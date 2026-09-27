@@ -64,10 +64,12 @@ PARALLEL_FAST_CI_BURN_RUNS ?= 3
 PARALLEL_FAST_MATRIX_SMPS ?= 2 4
 HW_SOAK_LOG ?=
 HW_SOAK_CAPTURE_LOG ?=
+BACKUP_REMOTE ?= origin
+BACKUP_TAG_PREFIX ?= backup
 SOURCES := $(shell find src -name '*.cpp')
 OBJECTS := $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 
-.PHONY: all clean limine iso usb-image run run-dev run-probe run-log run-log-check parallel-probe-check parallel-probe-drain-check parallel-probe-smoke parallel-probe-drain-smoke parallel-probe-dispatch-containment-smoke parallel-probe-dispatch-drain-smoke parallel-probe-gate parallel-probe-dispatch-drain-burn parallel-probe-ci parallel-premerge-fast parallel-premerge-gate parallel-premerge-fast-matrix parallel-premerge-matrix parallel-hw-soak-archive dsksurf-contract-check dsksurf-contract-occlusion-check dsksurf-contract-occlusion-strict-check dsksurf-contract-fallback-strict-check dsksurf-contract-token-check dsksurf-contract-smoke
+.PHONY: all clean limine iso usb-image run run-dev run-probe run-log run-log-check parallel-probe-check parallel-probe-drain-check parallel-probe-smoke parallel-probe-drain-smoke parallel-probe-dispatch-containment-smoke parallel-probe-dispatch-drain-smoke parallel-probe-gate parallel-probe-dispatch-drain-burn parallel-probe-ci parallel-premerge-fast parallel-premerge-gate parallel-premerge-fast-matrix parallel-premerge-matrix parallel-hw-soak-archive dsksurf-contract-check dsksurf-contract-occlusion-check dsksurf-contract-occlusion-strict-check dsksurf-contract-fallback-strict-check dsksurf-contract-token-check dsksurf-contract-smoke backup-snapshot
 
 all: $(KERNEL)
 
@@ -233,6 +235,9 @@ dsksurf-contract-token-check:
 
 dsksurf-contract-smoke:
 	@./tools/desktop_surface_contract_smoke.sh "$(CONTRACT_SMOKE_TIMEOUT)"
+
+backup-snapshot:
+	@BACKUP_REMOTE="$(BACKUP_REMOTE)" BACKUP_TAG_PREFIX="$(BACKUP_TAG_PREFIX)" bash ./tools/git_backup_snapshot.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

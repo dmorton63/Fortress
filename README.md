@@ -61,6 +61,25 @@ sudo dd if=build/fortress-usb.iso of=/dev/sdX bs=4M status=progress conv=fsync
 sync
 ```
 
+## Repository Backup Snapshot
+
+Create a timestamped backup snapshot commit (if needed), tag it, and push to your configured remote:
+
+```bash
+make backup-snapshot
+```
+
+Optional overrides:
+
+- `BACKUP_REMOTE=origin` (default remote to push)
+- `BACKUP_TAG_PREFIX=backup` (tag name prefix, e.g. `backup-20260927-012345`)
+
+Example:
+
+```bash
+make backup-snapshot BACKUP_REMOTE=origin BACKUP_TAG_PREFIX=fortress-backup
+```
+
 ## Run In QEMU
 
 ```bash

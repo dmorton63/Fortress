@@ -1,0 +1,6 @@
+parallel-probe-ci PASS
+id: matrix-20260925-164633-smp2
+safe_log: artifacts/parallel-probe-ci-matrix-20260925-164633-smp2/qemu-serial.parallel-safe.log
+strict_log: artifacts/parallel-probe-ci-matrix-20260925-164633-smp2/qemu-serial.parallel-strict.log
+burn_runs: 10
+burn_dir: artifacts/parallel-dispatch-burn-ci-matrix-20260925-164633-smp2

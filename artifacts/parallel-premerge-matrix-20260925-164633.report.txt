@@ -1,0 +1,8 @@
+parallel-premerge-matrix-check
+id: 20260925-164633
+smps: 2 4 8
+expected_burn_runs: 10
+smp2: PASS
+smp4: PASS
+smp8: PASS
+result: PASS

@@ -1,0 +1,9 @@
+parallel-premerge-matrix
+id: 20260925-164633
+burn_runs: 10
+timeout: 80
+smps: 2 4 8
+smp2: PASS artifacts/parallel-probe-ci-matrix-20260925-164633-smp2
+smp4: PASS artifacts/parallel-probe-ci-matrix-20260925-164633-smp4
+smp8: PASS artifacts/parallel-probe-ci-matrix-20260925-164633-smp8
+report: artifacts/parallel-premerge-matrix-20260925-164633.report.txt

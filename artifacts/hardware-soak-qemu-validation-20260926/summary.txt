@@ -1,0 +1,18 @@
+hardware-soak-summary
+id: qemu-validation-20260926
+serial_log: qemu-serial.parallel-dispatch-burn-10.attempt-1.log
+capture_log: qemu-serial.parallel-dispatch-burn-10.attempt-1.capture.log
+
+required_markers:
+- PASS: PARALLELPROBE MODE
+- PASS: PARALLEL ON AP_DRAIN
+- PASS: PARALLELCANARY REQ
+- PASS: PARALLELCANARY EXE DELTA
+- PASS: APW START
+
+diagnostics:
+- PARALLELPROBE_WARN_NOEXEC: 0
+- XHCI_BG_PAUSED_AP_DRAIN: 0
+- XHCI_BG_RESUME: 0
+
+result: PASS

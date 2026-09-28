@@ -22,6 +22,7 @@ class FKernelRuntimeDiagnostics {
     void TryLogTimerStats();
     void TryLogIrqStats();
     void TryLogCoreDispatchStats();
+    void TryLogServicePortStats();
 
     FDesktopRuntime *DesktopRuntime = nullptr;
 
@@ -31,6 +32,7 @@ class FKernelRuntimeDiagnostics {
     Fortress::Core::uint64 NextTimerStatsTick = 600u;
     Fortress::Core::uint64 NextIrqStatsTick = 600u;
     Fortress::Core::uint64 NextCoreDispatchStatsTick = 600u;
+    Fortress::Core::uint64 NextServicePortStatsTick = 600u;
 
     static constexpr Fortress::Core::uint64 SchedulerStatsLogIntervalTicks = 900u;
     static constexpr Fortress::Core::uint64 EventStatsLogIntervalTicks = 600u;
@@ -38,6 +40,7 @@ class FKernelRuntimeDiagnostics {
     static constexpr Fortress::Core::uint64 TimerStatsLogIntervalTicks = 1200u;
     static constexpr Fortress::Core::uint64 IrqStatsLogIntervalTicks = 1200u;
     static constexpr Fortress::Core::uint64 CoreDispatchStatsLogIntervalTicks = 1200u;
+    static constexpr Fortress::Core::uint64 ServicePortStatsLogIntervalTicks = 1200u;
 
     FKernelEventSubscriptionHandle HeartbeatSubscriptionHandle = {};
     FKernelEventSubscriptionHandle CommandSubscriptionHandle = {};

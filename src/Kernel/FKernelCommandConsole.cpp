@@ -22,7 +22,9 @@
 #include "Fortress/Kernel/FKernelRuntimeIds.hpp"
 #include "Fortress/Kernel/FKernelSchedulerEventPlane.hpp"
 #include "Fortress/Kernel/FMessageBus.hpp"
+#include "Fortress/Kernel/FPortManager.hpp"
 #include "Fortress/Kernel/FServiceRegistry.hpp"
+#include "Fortress/Kernel/FServiceRegistryDatabaseAdapter.hpp"
 #include "Fortress/Memory/FMmio.hpp"
 #include "Fortress/Memory/FDmaMemoryManager.hpp"
 #include "Fortress/Memory/FPinnedMappingManager.hpp"
@@ -221,7 +223,66 @@ static uint32_t GXhciIntrinBackgroundLastReportLength = 0u;
 static Fortress::Video::FVideoConsole *GBoundVideoConsole = nullptr;
 static Fortress::Kernel::FDesktopCompositor *GBoundDesktopCompositor = nullptr;
 static Fortress::Kernel::FDesktopInputRouter *GBoundDesktopInputRouter = nullptr;
+static constexpr uint32_t GMaxCommandPortLeases = 8u;
+
+struct FCachedCommandPortLease {
+    bool InUse = false;
+    uint16_t PortId = 0u;
+    uint32_t LeaseId = 0u;
+};
+
+static FCachedCommandPortLease GCommandPortLeases[GMaxCommandPortLeases] = {};
 static void ProcessCommand();
+
+static int32_t FindCachedCommandPortLeaseIndex(uint16_t portId) {
+    for (uint32_t i = 0u; i < GMaxCommandPortLeases; i++) {
+        if (GCommandPortLeases[i].InUse && GCommandPortLeases[i].PortId == portId) {
+            return static_cast<int32_t>(i);
+        }
+    }
+    return -1;
+}
+
+static bool CacheCommandPortLease(uint16_t portId, uint32_t leaseId) {
+    const int32_t existing = FindCachedCommandPortLeaseIndex(portId);
+    if (existing >= 0) {
+        GCommandPortLeases[existing].LeaseId = leaseId;
+        return true;
+    }
+
+    for (uint32_t i = 0u; i < GMaxCommandPortLeases; i++) {
+        if (!GCommandPortLeases[i].InUse) {
+            GCommandPortLeases[i] = FCachedCommandPortLease{
+                .InUse = true,
+                .PortId = portId,
+                .LeaseId = leaseId,
+            };
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void DropCachedCommandPortLease(uint16_t portId) {
+    const int32_t index = FindCachedCommandPortLeaseIndex(portId);
+    if (index < 0) {
+        return;
+    }
+
+    GCommandPortLeases[index] = FCachedCommandPortLease{};
+}
+
+static bool GetCachedCommandPortLease(uint16_t portId, uint32_t &outLeaseId) {
+    outLeaseId = 0u;
+    const int32_t index = FindCachedCommandPortLeaseIndex(portId);
+    if (index < 0) {
+        return false;
+    }
+
+    outLeaseId = GCommandPortLeases[index].LeaseId;
+    return true;
+}
 
 static void YieldLongOperationPoll(uint64_t pollIndex) {
     if (pollIndex == 0 || GLongOperationYieldCallback == nullptr) {
@@ -6490,7 +6551,173 @@ static void RunVfsStat() {
     PushLog(line);
 }
 
+static bool EnsureServicePortAccess(uint16_t portId, uint32_t serviceId, const char *denyContext) {
+    if (FPortManager::CanServiceAccessPort(portId, serviceId)) {
+        return true;
+    }
+
+    FPortLease lease{};
+    char line[144] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "PORT DENY ");
+    AppendString(line, sizeof(line), pos, denyContext != nullptr ? denyContext : "ACCESS");
+    AppendString(line, sizeof(line), pos, " P ");
+    AppendUInt(line, sizeof(line), pos, portId);
+    AppendString(line, sizeof(line), pos, " SID ");
+    AppendUInt(line, sizeof(line), pos, serviceId);
+    if (FPortManager::GetPortLease(portId, lease)) {
+        AppendString(line, sizeof(line), pos, " OWNER ");
+        AppendUInt(line, sizeof(line), pos, lease.ServiceId);
+        AppendString(line, sizeof(line), pos, " L ");
+        AppendUInt(line, sizeof(line), pos, lease.LeaseId);
+    } else {
+        AppendString(line, sizeof(line), pos, " (NO LEASE; TRY PORTOPEN ");
+        AppendUInt(line, sizeof(line), pos, portId);
+        AppendString(line, sizeof(line), pos, ")");
+    }
+    PushLog(line);
+    return false;
+}
+
+static void RunPortList() {
+    FPortRecordSnapshot ports[16] = {};
+    uint32_t count = 0u;
+    FPortManager::GetPorts(ports, 16u, count);
+
+    char header[64] = {};
+    size_t headerPos = 0;
+    AppendString(header, sizeof(header), headerPos, "PORTLIST N ");
+    AppendUInt(header, sizeof(header), headerPos, count);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < count; i++) {
+        char line[160] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "PORT ");
+        AppendUInt(line, sizeof(line), pos, ports[i].PortId);
+        AppendString(line, sizeof(line), pos, " NAME ");
+        AppendString(line, sizeof(line), pos, ports[i].Name != nullptr ? ports[i].Name : "<null>");
+        AppendString(line, sizeof(line), pos, " OPEN ");
+        AppendUInt(line, sizeof(line), pos, ports[i].Lease.InUse ? 1u : 0u);
+        if (ports[i].Lease.InUse) {
+            AppendString(line, sizeof(line), pos, " SID ");
+            AppendUInt(line, sizeof(line), pos, ports[i].Lease.ServiceId);
+            AppendString(line, sizeof(line), pos, " L ");
+            AppendUInt(line, sizeof(line), pos, ports[i].Lease.LeaseId);
+        }
+        PushLog(line);
+    }
+}
+
+static void RunPortOpen(uint32_t portIdRaw) {
+    const uint16_t portId = static_cast<uint16_t>(portIdRaw);
+    FPortLease existingLease{};
+    if (FPortManager::GetPortLease(portId, existingLease)) {
+        char line[112] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "PORTOPEN IN USE P ");
+        AppendUInt(line, sizeof(line), pos, portId);
+        AppendString(line, sizeof(line), pos, " SID ");
+        AppendUInt(line, sizeof(line), pos, existingLease.ServiceId);
+        AppendString(line, sizeof(line), pos, " L ");
+        AppendUInt(line, sizeof(line), pos, existingLease.LeaseId);
+        PushLog(line);
+        return;
+    }
+
+    uint32_t leaseId = 0u;
+    if (!FPortManager::OpenLease(portId, FKernelRuntimeIds::ServiceCommandConsole, "CommandConsole", leaseId)) {
+        PushLog("PORTOPEN FAIL");
+        return;
+    }
+
+    if (!CacheCommandPortLease(portId, leaseId)) {
+        PushLog("PORTOPEN CACHE FULL");
+        return;
+    }
+
+    char line[96] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "PORTOPEN OK P ");
+    AppendUInt(line, sizeof(line), pos, portId);
+    AppendString(line, sizeof(line), pos, " L ");
+    AppendUInt(line, sizeof(line), pos, leaseId);
+    PushLog(line);
+}
+
+static void RunPortClose(uint32_t portIdRaw) {
+    const uint16_t portId = static_cast<uint16_t>(portIdRaw);
+
+    uint32_t leaseId = 0u;
+    if (!GetCachedCommandPortLease(portId, leaseId)) {
+        FPortLease liveLease{};
+        if (!FPortManager::GetPortLease(portId, liveLease) ||
+            liveLease.ServiceId != FKernelRuntimeIds::ServiceCommandConsole) {
+            PushLog("PORTCLOSE NO LEASE");
+            return;
+        }
+        leaseId = liveLease.LeaseId;
+    }
+
+    if (!FPortManager::CloseLease(portId, FKernelRuntimeIds::ServiceCommandConsole, leaseId)) {
+        PushLog("PORTCLOSE FAIL");
+        return;
+    }
+
+    DropCachedCommandPortLease(portId);
+    char line[96] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "PORTCLOSE OK P ");
+    AppendUInt(line, sizeof(line), pos, portId);
+    AppendString(line, sizeof(line), pos, " L ");
+    AppendUInt(line, sizeof(line), pos, leaseId);
+    PushLog(line);
+}
+
+static void RunPortLease(uint32_t portIdRaw) {
+    const uint16_t portId = static_cast<uint16_t>(portIdRaw);
+
+    const char *portName = nullptr;
+    const bool haveName = FPortManager::GetPortName(portId, portName);
+    if (!haveName) {
+        PushLog("PORTLEASE PORT UNKNOWN");
+        return;
+    }
+
+    FPortLease lease{};
+    if (!FPortManager::GetPortLease(portId, lease)) {
+        char line[128] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "PORTLEASE P ");
+        AppendUInt(line, sizeof(line), pos, portId);
+        AppendString(line, sizeof(line), pos, " NAME ");
+        AppendString(line, sizeof(line), pos, portName != nullptr ? portName : "<null>");
+        AppendString(line, sizeof(line), pos, " OPEN 0");
+        PushLog(line);
+        return;
+    }
+
+    char line[160] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "PORTLEASE P ");
+    AppendUInt(line, sizeof(line), pos, portId);
+    AppendString(line, sizeof(line), pos, " NAME ");
+    AppendString(line, sizeof(line), pos, portName != nullptr ? portName : "<null>");
+    AppendString(line, sizeof(line), pos, " OPEN 1 SID ");
+    AppendUInt(line, sizeof(line), pos, lease.ServiceId);
+    AppendString(line, sizeof(line), pos, " L ");
+    AppendUInt(line, sizeof(line), pos, lease.LeaseId);
+    PushLog(line);
+}
+
 static void RunVfsResolve(const char *absolutePath) {
+    if (absolutePath != nullptr && StartsWith(absolutePath, "/boot") &&
+        !EnsureServicePortAccess(FKernelRuntimeIds::PortBootVolume,
+                                 FKernelRuntimeIds::ServiceVirtualFileSystem,
+                                 "VFSRESOLVE")) {
+        return;
+    }
+
     if (absolutePath == nullptr || absolutePath[0] != '/') {
         PushLog("VFS RESOLVE ARG INVALID");
         return;
@@ -6512,6 +6739,151 @@ static void RunVfsResolve(const char *absolutePath) {
     AppendString(line, sizeof(line), pos, route.RelativePath);
     AppendString(line, sizeof(line), pos, " RO ");
     AppendUInt(line, sizeof(line), pos, route.ReadOnly ? 1u : 0u);
+    PushLog(line);
+}
+
+static void RunServiceDbStats() {
+    FServiceRegistryDatabaseAdapterStats stats{};
+    FServiceRegistryDatabaseAdapter::GetStats(stats);
+
+    char line[112] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "SRDB REC ");
+    AppendUInt(line, sizeof(line), pos, stats.RecordCount);
+    AppendString(line, sizeof(line), pos, " REF ");
+    AppendUInt(line, sizeof(line), pos, stats.RefreshCount);
+    AppendString(line, sizeof(line), pos, " MISS ");
+    AppendUInt(line, sizeof(line), pos, stats.FailedLookupCount);
+    PushLog(line);
+}
+
+static void RunServiceDbFind(uint32_t serviceId) {
+    FServiceRegistryDatabaseRecord record{};
+    if (!FServiceRegistryDatabaseAdapter::FindRecordByServiceId(serviceId, record)) {
+        PushLog("SRDB FIND MISS");
+        return;
+    }
+
+    char line[128] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "SRDB SID ");
+    AppendUInt(line, sizeof(line), pos, record.ServiceId);
+    AppendString(line, sizeof(line), pos, " CH ");
+    AppendUInt(line, sizeof(line), pos, record.EndpointChannelId);
+    AppendString(line, sizeof(line), pos, " NAME ");
+    AppendString(line, sizeof(line), pos, record.Name != nullptr ? record.Name : "<null>");
+    PushLog(line);
+}
+
+static void RunPortPolicyStats() {
+    FPortManagerStats stats{};
+    FPortManager::GetStats(stats);
+
+    char line[128] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "PORT REG ");
+    AppendUInt(line, sizeof(line), pos, stats.RegisteredPortCount);
+    AppendString(line, sizeof(line), pos, " OPEN ");
+    AppendUInt(line, sizeof(line), pos, stats.ActiveLeaseCount);
+    AppendString(line, sizeof(line), pos, " DENY ");
+    AppendUInt(line, sizeof(line), pos, stats.DeniedAccessCount);
+    AppendString(line, sizeof(line), pos, " O ");
+    AppendUInt(line, sizeof(line), pos, stats.LeaseOpenCount);
+    AppendString(line, sizeof(line), pos, " C ");
+    AppendUInt(line, sizeof(line), pos, stats.LeaseCloseCount);
+    PushLog(line);
+}
+
+static void LogPortAuditEntry(const char *prefix, const FPortAuditEntry &entry) {
+    char line[144] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, prefix);
+    AppendString(line, sizeof(line), pos, " P ");
+    AppendUInt(line, sizeof(line), pos, entry.PortId);
+    AppendString(line, sizeof(line), pos, " S ");
+    AppendUInt(line, sizeof(line), pos, entry.ServiceId);
+    AppendString(line, sizeof(line), pos, " L ");
+    AppendUInt(line, sizeof(line), pos, entry.LeaseId);
+    AppendString(line, sizeof(line), pos, " A ");
+    AppendUInt(line, sizeof(line), pos, static_cast<uint64_t>(entry.Action));
+    AppendString(line, sizeof(line), pos, " R ");
+    AppendUInt(line, sizeof(line), pos, static_cast<uint64_t>(entry.Result));
+    PushLog(line);
+}
+
+static void RunPortAuditLast() {
+    FPortAuditEntry entry{};
+    if (!FPortManager::GetLastAuditEntry(entry)) {
+        PushLog("PORTAUDIT NONE");
+        return;
+    }
+
+    LogPortAuditEntry("PORTAUDIT LAST", entry);
+}
+
+static void RunPortAuditDenied() {
+    FPortAuditEntry entry{};
+    if (!FPortManager::GetLastDeniedAuditEntry(entry)) {
+        PushLog("PORTAUDIT DENY NONE");
+        return;
+    }
+
+    LogPortAuditEntry("PORTAUDIT DENY", entry);
+}
+
+static void RunPortPolicyCheck(uint32_t portId, uint32_t serviceId) {
+    const bool allowed = FPortManager::CanServiceAccessPort(static_cast<uint16_t>(portId), serviceId);
+    char line[96] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "PORTCHECK P ");
+    AppendUInt(line, sizeof(line), pos, portId);
+    AppendString(line, sizeof(line), pos, " S ");
+    AppendUInt(line, sizeof(line), pos, serviceId);
+    AppendString(line, sizeof(line), pos, " -> ");
+    AppendString(line, sizeof(line), pos, allowed ? "ALLOW" : "DENY");
+    PushLog(line);
+}
+
+static void RunDesktopZList() {
+    if (GBoundDesktopCompositor == nullptr || !GBoundDesktopCompositor->IsReady()) {
+        PushLog("DSKZLIST COMPOSITOR UNBOUND");
+        return;
+    }
+
+    FDesktopSurfaceId surfaceIds[32] = {};
+    uint32_t count = 0u;
+    GBoundDesktopCompositor->GetSurfacesInZOrder(surfaceIds, 32u, count);
+
+    char line[160] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "DSK ZLIST N ");
+    AppendUInt(line, sizeof(line), pos, count);
+    for (uint32_t i = 0u; i < count; i++) {
+        AppendString(line, sizeof(line), pos, " ");
+        AppendUInt(line, sizeof(line), pos, surfaceIds[i]);
+    }
+    PushLog(line);
+}
+
+static void RunDesktopChildren(uint32_t parentSurfaceId) {
+    if (GBoundDesktopCompositor == nullptr || !GBoundDesktopCompositor->IsReady()) {
+        PushLog("DSKCHILDREN COMPOSITOR UNBOUND");
+        return;
+    }
+
+    FDesktopSurfaceId childIds[32] = {};
+    uint32_t count = 0u;
+    GBoundDesktopCompositor->GetChildSurfaceIds(static_cast<FDesktopSurfaceId>(parentSurfaceId),
+                                                childIds,
+                                                32u,
+                                                count);
+
+    char line[160] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "DSK CHILDREN P ");
+    AppendUInt(line, sizeof(line), pos, parentSurfaceId);
+    AppendString(line, sizeof(line), pos, " N ");
+    AppendUInt(line, sizeof(line), pos, count);
     PushLog(line);
 }
 
@@ -6629,6 +7001,13 @@ static void RunLogSave(const char *args) {
         mountLen--;
     }
 
+    if (StartsWith(mountPathToken, "/boot") &&
+        !EnsureServicePortAccess(FKernelRuntimeIds::PortBootVolume,
+                                 FKernelRuntimeIds::ServiceVirtualFileSystem,
+                                 "LOGSAVE")) {
+        return;
+    }
+
     char probePath[96] = {};
     size_t probePos = 0u;
     AppendString(probePath, sizeof(probePath), probePos, mountPathToken);
@@ -6704,6 +7083,36 @@ static void RunLogSave(const char *args) {
     AppendString(line, sizeof(line), pos, " BYTES ");
     AppendUInt(line, sizeof(line), pos, totalBytesWritten);
     PushLog(line);
+}
+
+static void RunLogSaveBoot(const char *args) {
+    if (args == nullptr || args[0] == '\0') {
+        PushLog("LOGSAVEBOOT USAGE START_BLOCK BLOCK_COUNT");
+        return;
+    }
+
+    const char *cursor = args;
+    char startBlockToken[24] = {};
+    char blockCountToken[24] = {};
+    if (!ReadToken(cursor, startBlockToken, sizeof(startBlockToken)) ||
+        !ReadToken(cursor, blockCountToken, sizeof(blockCountToken))) {
+        PushLog("LOGSAVEBOOT USAGE START_BLOCK BLOCK_COUNT");
+        return;
+    }
+
+    char extraToken[8] = {};
+    if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+        PushLog("LOGSAVEBOOT TOO MANY ARGS");
+        return;
+    }
+
+    char mappedArgs[96] = {};
+    size_t pos = 0u;
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, "/boot ");
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, startBlockToken);
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, " ");
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, blockCountToken);
+    RunLogSave(mappedArgs);
 }
 
 static void RunEventBurst(uint32_t count) {
@@ -7040,9 +7449,11 @@ static void RunFontCacheReset() {
 }
 
 static void RunUtilityHelp() {
-    PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS] STATS EVENTHEALTH EVENTBURST VFSSTAT VFSRESOLVE KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
+    PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS] STATS EVENTHEALTH EVENTBURST VFSSTAT VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 LOGSAVE LOGSAVEBOOT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
     PushLog("KBD: KBDLAYOUT [US|DVORAK] KBDMODS");
     PushLog("TEXT: TEXTSHAPER [BASIC|WRAP [PX]]");
+    PushLog("VFS: VFSRESOLVE /ABS/PATH | VFSBOOT NAME | VFSBOOTBLK INDEX | VFSBOOT0");
+    PushLog("LOG: LOGSAVE /MOUNT START COUNT | LOGSAVEBOOT START COUNT");
     PushLog("FONT: FONTCACHE [RESET]");
     PushLog("DSKSURF: DSKSURFSTAT DSKSURFRAISE [ID] DSKSURFFOCUS [ID|NEXT]");
     PushLog("DSKSURF: DSKSURFCAPTURE [ID|OFF] DSKSURFINPUT (RX/DROP/PTR/CLK)");
@@ -7203,6 +7614,18 @@ static bool TryProcessUtilityCommand() {
         .RunEventBurstFn = RunEventBurst,
         .RunVfsStatFn = RunVfsStat,
         .RunVfsResolveFn = RunVfsResolve,
+        .RunServiceDbStatsFn = RunServiceDbStats,
+        .RunServiceDbFindFn = RunServiceDbFind,
+        .RunPortPolicyStatsFn = RunPortPolicyStats,
+        .RunPortAuditLastFn = RunPortAuditLast,
+        .RunPortAuditDeniedFn = RunPortAuditDenied,
+        .RunPortPolicyCheckFn = RunPortPolicyCheck,
+        .RunPortListFn = RunPortList,
+        .RunPortOpenFn = RunPortOpen,
+        .RunPortCloseFn = RunPortClose,
+        .RunPortLeaseFn = RunPortLease,
+        .RunDesktopZListFn = RunDesktopZList,
+        .RunDesktopChildrenFn = RunDesktopChildren,
         .SetHudLogShowTailFn = SetHudLogShowTail,
         .SetHudLogShowFullFn = SetHudLogShowFull,
         .SetHudLogShowErrorsFn = SetHudLogShowErrors,
@@ -7647,6 +8070,12 @@ static void ProcessCommand() {
 
     if (TryProcessRuntimeControlCommand(runtimeControlContext)) {
     } else if (TryProcessUtilityCommand()) {
+    } else if (StrEq(GCommandBuffer, "logsaveboot") || StartsWith(GCommandBuffer, "logsaveboot ")) {
+        if (StrEq(GCommandBuffer, "logsaveboot")) {
+            PushLog("LOGSAVEBOOT USAGE START_BLOCK BLOCK_COUNT");
+        } else {
+            RunLogSaveBoot(GCommandBuffer + 12);
+        }
     } else if (StrEq(GCommandBuffer, "logsave") || StartsWith(GCommandBuffer, "logsave ")) {
         if (StrEq(GCommandBuffer, "logsave")) {
             PushLog("LOGSAVE USAGE /MOUNT START_BLOCK BLOCK_COUNT");
@@ -7791,6 +8220,9 @@ void FKernelCommandConsole::Initialize() {
     GHidLogicalRangeProbeAttempted = false;
     GHaveHidLogicalRangeInterfaceHint = false;
     GHidLogicalRangeInterfaceHint = 0;
+    for (uint32_t i = 0u; i < GMaxCommandPortLeases; i++) {
+        GCommandPortLeases[i] = FCachedCommandPortLease{};
+    }
     GXhciIntrinLoopBackgroundEnabled = false;
     GXhciIntrinLoopBackgroundRunning = false;
     GXhciIntrinLoopBackgroundTickDivider = 120u;

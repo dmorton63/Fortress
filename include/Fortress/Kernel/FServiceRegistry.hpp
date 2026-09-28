@@ -20,6 +20,9 @@ class FServiceRegistry {
     static bool Initialize();
     static bool RegisterService(const FServiceRegistrationInfo &serviceInfo);
     static bool FindServiceById(Fortress::Core::uint32 serviceId, FServiceRegistrationInfo &outServiceInfo);
+        static void GetServices(FServiceRegistrationInfo *outServices,
+                                                        Fortress::Core::uint32 capacity,
+                                                        Fortress::Core::uint32 &outCount);
     static void GetStats(FServiceRegistryStats &outStats);
 };
 

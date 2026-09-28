@@ -16,8 +16,10 @@
 #include "Fortress/Kernel/FKeyboardManager.hpp"
 #include "Fortress/Kernel/FKernelRuntimeIds.hpp"
 #include "Fortress/Kernel/FMessageBus.hpp"
+#include "Fortress/Kernel/FPortManager.hpp"
 #include "Fortress/Kernel/FKernelScheduler.hpp"
 #include "Fortress/Kernel/FServiceRegistry.hpp"
+#include "Fortress/Kernel/FServiceRegistryDatabaseAdapter.hpp"
 #include "Fortress/Memory/FDmaMemoryManager.hpp"
 #include "Fortress/Memory/FPinnedMappingManager.hpp"
 #include "Fortress/Memory/FKernelHeap.hpp"
@@ -51,8 +53,10 @@ using Fortress::Kernel::FMessageBusStats;
 using Fortress::Kernel::FEventManager;
 using Fortress::Kernel::FEventManagerStats;
 using Fortress::Kernel::FKernelIrqControlPlane;
+using Fortress::Kernel::FPortManager;
 using Fortress::Kernel::FServiceRegistry;
 using Fortress::Kernel::FServiceRegistryStats;
+using Fortress::Kernel::FServiceRegistryDatabaseAdapter;
 using Fortress::Memory::FKernelHeap;
 using Fortress::Memory::FMemoryArena;
 using Fortress::Memory::FPhysicalMemoryManager;
@@ -470,6 +474,64 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
         })) {
         return false;
     }
+
+    if (!FServiceRegistryDatabaseAdapter::Initialize()) {
+        return false;
+    }
+
+    if (!FServiceRegistryDatabaseAdapter::RefreshFromServiceRegistry()) {
+        return false;
+    }
+
+    if (!FPortManager::Initialize()) {
+        return false;
+    }
+
+    if (!FPortManager::RegisterPort(FKernelRuntimeIds::PortDisplaySurface, "DisplaySurface")) {
+        return false;
+    }
+
+    if (!FPortManager::RegisterPort(FKernelRuntimeIds::PortKeyboardInput, "KeyboardInput")) {
+        return false;
+    }
+
+    if (!FPortManager::RegisterPort(FKernelRuntimeIds::PortBootVolume, "BootVolume")) {
+        return false;
+    }
+
+    uint32_t displayLeaseId = 0u;
+    if (!FPortManager::OpenLease(FKernelRuntimeIds::PortDisplaySurface,
+                                 FKernelRuntimeIds::ServiceDisplayManager,
+                                 "DisplayManager",
+                                 displayLeaseId)) {
+        return false;
+    }
+
+    uint32_t keyboardLeaseId = 0u;
+    if (!FPortManager::OpenLease(FKernelRuntimeIds::PortKeyboardInput,
+                                 FKernelRuntimeIds::ServiceKeyboardInput,
+                                 "KeyboardInput",
+                                 keyboardLeaseId)) {
+        return false;
+    }
+
+    uint32_t bootVolumeLeaseId = 0u;
+    if (!FPortManager::OpenLease(FKernelRuntimeIds::PortBootVolume,
+                                 FKernelRuntimeIds::ServiceVirtualFileSystem,
+                                 "VirtualFileSystem",
+                                 bootVolumeLeaseId)) {
+        return false;
+    }
+
+    (void)displayLeaseId;
+    (void)keyboardLeaseId;
+    (void)bootVolumeLeaseId;
+    (void)FPortManager::CanServiceAccessPort(FKernelRuntimeIds::PortDisplaySurface,
+                                             FKernelRuntimeIds::ServiceCommandConsole);
+    (void)FPortManager::CanServiceAccessPort(FKernelRuntimeIds::PortKeyboardInput,
+                                             FKernelRuntimeIds::ServiceDisplayManager);
+    (void)FPortManager::CanServiceAccessPort(FKernelRuntimeIds::PortBootVolume,
+                                             FKernelRuntimeIds::ServiceCommandConsole);
 
     if (!FKernelIrqControlPlane::Initialize()) {
         return false;

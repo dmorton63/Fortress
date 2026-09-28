@@ -398,6 +398,8 @@ void FDesktopRuntime::TryLogStats() {
     FKernelTextFormat::AppendUInt(line, sizeof(line), pos, compositorStats.DirtySurfaceCount);
     FKernelTextFormat::AppendString(line, sizeof(line), pos, " DA ");
     FKernelTextFormat::AppendUInt(line, sizeof(line), pos, compositorStats.DirtyPixelArea);
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, " CDA ");
+    FKernelTextFormat::AppendUInt(line, sizeof(line), pos, compositorStats.CoalescedDirtyPixelArea);
     FKernelTextFormat::AppendString(line, sizeof(line), pos, " ACK ");
     FKernelTextFormat::AppendUInt(line, sizeof(line), pos, compositorStats.DirtyAcknowledgeCount);
     FKernelTextFormat::AppendString(line, sizeof(line), pos, " APX ");
@@ -428,6 +430,10 @@ void FDesktopRuntime::TryLogStats() {
     FKernelTextFormat::AppendUInt(line, sizeof(line), pos, static_cast<Fortress::Core::uint64>(inputStats.CaptureSurfaceId));
     FKernelTextFormat::AppendString(line, sizeof(line), pos, " CLK ");
     FKernelTextFormat::AppendUInt(line, sizeof(line), pos, inputStats.PointerFocusClickCount);
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, " FREJ ");
+    FKernelTextFormat::AppendUInt(line, sizeof(line), pos, inputStats.FocusRejectCount);
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, " CSTALE ");
+    FKernelTextFormat::AppendUInt(line, sizeof(line), pos, inputStats.CaptureStaleDropCount);
     FKernelCommandConsole::PushSystemLog(line);
 
     char dirtyLine[220] = {};

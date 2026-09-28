@@ -10,7 +10,9 @@
 #include "Fortress/Kernel/FKernelScheduler.hpp"
 #include "Fortress/Kernel/FKernelSchedulerEventPlane.hpp"
 #include "Fortress/Kernel/FKernelTextFormat.hpp"
+#include "Fortress/Kernel/FPortManager.hpp"
 #include "Fortress/Kernel/FServiceRegistry.hpp"
+#include "Fortress/Kernel/FServiceRegistryDatabaseAdapter.hpp"
 #include "Fortress/Platform/FTimerX86.hpp"
 #include "Fortress/Video/FVideoConsole.hpp"
 
@@ -101,6 +103,7 @@ void FKernelRuntimeDiagnostics::Tick(FKernelRuntimeContext &runtime) {
     TryLogTimerStats();
     TryLogIrqStats();
     TryLogCoreDispatchStats();
+    TryLogServicePortStats();
 }
 
 void FKernelRuntimeDiagnostics::HandleDesktopInputEvent(const FKernelEvent &event, void *context) {
@@ -321,6 +324,62 @@ void FKernelRuntimeDiagnostics::TryLogCoreDispatchStats() {
     FKernelCommandConsole::PushSystemLog(apLine);
 
     NextCoreDispatchStatsTick = schedulerStats.TickCount + CoreDispatchStatsLogIntervalTicks;
+}
+
+void FKernelRuntimeDiagnostics::TryLogServicePortStats() {
+    FKernelSchedulerStats schedulerStats{};
+    FKernelScheduler::GetStats(schedulerStats);
+    if (schedulerStats.TickCount < NextServicePortStatsTick) {
+        return;
+    }
+
+    FServiceRegistryDatabaseAdapterStats adapterStats{};
+    FServiceRegistryDatabaseAdapter::GetStats(adapterStats);
+    char serviceLine[160] = {};
+    size_t servicePos = 0;
+    FKernelTextFormat::AppendString(serviceLine, sizeof(serviceLine), servicePos, "SRDB REC ");
+    FKernelTextFormat::AppendUInt(serviceLine, sizeof(serviceLine), servicePos, adapterStats.RecordCount);
+    FKernelTextFormat::AppendString(serviceLine, sizeof(serviceLine), servicePos, " REF ");
+    FKernelTextFormat::AppendUInt(serviceLine, sizeof(serviceLine), servicePos, adapterStats.RefreshCount);
+    FKernelTextFormat::AppendString(serviceLine, sizeof(serviceLine), servicePos, " MISS ");
+    FKernelTextFormat::AppendUInt(serviceLine, sizeof(serviceLine), servicePos, adapterStats.FailedLookupCount);
+    FKernelCommandConsole::PushSystemLog(serviceLine);
+
+    FPortManagerStats portStats{};
+    FPortManager::GetStats(portStats);
+    char portLine[196] = {};
+    size_t portPos = 0;
+    FKernelTextFormat::AppendString(portLine, sizeof(portLine), portPos, "PORT REG ");
+    FKernelTextFormat::AppendUInt(portLine, sizeof(portLine), portPos, portStats.RegisteredPortCount);
+    FKernelTextFormat::AppendString(portLine, sizeof(portLine), portPos, " OPEN ");
+    FKernelTextFormat::AppendUInt(portLine, sizeof(portLine), portPos, portStats.ActiveLeaseCount);
+    FKernelTextFormat::AppendString(portLine, sizeof(portLine), portPos, " DENY ");
+    FKernelTextFormat::AppendUInt(portLine, sizeof(portLine), portPos, portStats.DeniedAccessCount);
+    FKernelTextFormat::AppendString(portLine, sizeof(portLine), portPos, " OPEN# ");
+    FKernelTextFormat::AppendUInt(portLine, sizeof(portLine), portPos, portStats.LeaseOpenCount);
+    FKernelTextFormat::AppendString(portLine, sizeof(portLine), portPos, " CLS# ");
+    FKernelTextFormat::AppendUInt(portLine, sizeof(portLine), portPos, portStats.LeaseCloseCount);
+    FKernelCommandConsole::PushSystemLog(portLine);
+
+    FPortAuditEntry lastDenied{};
+    if (FPortManager::GetLastDeniedAuditEntry(lastDenied)) {
+        char deniedLine[176] = {};
+        size_t deniedPos = 0;
+        FKernelTextFormat::AppendString(deniedLine, sizeof(deniedLine), deniedPos, "PORT DENY P ");
+        FKernelTextFormat::AppendUInt(deniedLine, sizeof(deniedLine), deniedPos, lastDenied.PortId);
+        FKernelTextFormat::AppendString(deniedLine, sizeof(deniedLine), deniedPos, " S ");
+        FKernelTextFormat::AppendUInt(deniedLine, sizeof(deniedLine), deniedPos, lastDenied.ServiceId);
+        FKernelTextFormat::AppendString(deniedLine, sizeof(deniedLine), deniedPos, " A ");
+        FKernelTextFormat::AppendUInt(deniedLine,
+                                      sizeof(deniedLine),
+                                      deniedPos,
+                                      static_cast<Fortress::Core::uint64>(lastDenied.Action));
+        FKernelTextFormat::AppendString(deniedLine, sizeof(deniedLine), deniedPos, " L ");
+        FKernelTextFormat::AppendUInt(deniedLine, sizeof(deniedLine), deniedPos, lastDenied.LeaseId);
+        FKernelCommandConsole::PushSystemLog(deniedLine);
+    }
+
+    NextServicePortStatsTick = schedulerStats.TickCount + ServicePortStatsLogIntervalTicks;
 }
 
 } // namespace Fortress::Kernel

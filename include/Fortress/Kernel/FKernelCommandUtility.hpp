@@ -19,6 +19,18 @@ struct FKernelUtilityCommandContext {
     void (*RunEventBurstFn)(uint32_t burstCount);
     void (*RunVfsStatFn)();
     void (*RunVfsResolveFn)(const char *path);
+    void (*RunServiceDbStatsFn)();
+    void (*RunServiceDbFindFn)(uint32_t serviceId);
+    void (*RunPortPolicyStatsFn)();
+    void (*RunPortAuditLastFn)();
+    void (*RunPortAuditDeniedFn)();
+    void (*RunPortPolicyCheckFn)(uint32_t portId, uint32_t serviceId);
+    void (*RunPortListFn)();
+    void (*RunPortOpenFn)(uint32_t portId);
+    void (*RunPortCloseFn)(uint32_t portId);
+    void (*RunPortLeaseFn)(uint32_t portId);
+    void (*RunDesktopZListFn)();
+    void (*RunDesktopChildrenFn)(uint32_t parentSurfaceId);
 
     void (*SetHudLogShowTailFn)();
     void (*SetHudLogShowFullFn)();

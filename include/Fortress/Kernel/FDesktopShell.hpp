@@ -22,7 +22,9 @@ class FDesktopShell {
     bool Initialize(FDesktopCompositor *compositor);
     bool IsReady() const;
 
+    bool IsComponentRegistered(const char *name) const;
     bool RegisterComponent(const FDesktopShellComponent &component);
+    bool UnregisterComponent(const char *name);
     void Tick();
     void GetStats(FDesktopShellStats &outStats) const;
 

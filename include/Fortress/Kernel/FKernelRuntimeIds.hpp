@@ -33,6 +33,10 @@ static constexpr Fortress::Core::uint32 EventCursorOverlaySet = 5u;
 static constexpr Fortress::Core::uint32 EventInputKeyPressed = 6u;
 static constexpr Fortress::Core::uint32 EventDesktopSurfaceOverlaySet = 7u;
 
+static constexpr Fortress::Core::uint16 PortDisplaySurface = 1u;
+static constexpr Fortress::Core::uint16 PortKeyboardInput = 2u;
+static constexpr Fortress::Core::uint16 PortBootVolume = 3u;
+
 } // namespace Fortress::Kernel::FKernelRuntimeIds
 
 #endif

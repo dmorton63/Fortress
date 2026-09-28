@@ -44,7 +44,9 @@ bool FDesktopInputRouter::Initialize(FDesktopCompositor *compositor) {
     RoutedKeyCount = 0;
     DroppedKeyCount = 0;
     FocusChangeCount = 0;
+    FocusRejectCount = 0;
     CaptureChangeCount = 0;
+    CaptureStaleDropCount = 0;
     LastRoutedKeyAscii = 0;
     PointerSampleCount = 0;
     PointerFocusClickCount = 0;
@@ -66,7 +68,8 @@ void FDesktopInputRouter::SetPolicyConfig(const FPolicyConfig &policyConfig) {
 }
 
 bool FDesktopInputRouter::SetFocus(FDesktopSurfaceId surfaceId) {
-    if (!Ready || surfaceId == DesktopInvalidSurfaceId || !Compositor->SurfaceExists(surfaceId)) {
+    if (!Ready || surfaceId == DesktopInvalidSurfaceId || !Compositor->IsSurfaceFocusable(surfaceId)) {
+        FocusRejectCount++;
         return false;
     }
 
@@ -125,6 +128,12 @@ void FDesktopInputRouter::HandleInputEvent(const FKernelEvent &event) {
         return;
     }
 
+    if (CaptureSurfaceId != DesktopInvalidSurfaceId && !Compositor->IsSurfaceFocusable(CaptureSurfaceId)) {
+        CaptureSurfaceId = DesktopInvalidSurfaceId;
+        CaptureChangeCount++;
+        CaptureStaleDropCount++;
+    }
+
     const Fortress::Core::uint32 keyAscii = (event.Arg0 & 0xFFu);
     LastRoutedKeyAscii = keyAscii;
 
@@ -132,14 +141,16 @@ void FDesktopInputRouter::HandleInputEvent(const FKernelEvent &event) {
         (void)FocusNext();
     }
 
-    FDesktopSurfaceId targetSurface = CaptureSurfaceId;
-    if (targetSurface == DesktopInvalidSurfaceId) {
-        targetSurface = FocusSurfaceId;
+    if (!Compositor->IsSurfaceFocusable(FocusSurfaceId)) {
+        FDesktopSurfaceId fallbackFocus = DesktopInvalidSurfaceId;
+        if (Compositor->GetFocusableSurfaceId(fallbackFocus)) {
+            (void)SetFocus(fallbackFocus);
+        } else {
+            FocusSurfaceId = DesktopInvalidSurfaceId;
+        }
     }
-    if (targetSurface == DesktopInvalidSurfaceId && Compositor->GetFocusableSurfaceId(targetSurface)) {
-        FocusSurfaceId = targetSurface;
-        FocusChangeCount++;
-    }
+
+    const FDesktopSurfaceId targetSurface = FocusSurfaceId;
 
     if (targetSurface == DesktopInvalidSurfaceId) {
         DroppedKeyCount++;
@@ -202,7 +213,9 @@ void FDesktopInputRouter::GetStats(FDesktopInputRouterStats &outStats) const {
         .RoutedKeyCount = RoutedKeyCount,
         .DroppedKeyCount = DroppedKeyCount,
         .FocusChangeCount = FocusChangeCount,
+        .FocusRejectCount = FocusRejectCount,
         .CaptureChangeCount = CaptureChangeCount,
+        .CaptureStaleDropCount = CaptureStaleDropCount,
         .LastRoutedKeyAscii = LastRoutedKeyAscii,
         .PointerSampleCount = PointerSampleCount,
         .PointerFocusClickCount = PointerFocusClickCount,

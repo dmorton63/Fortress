@@ -13,7 +13,9 @@ struct FDesktopInputRouterStats {
     Fortress::Core::uint64 RoutedKeyCount = 0;
     Fortress::Core::uint64 DroppedKeyCount = 0;
     Fortress::Core::uint64 FocusChangeCount = 0;
+    Fortress::Core::uint64 FocusRejectCount = 0;
     Fortress::Core::uint64 CaptureChangeCount = 0;
+    Fortress::Core::uint64 CaptureStaleDropCount = 0;
     Fortress::Core::uint32 LastRoutedKeyAscii = 0;
     Fortress::Core::uint64 PointerSampleCount = 0;
     Fortress::Core::uint64 PointerFocusClickCount = 0;
@@ -65,7 +67,9 @@ class FDesktopInputRouter {
     Fortress::Core::uint64 RoutedKeyCount = 0;
     Fortress::Core::uint64 DroppedKeyCount = 0;
     Fortress::Core::uint64 FocusChangeCount = 0;
+    Fortress::Core::uint64 FocusRejectCount = 0;
     Fortress::Core::uint64 CaptureChangeCount = 0;
+    Fortress::Core::uint64 CaptureStaleDropCount = 0;
     Fortress::Core::uint32 LastRoutedKeyAscii = 0;
     Fortress::Core::uint64 PointerSampleCount = 0;
     Fortress::Core::uint64 PointerFocusClickCount = 0;

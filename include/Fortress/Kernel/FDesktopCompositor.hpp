@@ -19,6 +19,7 @@ struct FDesktopCompositorStats {
     Fortress::Core::uint32 SurfaceCount = 0;
     Fortress::Core::uint32 DirtySurfaceCount = 0;
     Fortress::Core::uint64 DirtyPixelArea = 0;
+    Fortress::Core::uint64 CoalescedDirtyPixelArea = 0;
     Fortress::Core::uint64 DirtyAcknowledgeCount = 0;
     Fortress::Core::uint64 DirtyAcknowledgePixels = 0;
     Fortress::Core::uint32 HighestZOrder = 0;
@@ -26,6 +27,7 @@ struct FDesktopCompositorStats {
 
 struct FDesktopSurfaceSnapshot {
     FDesktopSurfaceId SurfaceId = DesktopInvalidSurfaceId;
+    FDesktopSurfaceId ParentSurfaceId = DesktopInvalidSurfaceId;
     FDesktopRect Bounds = {};
     Fortress::Core::uint32 ZOrder = 0;
     bool Visible = false;
@@ -54,13 +56,25 @@ class FDesktopCompositor {
     bool MarkSurfaceDamaged(FDesktopSurfaceId surfaceId, const FDesktopRect &damageRect);
     bool PeekSurfaceDirtyRegion(FDesktopSurfaceId surfaceId, FDesktopRect &outDirtyRect) const;
     bool ConsumeSurfaceDirtyRegion(FDesktopSurfaceId surfaceId, FDesktopRect &outDirtyRect);
+    bool ConsumeCoalescedDirtyRegion(FDesktopRect &outDirtyRect);
     void ClearSurfaceDirty(FDesktopSurfaceId surfaceId);
+    bool IsSurfaceFocusable(FDesktopSurfaceId surfaceId) const;
     bool GetFocusableSurfaceId(FDesktopSurfaceId &outSurfaceId) const;
     bool GetNextFocusableSurfaceId(FDesktopSurfaceId currentSurfaceId, FDesktopSurfaceId &outSurfaceId) const;
     bool GetTopSurfaceAtPoint(Fortress::Core::int32 x, Fortress::Core::int32 y, FDesktopSurfaceId &outSurfaceId) const;
     bool GetSurfaceBounds(FDesktopSurfaceId surfaceId, FDesktopRect &outBounds) const;
+    bool GetSurfaceParentId(FDesktopSurfaceId surfaceId, FDesktopSurfaceId &outParentId) const;
     bool GetSurfaceSnapshot(FDesktopSurfaceId surfaceId, FDesktopSurfaceSnapshot &outSnapshot) const;
     bool SurfaceExists(FDesktopSurfaceId surfaceId) const;
+    bool IsSurfaceVisible(FDesktopSurfaceId surfaceId) const;
+    Fortress::Core::uint32 CountChildSurfaces(FDesktopSurfaceId parentId) const;
+    void GetChildSurfaceIds(FDesktopSurfaceId parentId,
+                            FDesktopSurfaceId *outSurfaceIds,
+                            Fortress::Core::uint32 capacity,
+                            Fortress::Core::uint32 &outCount) const;
+    void GetSurfacesInZOrder(FDesktopSurfaceId *outSurfaceIds,
+                             Fortress::Core::uint32 capacity,
+                             Fortress::Core::uint32 &outCount) const;
     void GetActiveSurfaceIds(FDesktopSurfaceId *outSurfaceIds,
                  Fortress::Core::uint32 capacity,
                  Fortress::Core::uint32 &outCount) const;
@@ -85,21 +99,31 @@ class FDesktopCompositor {
         bool Dirty = false;
         FDesktopSurfaceId SurfaceId = DesktopInvalidSurfaceId;
         FDesktopSurfaceId ParentId = DesktopInvalidSurfaceId;
+        FDesktopSurfaceId ZPrevSurfaceId = DesktopInvalidSurfaceId;
+        FDesktopSurfaceId ZNextSurfaceId = DesktopInvalidSurfaceId;
         Fortress::Core::uint32 ZOrder = 0;
         FDesktopRect Bounds = {};
         FDesktopRect DirtyRect = {};
     };
 
     Fortress::Core::int32 FindSurfaceIndex(FDesktopSurfaceId surfaceId) const;
+    void DetachFromZOrderList(FDesktopSurfaceId surfaceId);
+    void InsertIntoZOrderList(FDesktopSurfaceId surfaceId);
+    void SyncZOrderValuesFromList();
+    void MarkCoalescedDirty(const FDesktopRect &rect);
     Fortress::Core::uint32 ComputeHighestZOrder() const;
 
     bool Ready = false;
     Fortress::Core::uint32 NextSurfaceId = 1u;
+    bool HaveCoalescedDirty = false;
+    FDesktopRect CoalescedDirtyRect = {};
     Fortress::Core::uint64 DirtyAcknowledgeCount = 0;
     Fortress::Core::uint64 DirtyAcknowledgePixels = 0;
     FDesktopDirtyContributor LastFrameDirtyContributors[MaxDirtyContributors] = {};
     Fortress::Core::uint32 LastFrameDirtyContributorCount = 0;
     FDesktopSurfaceId RootSurfaceId = DesktopInvalidSurfaceId;
+    FDesktopSurfaceId ZOrderHeadSurfaceId = DesktopInvalidSurfaceId;
+    FDesktopSurfaceId ZOrderTailSurfaceId = DesktopInvalidSurfaceId;
     FSurfaceNode Surfaces[MaxSurfaces] = {};
 };
 

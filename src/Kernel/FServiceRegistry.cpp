@@ -51,6 +51,21 @@ bool FServiceRegistry::FindServiceById(Fortress::Core::uint32 serviceId, FServic
     return false;
 }
 
+void FServiceRegistry::GetServices(FServiceRegistrationInfo *outServices,
+                                   Fortress::Core::uint32 capacity,
+                                   Fortress::Core::uint32 &outCount) {
+    outCount = 0u;
+    if (!GInitialized || outServices == nullptr || capacity == 0u) {
+        return;
+    }
+
+    const Fortress::Core::uint32 copyCount = (GServiceCount < capacity) ? GServiceCount : capacity;
+    for (Fortress::Core::uint32 i = 0; i < copyCount; i++) {
+        outServices[i] = GServices[i];
+    }
+    outCount = copyCount;
+}
+
 void FServiceRegistry::GetStats(FServiceRegistryStats &outStats) {
     outStats = FServiceRegistryStats{
         .ServiceCount = GServiceCount,

@@ -50,6 +50,125 @@ Fortress::Core::int32 FDesktopCompositor::FindSurfaceIndex(FDesktopSurfaceId sur
     return -1;
 }
 
+void FDesktopCompositor::DetachFromZOrderList(FDesktopSurfaceId surfaceId) {
+    const Fortress::Core::int32 index = FindSurfaceIndex(surfaceId);
+    if (index < 0) {
+        return;
+    }
+
+    FSurfaceNode &node = Surfaces[index];
+    if (node.ZPrevSurfaceId != DesktopInvalidSurfaceId) {
+        const Fortress::Core::int32 prevIndex = FindSurfaceIndex(node.ZPrevSurfaceId);
+        if (prevIndex >= 0) {
+            Surfaces[prevIndex].ZNextSurfaceId = node.ZNextSurfaceId;
+        }
+    } else {
+        ZOrderHeadSurfaceId = node.ZNextSurfaceId;
+    }
+
+    if (node.ZNextSurfaceId != DesktopInvalidSurfaceId) {
+        const Fortress::Core::int32 nextIndex = FindSurfaceIndex(node.ZNextSurfaceId);
+        if (nextIndex >= 0) {
+            Surfaces[nextIndex].ZPrevSurfaceId = node.ZPrevSurfaceId;
+        }
+    } else {
+        ZOrderTailSurfaceId = node.ZPrevSurfaceId;
+    }
+
+    node.ZPrevSurfaceId = DesktopInvalidSurfaceId;
+    node.ZNextSurfaceId = DesktopInvalidSurfaceId;
+}
+
+void FDesktopCompositor::InsertIntoZOrderList(FDesktopSurfaceId surfaceId) {
+    const Fortress::Core::int32 index = FindSurfaceIndex(surfaceId);
+    if (index < 0) {
+        return;
+    }
+
+    FSurfaceNode &insertNode = Surfaces[index];
+    insertNode.ZPrevSurfaceId = DesktopInvalidSurfaceId;
+    insertNode.ZNextSurfaceId = DesktopInvalidSurfaceId;
+
+    if (ZOrderHeadSurfaceId == DesktopInvalidSurfaceId) {
+        ZOrderHeadSurfaceId = surfaceId;
+        ZOrderTailSurfaceId = surfaceId;
+        return;
+    }
+
+    FDesktopSurfaceId scanId = ZOrderHeadSurfaceId;
+    FDesktopSurfaceId prevId = DesktopInvalidSurfaceId;
+    while (scanId != DesktopInvalidSurfaceId) {
+        const Fortress::Core::int32 scanIndex = FindSurfaceIndex(scanId);
+        if (scanIndex < 0) {
+            break;
+        }
+
+        const FSurfaceNode &scanNode = Surfaces[scanIndex];
+        if (scanNode.ZOrder > insertNode.ZOrder) {
+            break;
+        }
+
+        prevId = scanId;
+        scanId = scanNode.ZNextSurfaceId;
+    }
+
+    if (prevId == DesktopInvalidSurfaceId) {
+        const Fortress::Core::int32 oldHeadIndex = FindSurfaceIndex(ZOrderHeadSurfaceId);
+        insertNode.ZNextSurfaceId = ZOrderHeadSurfaceId;
+        if (oldHeadIndex >= 0) {
+            Surfaces[oldHeadIndex].ZPrevSurfaceId = surfaceId;
+        }
+        ZOrderHeadSurfaceId = surfaceId;
+        return;
+    }
+
+    const Fortress::Core::int32 prevIndex = FindSurfaceIndex(prevId);
+    if (prevIndex < 0) {
+        return;
+    }
+
+    insertNode.ZPrevSurfaceId = prevId;
+    insertNode.ZNextSurfaceId = scanId;
+    Surfaces[prevIndex].ZNextSurfaceId = surfaceId;
+
+    if (scanId != DesktopInvalidSurfaceId) {
+        const Fortress::Core::int32 scanIndex = FindSurfaceIndex(scanId);
+        if (scanIndex >= 0) {
+            Surfaces[scanIndex].ZPrevSurfaceId = surfaceId;
+        }
+    } else {
+        ZOrderTailSurfaceId = surfaceId;
+    }
+}
+
+void FDesktopCompositor::SyncZOrderValuesFromList() {
+    Fortress::Core::uint32 order = 0u;
+    FDesktopSurfaceId scanId = ZOrderHeadSurfaceId;
+    while (scanId != DesktopInvalidSurfaceId) {
+        const Fortress::Core::int32 scanIndex = FindSurfaceIndex(scanId);
+        if (scanIndex < 0) {
+            break;
+        }
+
+        Surfaces[scanIndex].ZOrder = order;
+        order++;
+        scanId = Surfaces[scanIndex].ZNextSurfaceId;
+    }
+}
+
+void FDesktopCompositor::MarkCoalescedDirty(const FDesktopRect &rect) {
+    if (!IsRectValid(rect)) {
+        return;
+    }
+
+    if (HaveCoalescedDirty) {
+        CoalescedDirtyRect = UnionRects(CoalescedDirtyRect, rect);
+    } else {
+        HaveCoalescedDirty = true;
+        CoalescedDirtyRect = rect;
+    }
+}
+
 Fortress::Core::uint32 FDesktopCompositor::ComputeHighestZOrder() const {
     Fortress::Core::uint32 highest = 0;
     for (Fortress::Core::uint32 i = 0; i < MaxSurfaces; i++) {
@@ -72,6 +191,8 @@ bool FDesktopCompositor::Initialize(Fortress::Core::uint32 desktopWidth, Fortres
 
     Ready = false;
     NextSurfaceId = 1u;
+    HaveCoalescedDirty = false;
+    CoalescedDirtyRect = FDesktopRect{};
     DirtyAcknowledgeCount = 0;
     DirtyAcknowledgePixels = 0;
     LastFrameDirtyContributorCount = 0;
@@ -79,6 +200,8 @@ bool FDesktopCompositor::Initialize(Fortress::Core::uint32 desktopWidth, Fortres
         LastFrameDirtyContributors[i] = FDesktopDirtyContributor{};
     }
     RootSurfaceId = DesktopInvalidSurfaceId;
+    ZOrderHeadSurfaceId = DesktopInvalidSurfaceId;
+    ZOrderTailSurfaceId = DesktopInvalidSurfaceId;
     for (Fortress::Core::uint32 i = 0; i < MaxSurfaces; i++) {
         Surfaces[i] = FSurfaceNode{};
     }
@@ -135,10 +258,16 @@ bool FDesktopCompositor::CreateSurface(FDesktopSurfaceId parentId,
         .Dirty = true,
         .SurfaceId = surfaceId,
         .ParentId = parentId,
+        .ZPrevSurfaceId = DesktopInvalidSurfaceId,
+        .ZNextSurfaceId = DesktopInvalidSurfaceId,
         .ZOrder = zOrder,
         .Bounds = bounds,
         .DirtyRect = bounds,
     };
+
+    InsertIntoZOrderList(surfaceId);
+    SyncZOrderValuesFromList();
+    MarkCoalescedDirty(bounds);
 
     outSurfaceId = surfaceId;
     return true;
@@ -149,6 +278,23 @@ bool FDesktopCompositor::CloseSurface(FDesktopSurfaceId surfaceId) {
     if (index < 0 || surfaceId == RootSurfaceId) {
         return false;
     }
+
+    const FDesktopSurfaceId parentId = Surfaces[index].ParentId;
+    const FDesktopRect oldBounds = Surfaces[index].Bounds;
+
+    for (Fortress::Core::uint32 i = 0; i < MaxSurfaces; i++) {
+        if (!Surfaces[i].InUse || Surfaces[i].SurfaceId == surfaceId) {
+            continue;
+        }
+
+        if (Surfaces[i].ParentId == surfaceId) {
+            Surfaces[i].ParentId = parentId;
+        }
+    }
+
+    DetachFromZOrderList(surfaceId);
+    SyncZOrderValuesFromList();
+    MarkCoalescedDirty(oldBounds);
 
     Surfaces[index] = FSurfaceNode{};
     return true;
@@ -163,6 +309,7 @@ bool FDesktopCompositor::SetSurfaceVisible(FDesktopSurfaceId surfaceId, bool vis
     Surfaces[index].Visible = visible;
     Surfaces[index].Dirty = true;
     Surfaces[index].DirtyRect = Surfaces[index].Bounds;
+    MarkCoalescedDirty(Surfaces[index].Bounds);
     return true;
 }
 
@@ -172,9 +319,13 @@ bool FDesktopCompositor::RaiseSurface(FDesktopSurfaceId surfaceId) {
         return false;
     }
 
+    DetachFromZOrderList(surfaceId);
     Surfaces[index].ZOrder = ComputeHighestZOrder() + 1u;
+    InsertIntoZOrderList(surfaceId);
+    SyncZOrderValuesFromList();
     Surfaces[index].Dirty = true;
     Surfaces[index].DirtyRect = Surfaces[index].Bounds;
+    MarkCoalescedDirty(Surfaces[index].Bounds);
     return true;
 }
 
@@ -184,10 +335,12 @@ bool FDesktopCompositor::MoveSurface(FDesktopSurfaceId surfaceId, Fortress::Core
         return false;
     }
 
+    const FDesktopRect oldBounds = Surfaces[index].Bounds;
     Surfaces[index].Bounds.X = x;
     Surfaces[index].Bounds.Y = y;
     Surfaces[index].Dirty = true;
-    Surfaces[index].DirtyRect = Surfaces[index].Bounds;
+    Surfaces[index].DirtyRect = UnionRects(oldBounds, Surfaces[index].Bounds);
+    MarkCoalescedDirty(Surfaces[index].DirtyRect);
     return true;
 }
 
@@ -199,10 +352,12 @@ bool FDesktopCompositor::ResizeSurface(FDesktopSurfaceId surfaceId,
         return false;
     }
 
+    const FDesktopRect oldBounds = Surfaces[index].Bounds;
     Surfaces[index].Bounds.Width = width;
     Surfaces[index].Bounds.Height = height;
     Surfaces[index].Dirty = true;
-    Surfaces[index].DirtyRect = Surfaces[index].Bounds;
+    Surfaces[index].DirtyRect = UnionRects(oldBounds, Surfaces[index].Bounds);
+    MarkCoalescedDirty(Surfaces[index].DirtyRect);
     return true;
 }
 
@@ -223,6 +378,7 @@ bool FDesktopCompositor::MarkSurfaceDamaged(FDesktopSurfaceId surfaceId, const F
         Surfaces[index].Dirty = true;
         Surfaces[index].DirtyRect = clippedDamage;
     }
+    MarkCoalescedDirty(clippedDamage);
     return true;
 }
 
@@ -253,6 +409,18 @@ bool FDesktopCompositor::ConsumeSurfaceDirtyRegion(FDesktopSurfaceId surfaceId, 
     return true;
 }
 
+bool FDesktopCompositor::ConsumeCoalescedDirtyRegion(FDesktopRect &outDirtyRect) {
+    if (!HaveCoalescedDirty || !IsRectValid(CoalescedDirtyRect)) {
+        outDirtyRect = FDesktopRect{};
+        return false;
+    }
+
+    outDirtyRect = CoalescedDirtyRect;
+    HaveCoalescedDirty = false;
+    CoalescedDirtyRect = FDesktopRect{};
+    return true;
+}
+
 void FDesktopCompositor::ClearSurfaceDirty(FDesktopSurfaceId surfaceId) {
     const Fortress::Core::int32 index = FindSurfaceIndex(surfaceId);
     if (index < 0) {
@@ -263,77 +431,74 @@ void FDesktopCompositor::ClearSurfaceDirty(FDesktopSurfaceId surfaceId) {
     Surfaces[index].DirtyRect = FDesktopRect{};
 }
 
-bool FDesktopCompositor::GetFocusableSurfaceId(FDesktopSurfaceId &outSurfaceId) const {
-    outSurfaceId = DesktopInvalidSurfaceId;
-    bool haveCandidate = false;
-    Fortress::Core::uint32 candidateZ = 0;
-
-    for (Fortress::Core::uint32 i = 0; i < MaxSurfaces; i++) {
-        const FSurfaceNode &node = Surfaces[i];
-        if (!node.InUse || !node.Visible || node.SurfaceId == RootSurfaceId) {
-            continue;
-        }
-
-        if (!haveCandidate || node.ZOrder >= candidateZ) {
-            outSurfaceId = node.SurfaceId;
-            candidateZ = node.ZOrder;
-            haveCandidate = true;
-        }
+bool FDesktopCompositor::IsSurfaceFocusable(FDesktopSurfaceId surfaceId) const {
+    const Fortress::Core::int32 index = FindSurfaceIndex(surfaceId);
+    if (index < 0) {
+        return false;
     }
 
-    return haveCandidate;
+    const FSurfaceNode &node = Surfaces[index];
+    return node.InUse && node.Visible && node.SurfaceId != RootSurfaceId;
+}
+
+bool FDesktopCompositor::GetFocusableSurfaceId(FDesktopSurfaceId &outSurfaceId) const {
+    outSurfaceId = DesktopInvalidSurfaceId;
+    FDesktopSurfaceId scanId = ZOrderTailSurfaceId;
+    while (scanId != DesktopInvalidSurfaceId) {
+        if (IsSurfaceFocusable(scanId)) {
+            outSurfaceId = scanId;
+            return true;
+        }
+
+        const Fortress::Core::int32 scanIndex = FindSurfaceIndex(scanId);
+        if (scanIndex < 0) {
+            break;
+        }
+        scanId = Surfaces[scanIndex].ZPrevSurfaceId;
+    }
+
+    return false;
 }
 
 bool FDesktopCompositor::GetNextFocusableSurfaceId(FDesktopSurfaceId currentSurfaceId,
                                                    FDesktopSurfaceId &outSurfaceId) const {
     outSurfaceId = DesktopInvalidSurfaceId;
+    if (ZOrderTailSurfaceId == DesktopInvalidSurfaceId) {
+        return false;
+    }
 
-    Fortress::Core::uint32 currentZ = 0;
-    bool haveCurrent = false;
-    if (currentSurfaceId != DesktopInvalidSurfaceId) {
-        const Fortress::Core::int32 currentIndex = FindSurfaceIndex(currentSurfaceId);
-        if (currentIndex >= 0) {
-            currentZ = Surfaces[currentIndex].ZOrder;
-            haveCurrent = true;
+    if (!IsSurfaceFocusable(currentSurfaceId)) {
+        return GetFocusableSurfaceId(outSurfaceId);
+    }
+
+    const Fortress::Core::int32 currentIndex = FindSurfaceIndex(currentSurfaceId);
+    if (currentIndex < 0) {
+        return GetFocusableSurfaceId(outSurfaceId);
+    }
+
+    FDesktopSurfaceId scanId = Surfaces[currentIndex].ZPrevSurfaceId;
+    if (scanId == DesktopInvalidSurfaceId) {
+        scanId = ZOrderTailSurfaceId;
+    }
+
+    while (scanId != DesktopInvalidSurfaceId && scanId != currentSurfaceId) {
+        if (IsSurfaceFocusable(scanId)) {
+            outSurfaceId = scanId;
+            return true;
+        }
+
+        const Fortress::Core::int32 scanIndex = FindSurfaceIndex(scanId);
+        if (scanIndex < 0) {
+            break;
+        }
+        scanId = Surfaces[scanIndex].ZPrevSurfaceId;
+        if (scanId == DesktopInvalidSurfaceId) {
+            scanId = ZOrderTailSurfaceId;
         }
     }
 
-    bool haveCandidateAbove = false;
-    Fortress::Core::uint32 candidateAboveZ = 0;
-    FDesktopSurfaceId candidateAboveId = DesktopInvalidSurfaceId;
-
-    bool haveCandidateFloor = false;
-    Fortress::Core::uint32 candidateFloorZ = 0;
-    FDesktopSurfaceId candidateFloorId = DesktopInvalidSurfaceId;
-
-    for (Fortress::Core::uint32 i = 0; i < MaxSurfaces; i++) {
-        const FSurfaceNode &node = Surfaces[i];
-        if (!node.InUse || !node.Visible || node.SurfaceId == RootSurfaceId) {
-            continue;
-        }
-
-        if (haveCurrent && node.ZOrder > currentZ) {
-            if (!haveCandidateAbove || node.ZOrder < candidateAboveZ) {
-                haveCandidateAbove = true;
-                candidateAboveZ = node.ZOrder;
-                candidateAboveId = node.SurfaceId;
-            }
-        }
-
-        if (!haveCandidateFloor || node.ZOrder < candidateFloorZ) {
-            haveCandidateFloor = true;
-            candidateFloorZ = node.ZOrder;
-            candidateFloorId = node.SurfaceId;
-        }
-    }
-
-    if (haveCandidateAbove) {
-        outSurfaceId = candidateAboveId;
-        return true;
-    }
-
-    if (haveCandidateFloor) {
-        outSurfaceId = candidateFloorId;
+    if (IsSurfaceFocusable(currentSurfaceId)) {
+        outSurfaceId = currentSurfaceId;
         return true;
     }
 
@@ -344,12 +509,16 @@ bool FDesktopCompositor::GetTopSurfaceAtPoint(Fortress::Core::int32 x,
                                               Fortress::Core::int32 y,
                                               FDesktopSurfaceId &outSurfaceId) const {
     outSurfaceId = DesktopInvalidSurfaceId;
-    Fortress::Core::uint32 topZ = 0;
-    bool found = false;
+    FDesktopSurfaceId scanId = ZOrderTailSurfaceId;
+    while (scanId != DesktopInvalidSurfaceId) {
+        const Fortress::Core::int32 index = FindSurfaceIndex(scanId);
+        if (index < 0) {
+            break;
+        }
 
-    for (Fortress::Core::uint32 i = 0; i < MaxSurfaces; i++) {
-        const FSurfaceNode &node = Surfaces[i];
+        const FSurfaceNode &node = Surfaces[index];
         if (!node.InUse || !node.Visible || node.SurfaceId == RootSurfaceId) {
+            scanId = node.ZPrevSurfaceId;
             continue;
         }
 
@@ -357,18 +526,15 @@ bool FDesktopCompositor::GetTopSurfaceAtPoint(Fortress::Core::int32 x,
                               (y >= node.Bounds.Y) &&
                               (x < (node.Bounds.X + node.Bounds.Width)) &&
                               (y < (node.Bounds.Y + node.Bounds.Height));
-        if (!contains) {
-            continue;
+        if (contains) {
+            outSurfaceId = node.SurfaceId;
+            return true;
         }
 
-        if (!found || node.ZOrder >= topZ) {
-            found = true;
-            topZ = node.ZOrder;
-            outSurfaceId = node.SurfaceId;
-        }
+        scanId = node.ZPrevSurfaceId;
     }
 
-    return found;
+    return false;
 }
 
 bool FDesktopCompositor::GetSurfaceBounds(FDesktopSurfaceId surfaceId, FDesktopRect &outBounds) const {
@@ -390,6 +556,7 @@ bool FDesktopCompositor::GetSurfaceSnapshot(FDesktopSurfaceId surfaceId, FDeskto
     const FSurfaceNode &node = Surfaces[index];
     outSnapshot = FDesktopSurfaceSnapshot{
         .SurfaceId = node.SurfaceId,
+        .ParentSurfaceId = node.ParentId,
         .Bounds = node.Bounds,
         .ZOrder = node.ZOrder,
         .Visible = node.Visible,
@@ -400,6 +567,88 @@ bool FDesktopCompositor::GetSurfaceSnapshot(FDesktopSurfaceId surfaceId, FDeskto
 
 bool FDesktopCompositor::SurfaceExists(FDesktopSurfaceId surfaceId) const {
     return FindSurfaceIndex(surfaceId) >= 0;
+}
+
+bool FDesktopCompositor::IsSurfaceVisible(FDesktopSurfaceId surfaceId) const {
+    const Fortress::Core::int32 index = FindSurfaceIndex(surfaceId);
+    if (index < 0) {
+        return false;
+    }
+
+    return Surfaces[index].Visible;
+}
+
+Fortress::Core::uint32 FDesktopCompositor::CountChildSurfaces(FDesktopSurfaceId parentId) const {
+    Fortress::Core::uint32 count = 0u;
+    for (Fortress::Core::uint32 i = 0; i < MaxSurfaces; i++) {
+        if (!Surfaces[i].InUse) {
+            continue;
+        }
+
+        if (Surfaces[i].ParentId == parentId) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+bool FDesktopCompositor::GetSurfaceParentId(FDesktopSurfaceId surfaceId, FDesktopSurfaceId &outParentId) const {
+    outParentId = DesktopInvalidSurfaceId;
+    const Fortress::Core::int32 index = FindSurfaceIndex(surfaceId);
+    if (index < 0) {
+        return false;
+    }
+
+    outParentId = Surfaces[index].ParentId;
+    return true;
+}
+
+void FDesktopCompositor::GetChildSurfaceIds(FDesktopSurfaceId parentId,
+                                            FDesktopSurfaceId *outSurfaceIds,
+                                            Fortress::Core::uint32 capacity,
+                                            Fortress::Core::uint32 &outCount) const {
+    outCount = 0u;
+    if (outSurfaceIds == nullptr || capacity == 0u) {
+        return;
+    }
+
+    for (Fortress::Core::uint32 i = 0; i < MaxSurfaces; i++) {
+        const FSurfaceNode &surface = Surfaces[i];
+        if (!surface.InUse || surface.ParentId != parentId) {
+            continue;
+        }
+
+        if (outCount >= capacity) {
+            break;
+        }
+
+        outSurfaceIds[outCount++] = surface.SurfaceId;
+    }
+}
+
+void FDesktopCompositor::GetSurfacesInZOrder(FDesktopSurfaceId *outSurfaceIds,
+                                             Fortress::Core::uint32 capacity,
+                                             Fortress::Core::uint32 &outCount) const {
+    outCount = 0u;
+    if (outSurfaceIds == nullptr || capacity == 0u) {
+        return;
+    }
+
+    FDesktopSurfaceId scanId = ZOrderHeadSurfaceId;
+    while (scanId != DesktopInvalidSurfaceId && outCount < capacity) {
+        const Fortress::Core::int32 scanIndex = FindSurfaceIndex(scanId);
+        if (scanIndex < 0) {
+            break;
+        }
+
+        const FSurfaceNode &surface = Surfaces[scanIndex];
+        if (surface.InUse && surface.SurfaceId != RootSurfaceId) {
+            outSurfaceIds[outCount++] = surface.SurfaceId;
+        }
+
+        scanId = surface.ZNextSurfaceId;
+    }
 }
 
 void FDesktopCompositor::GetActiveSurfaceIds(FDesktopSurfaceId *outSurfaceIds,
@@ -444,6 +693,7 @@ void FDesktopCompositor::GetActiveSurfaceSnapshots(FDesktopSurfaceSnapshot *outS
 
         outSnapshots[outCount++] = FDesktopSurfaceSnapshot{
             .SurfaceId = surface.SurfaceId,
+            .ParentSurfaceId = surface.ParentId,
             .Bounds = surface.Bounds,
             .ZOrder = surface.ZOrder,
             .Visible = surface.Visible,
@@ -509,6 +759,8 @@ void FDesktopCompositor::GetStats(FDesktopCompositorStats &outStats) const {
         .SurfaceCount = surfaceCount,
         .DirtySurfaceCount = dirtyCount,
         .DirtyPixelArea = dirtyPixelArea,
+        .CoalescedDirtyPixelArea = static_cast<Fortress::Core::uint64>(CoalescedDirtyRect.Width > 0 ? CoalescedDirtyRect.Width : 0) *
+                                  static_cast<Fortress::Core::uint64>(CoalescedDirtyRect.Height > 0 ? CoalescedDirtyRect.Height : 0),
         .DirtyAcknowledgeCount = DirtyAcknowledgeCount,
         .DirtyAcknowledgePixels = DirtyAcknowledgePixels,
         .HighestZOrder = ComputeHighestZOrder(),

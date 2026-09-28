@@ -37,6 +37,8 @@ static char ScancodeToAscii(Fortress::Core::uint8 scanCode, bool shiftDown) {
         case 0x17: return shiftDown ? 'I' : 'i';
         case 0x18: return shiftDown ? 'O' : 'o';
         case 0x19: return shiftDown ? 'P' : 'p';
+        case 0x1A: return shiftDown ? '{' : '[';
+        case 0x1B: return shiftDown ? '}' : ']';
         case 0x1E: return shiftDown ? 'A' : 'a';
         case 0x1F: return shiftDown ? 'S' : 's';
         case 0x20: return shiftDown ? 'D' : 'd';
@@ -46,6 +48,10 @@ static char ScancodeToAscii(Fortress::Core::uint8 scanCode, bool shiftDown) {
         case 0x24: return shiftDown ? 'J' : 'j';
         case 0x25: return shiftDown ? 'K' : 'k';
         case 0x26: return shiftDown ? 'L' : 'l';
+        case 0x27: return shiftDown ? ':' : ';';
+        case 0x28: return shiftDown ? '"' : '\'';
+        case 0x29: return shiftDown ? '~' : '`';
+        case 0x2B: return shiftDown ? '|' : '\\';
         case 0x2C: return shiftDown ? 'Z' : 'z';
         case 0x2D: return shiftDown ? 'X' : 'x';
         case 0x2E: return shiftDown ? 'C' : 'c';
@@ -53,6 +59,9 @@ static char ScancodeToAscii(Fortress::Core::uint8 scanCode, bool shiftDown) {
         case 0x30: return shiftDown ? 'B' : 'b';
         case 0x31: return shiftDown ? 'N' : 'n';
         case 0x32: return shiftDown ? 'M' : 'm';
+        case 0x33: return shiftDown ? '<' : ',';
+        case 0x34: return shiftDown ? '>' : '.';
+        case 0x35: return shiftDown ? '?' : '/';
         case 0x39: return ' ';
         case 0x1C: return '\n';
         case 0x0E: return '\b';

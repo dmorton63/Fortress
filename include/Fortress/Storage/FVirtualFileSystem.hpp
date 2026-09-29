@@ -22,6 +22,12 @@ struct FVirtualFileSystemStats {
     Fortress::Core::uint32 Capacity = 0;
 };
 
+struct FVirtualFileSystemMountSnapshot {
+    char MountPath[32] = {};
+    bool ReadOnly = false;
+    const char *DriverName = "";
+};
+
 class FVirtualFileSystem {
   public:
     static bool Initialize();
@@ -38,6 +44,9 @@ class FVirtualFileSystem {
                           const void *inBuffer,
                           Fortress::Core::uint32 inBufferBytes,
                           Fortress::Core::uint32 &outWrittenBytes);
+    static void GetMounts(FVirtualFileSystemMountSnapshot *outMounts,
+                          Fortress::Core::uint32 capacity,
+                          Fortress::Core::uint32 &outCount);
     static void GetStats(FVirtualFileSystemStats &outStats);
 };
 

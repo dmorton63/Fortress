@@ -249,6 +249,37 @@ bool FVirtualFileSystem::WriteFile(const char *absolutePath,
                                    outWrittenBytes);
 }
 
+void FVirtualFileSystem::GetMounts(FVirtualFileSystemMountSnapshot *outMounts,
+                                   Fortress::Core::uint32 capacity,
+                                   Fortress::Core::uint32 &outCount) {
+    outCount = 0u;
+    if (!GInitialized || outMounts == nullptr || capacity == 0u) {
+        return;
+    }
+
+    for (Fortress::Core::uint32 i = 0; i < GMountCapacity; i++) {
+        if (!GMounts[i].InUse) {
+            continue;
+        }
+
+        if (outCount >= capacity) {
+            break;
+        }
+
+        outMounts[outCount] = FVirtualFileSystemMountSnapshot{
+            .ReadOnly = GMounts[i].ReadOnly,
+            .DriverName = (GMounts[i].Driver == nullptr) ? "" : GMounts[i].Driver->GetDriverName(),
+        };
+
+        const Fortress::Core::uint32 mountLen = StringLength(GMounts[i].MountPath, GMaxMountPath);
+        (void)CopyStringBounded(outMounts[outCount].MountPath,
+                                static_cast<Fortress::Core::uint32>(sizeof(outMounts[outCount].MountPath)),
+                                GMounts[i].MountPath,
+                                mountLen);
+        outCount++;
+    }
+}
+
 void FVirtualFileSystem::GetStats(FVirtualFileSystemStats &outStats) {
     outStats = FVirtualFileSystemStats{
         .MountCount = CountMounts(),

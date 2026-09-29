@@ -6551,6 +6551,1762 @@ static void RunVfsStat() {
     PushLog(line);
 }
 
+static void RunVfsResolve(const char *args);
+static void RunLogSave(const char *args);
+
+static bool BuildAbsolutePathFromMountToken(const char *mountToken,
+                                            const char *leafToken,
+                                            char *outPath,
+                                            size_t outPathSize) {
+    if (mountToken == nullptr || mountToken[0] == '\0' || outPath == nullptr || outPathSize < 4u) {
+        return false;
+    }
+
+    size_t pos = 0u;
+    outPath[0] = '\0';
+    AppendString(outPath, outPathSize, pos, "/");
+    for (size_t i = 0u; mountToken[i] != '\0'; i++) {
+        const char c = mountToken[i];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) {
+            return false;
+        }
+        AppendChar(outPath, outPathSize, pos, c);
+    }
+
+    if (leafToken != nullptr && leafToken[0] != '\0') {
+        AppendString(outPath, outPathSize, pos, "/");
+        AppendString(outPath, outPathSize, pos, leafToken);
+    }
+
+    return outPath[0] == '/';
+}
+
+static void RunVfsMounts() {
+    Fortress::Storage::FVirtualFileSystemMountSnapshot mounts[8] = {};
+    uint32_t count = 0u;
+    FVirtualFileSystem::GetMounts(mounts, 8u, count);
+
+    char header[64] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSMOUNTS N ");
+    AppendUInt(header, sizeof(header), headerPos, count);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < count; i++) {
+        char line[144] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "MOUNT ");
+        AppendString(line, sizeof(line), pos, mounts[i].MountPath);
+        AppendString(line, sizeof(line), pos, " RO ");
+        AppendUInt(line, sizeof(line), pos, mounts[i].ReadOnly ? 1u : 0u);
+        AppendString(line, sizeof(line), pos, " DRV ");
+        AppendString(line, sizeof(line), pos, mounts[i].DriverName != nullptr ? mounts[i].DriverName : "");
+        PushLog(line);
+    }
+}
+
+static void RunVfsResolveByMount(const char *mountToken, const char *leafToken) {
+    char path[128] = {};
+    if (!BuildAbsolutePathFromMountToken(mountToken, leafToken, path, sizeof(path))) {
+        PushLog("VFSMRESOLVE MOUNT INVALID");
+        return;
+    }
+
+    RunVfsResolve(path);
+}
+
+static void RunVfsResolveBlockByMount(const char *mountToken, uint32_t blockIndex) {
+    char suffix[48] = {};
+    size_t suffixPos = 0u;
+    AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+    AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+    RunVfsResolveByMount(mountToken, suffix);
+}
+
+static void RunVfsBlockDigestByMount(const char *mountToken, uint32_t blockIndex) {
+    char suffix[48] = {};
+    size_t suffixPos = 0u;
+    AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+    AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+    char path[128] = {};
+    if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+        PushLog("VFSBLKDIGEST MOUNT INVALID");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t readBytes = 0u;
+    if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+        PushLog("VFSBLKDIGEST READ FAIL");
+        return;
+    }
+
+    uint32_t sum = 0u;
+    uint32_t xorv = 0u;
+    for (uint32_t i = 0u; i < readBytes; i++) {
+        sum += buffer[i];
+        xorv ^= buffer[i];
+    }
+
+    char line[160] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "VFSBLKDIGEST ");
+    AppendString(line, sizeof(line), pos, path);
+    AppendString(line, sizeof(line), pos, " BYTES ");
+    AppendUInt(line, sizeof(line), pos, readBytes);
+    AppendString(line, sizeof(line), pos, " SUM ");
+    AppendUInt(line, sizeof(line), pos, sum);
+    AppendString(line, sizeof(line), pos, " XOR ");
+    AppendUInt(line, sizeof(line), pos, xorv);
+    AppendString(line, sizeof(line), pos, " B0 ");
+    AppendHex(line, sizeof(line), pos, (readBytes > 0u) ? buffer[0] : 0u);
+    PushLog(line);
+}
+
+static void RunVfsBlockDigestRangeByMount(const char *mountToken,
+                                          uint32_t startBlock,
+                                          uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 16u) {
+        PushLog("VFSDIGESTRANGE COUNT RANGE 1..16");
+        return;
+    }
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTRANGE MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    uint8_t buffer[4096] = {};
+    uint64_t totalBytes = 0u;
+    uint64_t totalSum = 0u;
+    uint32_t totalXor = 0u;
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTRANGE MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTRANGE READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        totalBytes += readBytes;
+        totalSum += sum;
+        totalXor ^= xorv;
+
+        char line[160] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "VFSBLKDIGEST BLK ");
+        AppendUInt(line, sizeof(line), pos, blockIndex);
+        AppendString(line, sizeof(line), pos, " BYTES ");
+        AppendUInt(line, sizeof(line), pos, readBytes);
+        AppendString(line, sizeof(line), pos, " SUM ");
+        AppendUInt(line, sizeof(line), pos, sum);
+        AppendString(line, sizeof(line), pos, " XOR ");
+        AppendUInt(line, sizeof(line), pos, xorv);
+        AppendString(line, sizeof(line), pos, " B0 ");
+        AppendHex(line, sizeof(line), pos, (readBytes > 0u) ? buffer[0] : 0u);
+        PushLog(line);
+    }
+
+    char summary[160] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTRANGE OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " BYTES ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalBytes);
+    AppendString(summary, sizeof(summary), summaryPos, " SUM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalSum);
+    AppendString(summary, sizeof(summary), summaryPos, " XOR ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalXor);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestCompareByMount(const char *mountToken,
+                                            uint32_t leftBlock,
+                                            uint32_t rightBlock) {
+    uint8_t leftBuffer[4096] = {};
+    uint8_t rightBuffer[4096] = {};
+
+    char leftSuffix[48] = {};
+    size_t leftSuffixPos = 0u;
+    AppendString(leftSuffix, sizeof(leftSuffix), leftSuffixPos, "blk/");
+    AppendUInt(leftSuffix, sizeof(leftSuffix), leftSuffixPos, leftBlock);
+
+    char rightSuffix[48] = {};
+    size_t rightSuffixPos = 0u;
+    AppendString(rightSuffix, sizeof(rightSuffix), rightSuffixPos, "blk/");
+    AppendUInt(rightSuffix, sizeof(rightSuffix), rightSuffixPos, rightBlock);
+
+    char leftPath[128] = {};
+    char rightPath[128] = {};
+    if (!BuildAbsolutePathFromMountToken(mountToken, leftSuffix, leftPath, sizeof(leftPath)) ||
+        !BuildAbsolutePathFromMountToken(mountToken, rightSuffix, rightPath, sizeof(rightPath))) {
+        PushLog("VFSDIGESTCMP MOUNT INVALID");
+        return;
+    }
+
+    uint32_t leftReadBytes = 0u;
+    uint32_t rightReadBytes = 0u;
+    if (!FVirtualFileSystem::ReadFile(leftPath, leftBuffer, sizeof(leftBuffer), leftReadBytes)) {
+        PushLog("VFSDIGESTCMP LEFT READ FAIL");
+        return;
+    }
+    if (!FVirtualFileSystem::ReadFile(rightPath, rightBuffer, sizeof(rightBuffer), rightReadBytes)) {
+        PushLog("VFSDIGESTCMP RIGHT READ FAIL");
+        return;
+    }
+
+    uint32_t leftSum = 0u;
+    uint32_t rightSum = 0u;
+    uint32_t leftXor = 0u;
+    uint32_t rightXor = 0u;
+
+    for (uint32_t i = 0u; i < leftReadBytes; i++) {
+        leftSum += leftBuffer[i];
+        leftXor ^= leftBuffer[i];
+    }
+    for (uint32_t i = 0u; i < rightReadBytes; i++) {
+        rightSum += rightBuffer[i];
+        rightXor ^= rightBuffer[i];
+    }
+
+    uint32_t comparedBytes = leftReadBytes < rightReadBytes ? leftReadBytes : rightReadBytes;
+    uint32_t diffBytes = 0u;
+    uint32_t firstDiff = comparedBytes;
+    for (uint32_t i = 0u; i < comparedBytes; i++) {
+        if (leftBuffer[i] != rightBuffer[i]) {
+            diffBytes++;
+            if (firstDiff == comparedBytes) {
+                firstDiff = i;
+            }
+        }
+    }
+
+    const bool sizesMatch = leftReadBytes == rightReadBytes;
+    const bool equal = sizesMatch && diffBytes == 0u;
+
+    char line[192] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "VFSDIGESTCMP MOUNT ");
+    AppendString(line, sizeof(line), pos, mountToken != nullptr ? mountToken : "");
+    AppendString(line, sizeof(line), pos, " L ");
+    AppendUInt(line, sizeof(line), pos, leftBlock);
+    AppendString(line, sizeof(line), pos, " R ");
+    AppendUInt(line, sizeof(line), pos, rightBlock);
+    AppendString(line, sizeof(line), pos, " EQ ");
+    AppendUInt(line, sizeof(line), pos, equal ? 1u : 0u);
+    AppendString(line, sizeof(line), pos, " LB ");
+    AppendUInt(line, sizeof(line), pos, leftReadBytes);
+    AppendString(line, sizeof(line), pos, " RB ");
+    AppendUInt(line, sizeof(line), pos, rightReadBytes);
+    PushLog(line);
+
+    pos = 0u;
+    line[0] = '\0';
+    AppendString(line, sizeof(line), pos, "VFSDIGESTCMP LS ");
+    AppendUInt(line, sizeof(line), pos, leftSum);
+    AppendString(line, sizeof(line), pos, " LX ");
+    AppendUInt(line, sizeof(line), pos, leftXor);
+    AppendString(line, sizeof(line), pos, " RS ");
+    AppendUInt(line, sizeof(line), pos, rightSum);
+    AppendString(line, sizeof(line), pos, " RX ");
+    AppendUInt(line, sizeof(line), pos, rightXor);
+    AppendString(line, sizeof(line), pos, " DIFF ");
+    AppendUInt(line, sizeof(line), pos, diffBytes);
+    PushLog(line);
+
+    if (!equal) {
+        pos = 0u;
+        line[0] = '\0';
+        AppendString(line, sizeof(line), pos, "VFSDIGESTCMP FIRSTDIFF ");
+        if (sizesMatch && firstDiff < comparedBytes) {
+            AppendUInt(line, sizeof(line), pos, firstDiff);
+        } else if (!sizesMatch) {
+            AppendString(line, sizeof(line), pos, "SIZE");
+        } else {
+            AppendString(line, sizeof(line), pos, "NONE");
+        }
+        PushLog(line);
+    }
+}
+
+static void RunVfsBlockDigestScanByMount(const char *mountToken,
+                                         uint32_t startBlock,
+                                         uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 64u) {
+        PushLog("VFSDIGESTSCAN COUNT RANGE 1..64");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t firstNonZeroBlock = 0u;
+    uint32_t firstNonZeroSet = 0u;
+    uint64_t totalBytes = 0u;
+    uint64_t totalSum = 0u;
+    uint32_t totalXor = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTSCAN MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTSCAN MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTSCAN READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        totalBytes += readBytes;
+        totalSum += sum;
+        totalXor ^= xorv;
+
+        const bool nonZero = (sum != 0u) || (xorv != 0u);
+        if (nonZero) {
+            if (firstNonZeroSet == 0u) {
+                firstNonZeroSet = 1u;
+                firstNonZeroBlock = blockIndex;
+            }
+            nonZeroBlocks++;
+        }
+    }
+
+    char summary[192] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTSCAN OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " FIRSTNZ ");
+    if (firstNonZeroSet != 0u) {
+        AppendUInt(summary, sizeof(summary), summaryPos, firstNonZeroBlock);
+    } else {
+        AppendString(summary, sizeof(summary), summaryPos, "NONE");
+    }
+    AppendString(summary, sizeof(summary), summaryPos, " BYTES ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalBytes);
+    AppendString(summary, sizeof(summary), summaryPos, " SUM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalSum);
+    AppendString(summary, sizeof(summary), summaryPos, " XOR ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalXor);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestNonZeroByMount(const char *mountToken,
+                                            uint32_t startBlock,
+                                            uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 128u) {
+        PushLog("VFSDIGESTNZ COUNT RANGE 1..128");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t totalNonZero = 0u;
+    uint32_t emitted = 0u;
+    uint32_t suppressed = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTNZ MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTNZ MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTNZ READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        const bool nonZero = (sum != 0u) || (xorv != 0u);
+        if (!nonZero) {
+            continue;
+        }
+
+        totalNonZero++;
+        if (emitted >= 16u) {
+            suppressed++;
+            continue;
+        }
+
+        char line[160] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "VFSDIGESTNZ BLK ");
+        AppendUInt(line, sizeof(line), pos, blockIndex);
+        AppendString(line, sizeof(line), pos, " BYTES ");
+        AppendUInt(line, sizeof(line), pos, readBytes);
+        AppendString(line, sizeof(line), pos, " SUM ");
+        AppendUInt(line, sizeof(line), pos, sum);
+        AppendString(line, sizeof(line), pos, " XOR ");
+        AppendUInt(line, sizeof(line), pos, xorv);
+        AppendString(line, sizeof(line), pos, " B0 ");
+        AppendHex(line, sizeof(line), pos, (readBytes > 0u) ? buffer[0] : 0u);
+        PushLog(line);
+        emitted++;
+    }
+
+    char summary[192] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTNZ OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalNonZero);
+    AppendString(summary, sizeof(summary), summaryPos, " EMIT ");
+    AppendUInt(summary, sizeof(summary), summaryPos, emitted);
+    AppendString(summary, sizeof(summary), summaryPos, " SUPPRESS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, suppressed);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestFirstNonZeroByMount(const char *mountToken,
+                                                 uint32_t startBlock,
+                                                 uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 256u) {
+        PushLog("VFSDIGESTFIRST COUNT RANGE 1..256");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTFIRST MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTFIRST MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTFIRST READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            continue;
+        }
+
+        char hit[160] = {};
+        size_t hitPos = 0u;
+        AppendString(hit, sizeof(hit), hitPos, "VFSDIGESTFIRST HIT BLK ");
+        AppendUInt(hit, sizeof(hit), hitPos, blockIndex);
+        AppendString(hit, sizeof(hit), hitPos, " BYTES ");
+        AppendUInt(hit, sizeof(hit), hitPos, readBytes);
+        AppendString(hit, sizeof(hit), hitPos, " SUM ");
+        AppendUInt(hit, sizeof(hit), hitPos, sum);
+        AppendString(hit, sizeof(hit), hitPos, " XOR ");
+        AppendUInt(hit, sizeof(hit), hitPos, xorv);
+        AppendString(hit, sizeof(hit), hitPos, " B0 ");
+        AppendHex(hit, sizeof(hit), hitPos, (readBytes > 0u) ? buffer[0] : 0u);
+        PushLog(hit);
+        return;
+    }
+
+    PushLog("VFSDIGESTFIRST NONE");
+}
+
+static void RunVfsBlockDigestLastNonZeroByMount(const char *mountToken,
+                                                uint32_t startBlock,
+                                                uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 512u) {
+        PushLog("VFSDIGESTLAST COUNT RANGE 1..512");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t hitBlock = 0u;
+    uint32_t hitBytes = 0u;
+    uint32_t hitSum = 0u;
+    uint32_t hitXor = 0u;
+    uint8_t hitB0 = 0u;
+    bool found = false;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTLAST MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTLAST MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTLAST READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            continue;
+        }
+
+        found = true;
+        hitBlock = blockIndex;
+        hitBytes = readBytes;
+        hitSum = sum;
+        hitXor = xorv;
+        hitB0 = (readBytes > 0u) ? buffer[0] : 0u;
+    }
+
+    if (!found) {
+        PushLog("VFSDIGESTLAST NONE");
+        return;
+    }
+
+    char hit[160] = {};
+    size_t hitPos = 0u;
+    AppendString(hit, sizeof(hit), hitPos, "VFSDIGESTLAST HIT BLK ");
+    AppendUInt(hit, sizeof(hit), hitPos, hitBlock);
+    AppendString(hit, sizeof(hit), hitPos, " BYTES ");
+    AppendUInt(hit, sizeof(hit), hitPos, hitBytes);
+    AppendString(hit, sizeof(hit), hitPos, " SUM ");
+    AppendUInt(hit, sizeof(hit), hitPos, hitSum);
+    AppendString(hit, sizeof(hit), hitPos, " XOR ");
+    AppendUInt(hit, sizeof(hit), hitPos, hitXor);
+    AppendString(hit, sizeof(hit), hitPos, " B0 ");
+    AppendHex(hit, sizeof(hit), hitPos, hitB0);
+    PushLog(hit);
+}
+
+static void RunVfsBlockDigestSpanByMount(const char *mountToken,
+                                         uint32_t startBlock,
+                                         uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 1024u) {
+        PushLog("VFSDIGESTSPAN COUNT RANGE 1..1024");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    bool found = false;
+    uint32_t nonZeroBlocks = 0u;
+
+    uint32_t firstBlock = 0u;
+    uint32_t firstBytes = 0u;
+    uint32_t firstSum = 0u;
+    uint32_t firstXor = 0u;
+    uint8_t firstB0 = 0u;
+
+    uint32_t lastBlock = 0u;
+    uint32_t lastBytes = 0u;
+    uint32_t lastSum = 0u;
+    uint32_t lastXor = 0u;
+    uint8_t lastB0 = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTSPAN MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTSPAN MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTSPAN READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            continue;
+        }
+
+        nonZeroBlocks++;
+        if (!found) {
+            found = true;
+            firstBlock = blockIndex;
+            firstBytes = readBytes;
+            firstSum = sum;
+            firstXor = xorv;
+            firstB0 = (readBytes > 0u) ? buffer[0] : 0u;
+        }
+
+        lastBlock = blockIndex;
+        lastBytes = readBytes;
+        lastSum = sum;
+        lastXor = xorv;
+        lastB0 = (readBytes > 0u) ? buffer[0] : 0u;
+    }
+
+    if (!found) {
+        PushLog("VFSDIGESTSPAN NONE");
+        return;
+    }
+
+    char summary[192] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTSPAN HIT NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " FIRST ");
+    AppendUInt(summary, sizeof(summary), summaryPos, firstBlock);
+    AppendString(summary, sizeof(summary), summaryPos, " LAST ");
+    AppendUInt(summary, sizeof(summary), summaryPos, lastBlock);
+    PushLog(summary);
+
+    char firstLine[160] = {};
+    size_t firstPos = 0u;
+    AppendString(firstLine, sizeof(firstLine), firstPos, "VFSDIGESTSPAN FIRST BLK ");
+    AppendUInt(firstLine, sizeof(firstLine), firstPos, firstBlock);
+    AppendString(firstLine, sizeof(firstLine), firstPos, " BYTES ");
+    AppendUInt(firstLine, sizeof(firstLine), firstPos, firstBytes);
+    AppendString(firstLine, sizeof(firstLine), firstPos, " SUM ");
+    AppendUInt(firstLine, sizeof(firstLine), firstPos, firstSum);
+    AppendString(firstLine, sizeof(firstLine), firstPos, " XOR ");
+    AppendUInt(firstLine, sizeof(firstLine), firstPos, firstXor);
+    AppendString(firstLine, sizeof(firstLine), firstPos, " B0 ");
+    AppendHex(firstLine, sizeof(firstLine), firstPos, firstB0);
+    PushLog(firstLine);
+
+    char lastLine[160] = {};
+    size_t lastPos = 0u;
+    AppendString(lastLine, sizeof(lastLine), lastPos, "VFSDIGESTSPAN LAST BLK ");
+    AppendUInt(lastLine, sizeof(lastLine), lastPos, lastBlock);
+    AppendString(lastLine, sizeof(lastLine), lastPos, " BYTES ");
+    AppendUInt(lastLine, sizeof(lastLine), lastPos, lastBytes);
+    AppendString(lastLine, sizeof(lastLine), lastPos, " SUM ");
+    AppendUInt(lastLine, sizeof(lastLine), lastPos, lastSum);
+    AppendString(lastLine, sizeof(lastLine), lastPos, " XOR ");
+    AppendUInt(lastLine, sizeof(lastLine), lastPos, lastXor);
+    AppendString(lastLine, sizeof(lastLine), lastPos, " B0 ");
+    AppendHex(lastLine, sizeof(lastLine), lastPos, lastB0);
+    PushLog(lastLine);
+}
+
+static void RunVfsBlockDigestWindowByMount(const char *mountToken,
+                                           uint32_t startBlock,
+                                           uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 2048u) {
+        PushLog("VFSDIGESTWINDOW COUNT RANGE 1..2048");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint64_t totalBytes = 0u;
+    uint64_t totalSum = 0u;
+    uint32_t totalXor = 0u;
+    bool haveFirst = false;
+    bool haveLast = false;
+    uint32_t firstBlock = 0u;
+    uint32_t lastBlock = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTWINDOW MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTWINDOW MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTWINDOW READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        totalBytes += readBytes;
+        totalSum += sum;
+        totalXor ^= xorv;
+
+        if (sum == 0u && xorv == 0u) {
+            continue;
+        }
+
+        nonZeroBlocks++;
+        if (!haveFirst) {
+            haveFirst = true;
+            firstBlock = blockIndex;
+        }
+        haveLast = true;
+        lastBlock = blockIndex;
+    }
+
+    char summary[192] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTWINDOW OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " FIRST ");
+    if (haveFirst) {
+        AppendUInt(summary, sizeof(summary), summaryPos, firstBlock);
+    } else {
+        AppendString(summary, sizeof(summary), summaryPos, "NONE");
+    }
+    AppendString(summary, sizeof(summary), summaryPos, " LAST ");
+    if (haveLast) {
+        AppendUInt(summary, sizeof(summary), summaryPos, lastBlock);
+    } else {
+        AppendString(summary, sizeof(summary), summaryPos, "NONE");
+    }
+    AppendString(summary, sizeof(summary), summaryPos, " BYTES ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalBytes);
+    AppendString(summary, sizeof(summary), summaryPos, " SUM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalSum);
+    AppendString(summary, sizeof(summary), summaryPos, " XOR ");
+    AppendUInt(summary, sizeof(summary), summaryPos, totalXor);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestRunsByMount(const char *mountToken,
+                                         uint32_t startBlock,
+                                         uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 4096u) {
+        PushLog("VFSDIGESTRUNS COUNT RANGE 1..4096");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t zeroBlocks = 0u;
+    bool haveFirstNonZero = false;
+    bool haveLastNonZero = false;
+    uint32_t firstNonZeroBlock = 0u;
+    uint32_t lastNonZeroBlock = 0u;
+    uint32_t currentNzRun = 0u;
+    uint32_t currentZRun = 0u;
+    uint32_t maxNzRun = 0u;
+    uint32_t maxZRun = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTRUNS MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTRUNS MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTRUNS READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        const bool nonZero = !(sum == 0u && xorv == 0u);
+        if (nonZero) {
+            nonZeroBlocks++;
+            currentNzRun++;
+            if (currentNzRun > maxNzRun) {
+                maxNzRun = currentNzRun;
+            }
+            currentZRun = 0u;
+
+            if (!haveFirstNonZero) {
+                haveFirstNonZero = true;
+                firstNonZeroBlock = blockIndex;
+            }
+            haveLastNonZero = true;
+            lastNonZeroBlock = blockIndex;
+        } else {
+            zeroBlocks++;
+            currentZRun++;
+            if (currentZRun > maxZRun) {
+                maxZRun = currentZRun;
+            }
+            currentNzRun = 0u;
+        }
+    }
+
+    char summary[224] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTRUNS OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " Z ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " FIRSTNZ ");
+    if (haveFirstNonZero) {
+        AppendUInt(summary, sizeof(summary), summaryPos, firstNonZeroBlock);
+    } else {
+        AppendString(summary, sizeof(summary), summaryPos, "NONE");
+    }
+    AppendString(summary, sizeof(summary), summaryPos, " LASTNZ ");
+    if (haveLastNonZero) {
+        AppendUInt(summary, sizeof(summary), summaryPos, lastNonZeroBlock);
+    } else {
+        AppendString(summary, sizeof(summary), summaryPos, "NONE");
+    }
+    AppendString(summary, sizeof(summary), summaryPos, " MAXNZRUN ");
+    AppendUInt(summary, sizeof(summary), summaryPos, maxNzRun);
+    AppendString(summary, sizeof(summary), summaryPos, " MAXZRUN ");
+    AppendUInt(summary, sizeof(summary), summaryPos, maxZRun);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestTransitionsByMount(const char *mountToken,
+                                                uint32_t startBlock,
+                                                uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 8192u) {
+        PushLog("VFSDIGESTTRANS COUNT RANGE 1..8192");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t zeroBlocks = 0u;
+    uint32_t transitions = 0u;
+    uint32_t nzRuns = 0u;
+    uint32_t zRuns = 0u;
+    bool previousStateSet = false;
+    bool previousNonZero = false;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTTRANS MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTTRANS MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTTRANS READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        const bool nonZero = !(sum == 0u && xorv == 0u);
+        if (nonZero) {
+            nonZeroBlocks++;
+        } else {
+            zeroBlocks++;
+        }
+
+        if (!previousStateSet) {
+            previousStateSet = true;
+            previousNonZero = nonZero;
+            if (nonZero) {
+                nzRuns++;
+            } else {
+                zRuns++;
+            }
+            continue;
+        }
+
+        if (nonZero != previousNonZero) {
+            transitions++;
+            if (nonZero) {
+                nzRuns++;
+            } else {
+                zRuns++;
+            }
+            previousNonZero = nonZero;
+        }
+    }
+
+    char summary[224] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTTRANS OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " Z ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " TRANS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, transitions);
+    AppendString(summary, sizeof(summary), summaryPos, " NZRUNS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nzRuns);
+    AppendString(summary, sizeof(summary), summaryPos, " ZRUNS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zRuns);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestDensityByMount(const char *mountToken,
+                                            uint32_t startBlock,
+                                            uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 16384u) {
+        PushLog("VFSDIGESTDENSITY COUNT RANGE 1..16384");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t zeroBlocks = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTDENSITY MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTDENSITY MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTDENSITY READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            zeroBlocks++;
+        } else {
+            nonZeroBlocks++;
+        }
+    }
+
+    const uint32_t densityPct = static_cast<uint32_t>((static_cast<uint64_t>(nonZeroBlocks) * 100u) /
+                                                       static_cast<uint64_t>(blockCount));
+    const uint32_t densityPermille = static_cast<uint32_t>((static_cast<uint64_t>(nonZeroBlocks) * 1000u) /
+                                                           static_cast<uint64_t>(blockCount));
+
+    char summary[224] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTDENSITY OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " Z ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " DENSITYPCT ");
+    AppendUInt(summary, sizeof(summary), summaryPos, densityPct);
+    AppendString(summary, sizeof(summary), summaryPos, " DENSITYPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, densityPermille);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestRatioByMount(const char *mountToken,
+                                          uint32_t startBlock,
+                                          uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 32768u) {
+        PushLog("VFSDIGESTRATIO COUNT RANGE 1..32768");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t zeroBlocks = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTRATIO MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTRATIO MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTRATIO READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            zeroBlocks++;
+        } else {
+            nonZeroBlocks++;
+        }
+    }
+
+    const uint32_t nzPermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(nonZeroBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+    const uint32_t zPermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(zeroBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+
+    const char *dominant = "EQ";
+    uint32_t domDelta = 0u;
+    if (nonZeroBlocks > zeroBlocks) {
+        dominant = "NZ";
+        domDelta = nonZeroBlocks - zeroBlocks;
+    } else if (zeroBlocks > nonZeroBlocks) {
+        dominant = "Z";
+        domDelta = zeroBlocks - nonZeroBlocks;
+    }
+
+    char summary[224] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTRATIO OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " Z ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " NZPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nzPermille);
+    AppendString(summary, sizeof(summary), summaryPos, " ZPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zPermille);
+    AppendString(summary, sizeof(summary), summaryPos, " DOM ");
+    AppendString(summary, sizeof(summary), summaryPos, dominant);
+    AppendString(summary, sizeof(summary), summaryPos, " DOMDELTA ");
+    AppendUInt(summary, sizeof(summary), summaryPos, domDelta);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestBalanceByMount(const char *mountToken,
+                                            uint32_t startBlock,
+                                            uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 65536u) {
+        PushLog("VFSDIGESTBALANCE COUNT RANGE 1..65536");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t zeroBlocks = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTBALANCE MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTBALANCE MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTBALANCE READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            zeroBlocks++;
+        } else {
+            nonZeroBlocks++;
+        }
+    }
+
+    const uint32_t nzPct =
+        static_cast<uint32_t>((static_cast<uint64_t>(nonZeroBlocks) * 100u) / static_cast<uint64_t>(blockCount));
+    const uint32_t zPct =
+        static_cast<uint32_t>((static_cast<uint64_t>(zeroBlocks) * 100u) / static_cast<uint64_t>(blockCount));
+
+    uint32_t deltaBlocks = (nonZeroBlocks >= zeroBlocks) ? (nonZeroBlocks - zeroBlocks) : (zeroBlocks - nonZeroBlocks);
+    const uint32_t balancePermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(deltaBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+
+    const char *dominant = "EQ";
+    if (nonZeroBlocks > zeroBlocks) {
+        dominant = "NZ";
+    } else if (zeroBlocks > nonZeroBlocks) {
+        dominant = "Z";
+    }
+
+    char summary[224] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTBALANCE OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " Z ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " NZPCT ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nzPct);
+    AppendString(summary, sizeof(summary), summaryPos, " ZPCT ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zPct);
+    AppendString(summary, sizeof(summary), summaryPos, " DOM ");
+    AppendString(summary, sizeof(summary), summaryPos, dominant);
+    AppendString(summary, sizeof(summary), summaryPos, " BALPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, balancePermille);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestSkewByMount(const char *mountToken,
+                                         uint32_t startBlock,
+                                         uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 131072u) {
+        PushLog("VFSDIGESTSKEW COUNT RANGE 1..131072");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t zeroBlocks = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTSKEW MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTSKEW MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTSKEW READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            zeroBlocks++;
+        } else {
+            nonZeroBlocks++;
+        }
+    }
+
+    const uint32_t nzPermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(nonZeroBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+    const uint32_t zPermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(zeroBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+
+    const char *dominant = "EQ";
+    uint32_t skewPermille = 0u;
+    if (nzPermille > zPermille) {
+        dominant = "NZ";
+        skewPermille = nzPermille - zPermille;
+    } else if (zPermille > nzPermille) {
+        dominant = "Z";
+        skewPermille = zPermille - nzPermille;
+    }
+
+    char summary[224] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTSKEW OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " Z ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " NZPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nzPermille);
+    AppendString(summary, sizeof(summary), summaryPos, " ZPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zPermille);
+    AppendString(summary, sizeof(summary), summaryPos, " DOM ");
+    AppendString(summary, sizeof(summary), summaryPos, dominant);
+    AppendString(summary, sizeof(summary), summaryPos, " SKEWPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, skewPermille);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestTiltByMount(const char *mountToken,
+                                         uint32_t startBlock,
+                                         uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 262144u) {
+        PushLog("VFSDIGESTTILT COUNT RANGE 1..262144");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t zeroBlocks = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTTILT MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTTILT MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTTILT READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            zeroBlocks++;
+        } else {
+            nonZeroBlocks++;
+        }
+    }
+
+    const uint32_t nzPermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(nonZeroBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+    const uint32_t zPermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(zeroBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+
+    const char *dominant = "EQ";
+    uint32_t tiltPermille = 0u;
+    if (nzPermille > zPermille) {
+        dominant = "NZ";
+        tiltPermille = nzPermille - zPermille;
+    } else if (zPermille > nzPermille) {
+        dominant = "Z";
+        tiltPermille = zPermille - nzPermille;
+    }
+
+    const uint32_t dominantBlocks = (nonZeroBlocks >= zeroBlocks) ? nonZeroBlocks : zeroBlocks;
+    const uint32_t dominancePct =
+        static_cast<uint32_t>((static_cast<uint64_t>(dominantBlocks) * 100u) / static_cast<uint64_t>(blockCount));
+
+    char summary[224] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTTILT OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " Z ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " DOM ");
+    AppendString(summary, sizeof(summary), summaryPos, dominant);
+    AppendString(summary, sizeof(summary), summaryPos, " DOMPCT ");
+    AppendUInt(summary, sizeof(summary), summaryPos, dominancePct);
+    AppendString(summary, sizeof(summary), summaryPos, " TILTPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, tiltPermille);
+    PushLog(summary);
+}
+
+static void RunVfsBlockDigestBiasByMount(const char *mountToken,
+                                         uint32_t startBlock,
+                                         uint32_t blockCount) {
+    if (blockCount == 0u || blockCount > 524288u) {
+        PushLog("VFSDIGESTBIAS COUNT RANGE 1..524288");
+        return;
+    }
+
+    uint8_t buffer[4096] = {};
+    uint32_t nonZeroBlocks = 0u;
+    uint32_t zeroBlocks = 0u;
+
+    char header[128] = {};
+    size_t headerPos = 0u;
+    AppendString(header, sizeof(header), headerPos, "VFSDIGESTBIAS MOUNT ");
+    AppendString(header, sizeof(header), headerPos, mountToken != nullptr ? mountToken : "");
+    AppendString(header, sizeof(header), headerPos, " START ");
+    AppendUInt(header, sizeof(header), headerPos, startBlock);
+    AppendString(header, sizeof(header), headerPos, " COUNT ");
+    AppendUInt(header, sizeof(header), headerPos, blockCount);
+    PushLog(header);
+
+    for (uint32_t i = 0u; i < blockCount; i++) {
+        const uint32_t blockIndex = startBlock + i;
+
+        char suffix[48] = {};
+        size_t suffixPos = 0u;
+        AppendString(suffix, sizeof(suffix), suffixPos, "blk/");
+        AppendUInt(suffix, sizeof(suffix), suffixPos, blockIndex);
+
+        char path[128] = {};
+        if (!BuildAbsolutePathFromMountToken(mountToken, suffix, path, sizeof(path))) {
+            PushLog("VFSDIGESTBIAS MOUNT INVALID");
+            return;
+        }
+
+        uint32_t readBytes = 0u;
+        if (!FVirtualFileSystem::ReadFile(path, buffer, sizeof(buffer), readBytes)) {
+            char fail[128] = {};
+            size_t failPos = 0u;
+            AppendString(fail, sizeof(fail), failPos, "VFSDIGESTBIAS READ FAIL BLK ");
+            AppendUInt(fail, sizeof(fail), failPos, blockIndex);
+            PushLog(fail);
+            return;
+        }
+
+        uint32_t sum = 0u;
+        uint32_t xorv = 0u;
+        for (uint32_t j = 0u; j < readBytes; j++) {
+            sum += buffer[j];
+            xorv ^= buffer[j];
+        }
+
+        if (sum == 0u && xorv == 0u) {
+            zeroBlocks++;
+        } else {
+            nonZeroBlocks++;
+        }
+    }
+
+    const uint32_t nzPermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(nonZeroBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+    const uint32_t zPermille =
+        static_cast<uint32_t>((static_cast<uint64_t>(zeroBlocks) * 1000u) / static_cast<uint64_t>(blockCount));
+
+    const char *dominant = "EQ";
+    uint32_t biasPermille = 0u;
+    if (nzPermille > zPermille) {
+        dominant = "NZ";
+        biasPermille = nzPermille - zPermille;
+    } else if (zPermille > nzPermille) {
+        dominant = "Z";
+        biasPermille = zPermille - nzPermille;
+    }
+
+    uint32_t biasBlocks = 0u;
+    if (nonZeroBlocks >= zeroBlocks) {
+        biasBlocks = nonZeroBlocks - zeroBlocks;
+    } else {
+        biasBlocks = zeroBlocks - nonZeroBlocks;
+    }
+
+    char summary[224] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "VFSDIGESTBIAS OK BLKS ");
+    AppendUInt(summary, sizeof(summary), summaryPos, blockCount);
+    AppendString(summary, sizeof(summary), summaryPos, " NZ ");
+    AppendUInt(summary, sizeof(summary), summaryPos, nonZeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " Z ");
+    AppendUInt(summary, sizeof(summary), summaryPos, zeroBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " DOM ");
+    AppendString(summary, sizeof(summary), summaryPos, dominant);
+    AppendString(summary, sizeof(summary), summaryPos, " BIASBLK ");
+    AppendUInt(summary, sizeof(summary), summaryPos, biasBlocks);
+    AppendString(summary, sizeof(summary), summaryPos, " BIASPM ");
+    AppendUInt(summary, sizeof(summary), summaryPos, biasPermille);
+    PushLog(summary);
+}
+
+static void RunLogSaveByMount(const char *mountToken, uint32_t startBlock, uint32_t blockCount) {
+    char mountPath[64] = {};
+    if (!BuildAbsolutePathFromMountToken(mountToken, nullptr, mountPath, sizeof(mountPath))) {
+        PushLog("LOGSAVEMOUNT MOUNT INVALID");
+        return;
+    }
+
+    char mappedArgs[128] = {};
+    size_t pos = 0u;
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, mountPath);
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, " ");
+    AppendUInt(mappedArgs, sizeof(mappedArgs), pos, startBlock);
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, " ");
+    AppendUInt(mappedArgs, sizeof(mappedArgs), pos, blockCount);
+    RunLogSave(mappedArgs);
+}
+
+static bool SplitTokenAtDelimiter(const char *token,
+                                  char delimiter,
+                                  char *left,
+                                  size_t leftSize,
+                                  char *right,
+                                  size_t rightSize) {
+    if (token == nullptr || left == nullptr || right == nullptr || leftSize == 0u || rightSize == 0u) {
+        return false;
+    }
+
+    left[0] = '\0';
+    right[0] = '\0';
+
+    size_t split = 0u;
+    while (token[split] != '\0' && token[split] != delimiter) {
+        split++;
+    }
+
+    if (token[split] != delimiter || split == 0u || token[split + 1u] == '\0') {
+        return false;
+    }
+
+    size_t leftLen = split;
+    size_t rightLen = 0u;
+    while (token[split + 1u + rightLen] != '\0') {
+        rightLen++;
+    }
+
+    if (leftLen + 1u > leftSize || rightLen + 1u > rightSize) {
+        return false;
+    }
+
+    for (size_t i = 0u; i < leftLen; i++) {
+        left[i] = token[i];
+    }
+    left[leftLen] = '\0';
+
+    for (size_t i = 0u; i < rightLen; i++) {
+        right[i] = token[split + 1u + i];
+    }
+    right[rightLen] = '\0';
+    return true;
+}
+
+static bool ParsePackedBlockRange(const char *token, uint64_t &outStartBlock, uint64_t &outBlockCount) {
+    if (token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    char left[24] = {};
+    char right[24] = {};
+    const char delimiters[3] = {'.', ':', '/'};
+    for (size_t i = 0u; i < sizeof(delimiters); i++) {
+        if (!SplitTokenAtDelimiter(token,
+                                   delimiters[i],
+                                   left,
+                                   sizeof(left),
+                                   right,
+                                   sizeof(right))) {
+            continue;
+        }
+
+        if (!ParseUInt(left, outStartBlock) || !ParseUInt(right, outBlockCount)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
 static bool EnsureServicePortAccess(uint16_t portId, uint32_t serviceId, const char *denyContext) {
     if (FPortManager::CanServiceAccessPort(portId, serviceId)) {
         return true;
@@ -6963,15 +8719,8 @@ static void RunLogSave(const char *args) {
     char startBlockToken[24] = {};
     char blockCountToken[24] = {};
     if (!ReadToken(cursor, mountPathToken, sizeof(mountPathToken)) ||
-        !ReadToken(cursor, startBlockToken, sizeof(startBlockToken)) ||
-        !ReadToken(cursor, blockCountToken, sizeof(blockCountToken))) {
+        !ReadToken(cursor, startBlockToken, sizeof(startBlockToken))) {
         PushLog("LOGSAVE USAGE /MOUNT START_BLOCK BLOCK_COUNT");
-        return;
-    }
-
-    char extraToken[8] = {};
-    if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
-        PushLog("LOGSAVE TOO MANY ARGS");
         return;
     }
 
@@ -6982,8 +8731,22 @@ static void RunLogSave(const char *args) {
 
     uint64_t startBlock = 0u;
     uint64_t blockCount = 0u;
-    if (!ParseUInt(startBlockToken, startBlock) || !ParseUInt(blockCountToken, blockCount)) {
-        PushLog("LOGSAVE ARG INVALID");
+    const bool hasBlockCountToken = ReadToken(cursor, blockCountToken, sizeof(blockCountToken));
+    if (hasBlockCountToken) {
+        if (!ParseUInt(startBlockToken, startBlock) || !ParseUInt(blockCountToken, blockCount)) {
+            PushLog("LOGSAVE ARG INVALID");
+            return;
+        }
+    } else {
+        if (!ParsePackedBlockRange(startBlockToken, startBlock, blockCount)) {
+            PushLog("LOGSAVE USAGE /MOUNT START_BLOCK BLOCK_COUNT");
+            return;
+        }
+    }
+
+    char extraToken[8] = {};
+    if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+        PushLog("LOGSAVE TOO MANY ARGS");
         return;
     }
 
@@ -7092,12 +8855,27 @@ static void RunLogSaveBoot(const char *args) {
     }
 
     const char *cursor = args;
-    char startBlockToken[24] = {};
-    char blockCountToken[24] = {};
-    if (!ReadToken(cursor, startBlockToken, sizeof(startBlockToken)) ||
-        !ReadToken(cursor, blockCountToken, sizeof(blockCountToken))) {
+    char firstToken[24] = {};
+    char secondToken[24] = {};
+    if (!ReadToken(cursor, firstToken, sizeof(firstToken))) {
         PushLog("LOGSAVEBOOT USAGE START_BLOCK BLOCK_COUNT");
         return;
+    }
+
+    bool hasSecondToken = ReadToken(cursor, secondToken, sizeof(secondToken));
+
+    uint64_t startBlock = 0u;
+    uint64_t blockCount = 0u;
+    if (hasSecondToken) {
+        if (!ParseUInt(firstToken, startBlock) || !ParseUInt(secondToken, blockCount)) {
+            PushLog("LOGSAVEBOOT ARG INVALID");
+            return;
+        }
+    } else {
+        if (!ParsePackedBlockRange(firstToken, startBlock, blockCount)) {
+            PushLog("LOGSAVEBOOT USAGE START_BLOCK BLOCK_COUNT");
+            return;
+        }
     }
 
     char extraToken[8] = {};
@@ -7106,12 +8884,21 @@ static void RunLogSaveBoot(const char *args) {
         return;
     }
 
+    char startToken[24] = {};
+    char countToken[24] = {};
+    Fortress::Runtime::Memset(startToken, 0, sizeof(startToken));
+    Fortress::Runtime::Memset(countToken, 0, sizeof(countToken));
+    size_t startPos = 0u;
+    size_t countPos = 0u;
+    AppendUInt(startToken, sizeof(startToken), startPos, startBlock);
+    AppendUInt(countToken, sizeof(countToken), countPos, blockCount);
+
     char mappedArgs[96] = {};
     size_t pos = 0u;
     AppendString(mappedArgs, sizeof(mappedArgs), pos, "/boot ");
-    AppendString(mappedArgs, sizeof(mappedArgs), pos, startBlockToken);
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, startToken);
     AppendString(mappedArgs, sizeof(mappedArgs), pos, " ");
-    AppendString(mappedArgs, sizeof(mappedArgs), pos, blockCountToken);
+    AppendString(mappedArgs, sizeof(mappedArgs), pos, countToken);
     RunLogSave(mappedArgs);
 }
 
@@ -7449,11 +9236,55 @@ static void RunFontCacheReset() {
 }
 
 static void RunUtilityHelp() {
-    PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS] STATS EVENTHEALTH EVENTBURST VFSSTAT VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 LOGSAVE LOGSAVEBOOT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
+    PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS] STATS EVENTHEALTH EVENTBURST VFSSTAT VFSMOUNTS VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 VFSMRESOLVE VFSMBLK VFSBLKDIGEST LOGSAVE LOGSAVEBOOT LOGSAVEMOUNT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
     PushLog("KBD: KBDLAYOUT [US|DVORAK] KBDMODS");
     PushLog("TEXT: TEXTSHAPER [BASIC|WRAP [PX]]");
     PushLog("VFS: VFSRESOLVE /ABS/PATH | VFSBOOT NAME | VFSBOOTBLK INDEX | VFSBOOT0");
-    PushLog("LOG: LOGSAVE /MOUNT START COUNT | LOGSAVEBOOT START COUNT");
+    PushLog("VFS: VFSMOUNTS | VFSMRESOLVE MOUNT LEAF | VFSMBLK MOUNT INDEX | VFSBLKDIGEST MOUNT INDEX");
+    PushLog("VFS: VFSDIGESTRANGE MOUNT START COUNT | VFS DIGESTRANGE MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTCMP MOUNT LEFT RIGHT | VFS DIGESTCMP MOUNT LEFT RIGHT");
+    PushLog("VFS: VFSDIGESTSCAN MOUNT START COUNT | VFS DIGESTSCAN MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTNZ MOUNT START COUNT | VFS DIGESTNZ MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTFIRST MOUNT START COUNT | VFS DIGESTFIRST MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTLAST MOUNT START COUNT | VFS DIGESTLAST MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTSPAN MOUNT START COUNT | VFS DIGESTSPAN MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTWINDOW MOUNT START COUNT | VFS DIGESTWINDOW MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTRUNS MOUNT START COUNT | VFS DIGESTRUNS MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTTRANS MOUNT START COUNT | VFS DIGESTTRANS MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTDENSITY MOUNT START COUNT | VFS DIGESTDENSITY MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTRATIO MOUNT START COUNT | VFS DIGESTRATIO MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTBALANCE MOUNT START COUNT | VFS DIGESTBALANCE MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTSKEW MOUNT START COUNT | VFS DIGESTSKEW MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTTILT MOUNT START COUNT | VFS DIGESTTILT MOUNT START COUNT");
+    PushLog("VFS: VFSDIGESTBIAS MOUNT START COUNT | VFS DIGESTBIAS MOUNT START COUNT");
+    PushLog("VFS ALIAS: VFS MOUNTS | VFS RESOLVE /ABS/PATH | VFS BOOT NAME | VFS BOOTBLK INDEX | VFS BOOT0");
+    PushLog("VFS ALIAS: VFS MRESOLVE MOUNT LEAF | VFS MBLK MOUNT INDEX | VFS BLKDIGEST MOUNT INDEX");
+    PushLog("VFS ALIAS: VFS RESOLVE BOOTBLK [INDEX] | VFS RESOLVE BOOT0 | VFS RESOLVE BOOT NAME");
+    PushLog("VFS ALIAS: VFS RESOLVE MBLK MOUNT INDEX | VFS RESOLVE MRESOLVE MOUNT LEAF");
+    PushLog("VFS ALIAS: VFS RESOLVE BOOTBLK/INDEX | VFS RESOLVE BOOT/NAME | VFS RESOLVE MBLK MOUNT:INDEX");
+    PushLog("VFS ALIAS: VFS RESOLVE MRESOLVE MOUNT:LEAF");
+    PushLog("VFS ALIAS: VFSMBLK MOUNT:INDEX | VFS MBLK MOUNT:INDEX | VFSBLKDIGEST MOUNT:INDEX | VFS BLKDIGEST MOUNT:INDEX");
+    PushLog("VFS ALIAS: VFSMRESOLVE MOUNT:LEAF | VFS MRESOLVE MOUNT:LEAF | VFSBOOTBLK/INDEX | VFS BOOTBLK/INDEX");
+    PushLog("VFS ALIAS: VFSDIGESTRANGE MOUNT START.COUNT | VFS DIGESTRANGE MOUNT START.COUNT (COUNT 1..16)");
+    PushLog("VFS ALIAS: VFSDIGESTCMP MOUNT LEFT.RIGHT | VFS DIGESTCMP MOUNT LEFT:RIGHT");
+    PushLog("VFS ALIAS: VFSDIGESTSCAN MOUNT START.COUNT | VFS DIGESTSCAN MOUNT START:COUNT (COUNT 1..64)");
+    PushLog("VFS ALIAS: VFSDIGESTNZ MOUNT START.COUNT | VFS DIGESTNZ MOUNT START:COUNT (COUNT 1..128)");
+    PushLog("VFS ALIAS: VFSDIGESTFIRST MOUNT START.COUNT | VFS DIGESTFIRST MOUNT START:COUNT (COUNT 1..256)");
+    PushLog("VFS ALIAS: VFSDIGESTLAST MOUNT START.COUNT | VFS DIGESTLAST MOUNT START:COUNT (COUNT 1..512)");
+    PushLog("VFS ALIAS: VFSDIGESTSPAN MOUNT START.COUNT | VFS DIGESTSPAN MOUNT START:COUNT (COUNT 1..1024)");
+    PushLog("VFS ALIAS: VFSDIGESTWINDOW MOUNT START.COUNT | VFS DIGESTWINDOW MOUNT START:COUNT (COUNT 1..2048)");
+    PushLog("VFS ALIAS: VFSDIGESTRUNS MOUNT START.COUNT | VFS DIGESTRUNS MOUNT START:COUNT (COUNT 1..4096)");
+    PushLog("VFS ALIAS: VFSDIGESTTRANS MOUNT START.COUNT | VFS DIGESTTRANS MOUNT START:COUNT (COUNT 1..8192)");
+    PushLog("VFS ALIAS: VFSDIGESTDENSITY MOUNT START.COUNT | VFS DIGESTDENSITY MOUNT START:COUNT (COUNT 1..16384)");
+    PushLog("VFS ALIAS: VFSDIGESTRATIO MOUNT START.COUNT | VFS DIGESTRATIO MOUNT START:COUNT (COUNT 1..32768)");
+    PushLog("VFS ALIAS: VFSDIGESTBALANCE MOUNT START.COUNT | VFS DIGESTBALANCE MOUNT START:COUNT (COUNT 1..65536)");
+    PushLog("VFS ALIAS: VFSDIGESTSKEW MOUNT START.COUNT | VFS DIGESTSKEW MOUNT START:COUNT (COUNT 1..131072)");
+    PushLog("VFS ALIAS: VFSDIGESTTILT MOUNT START.COUNT | VFS DIGESTTILT MOUNT START:COUNT (COUNT 1..262144)");
+    PushLog("VFS ALIAS: VFSDIGESTBIAS MOUNT START.COUNT | VFS DIGESTBIAS MOUNT START:COUNT (COUNT 1..524288)");
+    PushLog("LOG: LOGSAVE /MOUNT START COUNT | LOGSAVEBOOT START COUNT | LOGSAVEMOUNT MOUNT START COUNT");
+    PushLog("LOG ALIAS: LOG SAVEMOUNT MOUNT START COUNT");
+    PushLog("LOG ALIAS: LOG SAVE /MOUNT START COUNT | LOG SAVEBOOT START COUNT");
+    PushLog("LOG ALIAS: LOGSAVE /MOUNT START.COUNT | LOGSAVEBOOT START.COUNT | LOG SAVEMOUNT MOUNT START.COUNT");
     PushLog("FONT: FONTCACHE [RESET]");
     PushLog("DSKSURF: DSKSURFSTAT DSKSURFRAISE [ID] DSKSURFFOCUS [ID|NEXT]");
     PushLog("DSKSURF: DSKSURFCAPTURE [ID|OFF] DSKSURFINPUT (RX/DROP/PTR/CLK)");
@@ -7468,7 +9299,7 @@ static void RunUtilityHelp() {
     PushLog("CPU: PARALLELHUD [ON|OFF] (HUD PARALLEL STATS SECTION)");
     PushLog("EVENT: EVENTHEALTH EVENTBURST [N] (N: 1..200000, DEFAULT 2048)");
     PushLog("HUD: SHOWLOG BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS] LAYERS");
-    PushLog("VFS: VFSSTAT VFSRESOLVE /ABS/PATH");
+    PushLog("VFS: VFSSTAT VFSMOUNTS VFSRESOLVE /ABS/PATH");
     PushLog("VFS: LOGSAVE /MOUNT START_BLOCK BLOCK_COUNT (writes boot+runtime logs to /MOUNT/blk/N)");
     PushLog("PMM: PALLOC [N] PFREE PRESERVE LOW");
     PushLog("VMM: VMMAP VA PA [N] [rw|rwnx|rx|dev]");
@@ -7613,7 +9444,28 @@ static bool TryProcessUtilityCommand() {
         .ParseUIntFn = ParseUInt,
         .RunEventBurstFn = RunEventBurst,
         .RunVfsStatFn = RunVfsStat,
+        .RunVfsMountsFn = RunVfsMounts,
         .RunVfsResolveFn = RunVfsResolve,
+        .RunVfsResolveByMountFn = RunVfsResolveByMount,
+        .RunVfsResolveBlockByMountFn = RunVfsResolveBlockByMount,
+        .RunVfsBlockDigestByMountFn = RunVfsBlockDigestByMount,
+        .RunVfsBlockDigestRangeByMountFn = RunVfsBlockDigestRangeByMount,
+        .RunVfsBlockDigestCompareByMountFn = RunVfsBlockDigestCompareByMount,
+        .RunVfsBlockDigestScanByMountFn = RunVfsBlockDigestScanByMount,
+        .RunVfsBlockDigestNonZeroByMountFn = RunVfsBlockDigestNonZeroByMount,
+        .RunVfsBlockDigestFirstNonZeroByMountFn = RunVfsBlockDigestFirstNonZeroByMount,
+        .RunVfsBlockDigestLastNonZeroByMountFn = RunVfsBlockDigestLastNonZeroByMount,
+        .RunVfsBlockDigestSpanByMountFn = RunVfsBlockDigestSpanByMount,
+        .RunVfsBlockDigestWindowByMountFn = RunVfsBlockDigestWindowByMount,
+        .RunVfsBlockDigestRunsByMountFn = RunVfsBlockDigestRunsByMount,
+        .RunVfsBlockDigestTransitionsByMountFn = RunVfsBlockDigestTransitionsByMount,
+        .RunVfsBlockDigestDensityByMountFn = RunVfsBlockDigestDensityByMount,
+        .RunVfsBlockDigestRatioByMountFn = RunVfsBlockDigestRatioByMount,
+        .RunVfsBlockDigestBalanceByMountFn = RunVfsBlockDigestBalanceByMount,
+        .RunVfsBlockDigestSkewByMountFn = RunVfsBlockDigestSkewByMount,
+        .RunVfsBlockDigestTiltByMountFn = RunVfsBlockDigestTiltByMount,
+        .RunVfsBlockDigestBiasByMountFn = RunVfsBlockDigestBiasByMount,
+        .RunLogSaveByMountFn = RunLogSaveByMount,
         .RunServiceDbStatsFn = RunServiceDbStats,
         .RunServiceDbFindFn = RunServiceDbFind,
         .RunPortPolicyStatsFn = RunPortPolicyStats,
@@ -8070,6 +9922,18 @@ static void ProcessCommand() {
 
     if (TryProcessRuntimeControlCommand(runtimeControlContext)) {
     } else if (TryProcessUtilityCommand()) {
+    } else if (StrEq(GCommandBuffer, "log saveboot") || StartsWith(GCommandBuffer, "log saveboot ")) {
+        if (StrEq(GCommandBuffer, "log saveboot")) {
+            PushLog("LOGSAVEBOOT USAGE START_BLOCK BLOCK_COUNT");
+        } else {
+            RunLogSaveBoot(GCommandBuffer + 13);
+        }
+    } else if (StrEq(GCommandBuffer, "log save") || StartsWith(GCommandBuffer, "log save ")) {
+        if (StrEq(GCommandBuffer, "log save")) {
+            PushLog("LOGSAVE USAGE /MOUNT START_BLOCK BLOCK_COUNT");
+        } else {
+            RunLogSave(GCommandBuffer + 9);
+        }
     } else if (StrEq(GCommandBuffer, "logsaveboot") || StartsWith(GCommandBuffer, "logsaveboot ")) {
         if (StrEq(GCommandBuffer, "logsaveboot")) {
             PushLog("LOGSAVEBOOT USAGE START_BLOCK BLOCK_COUNT");

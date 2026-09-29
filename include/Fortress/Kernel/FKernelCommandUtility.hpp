@@ -18,7 +18,52 @@ struct FKernelUtilityCommandContext {
 
     void (*RunEventBurstFn)(uint32_t burstCount);
     void (*RunVfsStatFn)();
+    void (*RunVfsMountsFn)();
     void (*RunVfsResolveFn)(const char *path);
+    void (*RunVfsResolveByMountFn)(const char *mountToken, const char *leafToken);
+    void (*RunVfsResolveBlockByMountFn)(const char *mountToken, uint32_t blockIndex);
+    void (*RunVfsBlockDigestByMountFn)(const char *mountToken, uint32_t blockIndex);
+    void (*RunVfsBlockDigestRangeByMountFn)(const char *mountToken, uint32_t startBlock, uint32_t blockCount);
+    void (*RunVfsBlockDigestCompareByMountFn)(const char *mountToken, uint32_t leftBlock, uint32_t rightBlock);
+    void (*RunVfsBlockDigestScanByMountFn)(const char *mountToken, uint32_t startBlock, uint32_t blockCount);
+    void (*RunVfsBlockDigestNonZeroByMountFn)(const char *mountToken, uint32_t startBlock, uint32_t blockCount);
+    void (*RunVfsBlockDigestFirstNonZeroByMountFn)(const char *mountToken,
+                                                   uint32_t startBlock,
+                                                   uint32_t blockCount);
+    void (*RunVfsBlockDigestLastNonZeroByMountFn)(const char *mountToken,
+                                                  uint32_t startBlock,
+                                                  uint32_t blockCount);
+    void (*RunVfsBlockDigestSpanByMountFn)(const char *mountToken,
+                                           uint32_t startBlock,
+                                           uint32_t blockCount);
+    void (*RunVfsBlockDigestWindowByMountFn)(const char *mountToken,
+                                             uint32_t startBlock,
+                                             uint32_t blockCount);
+    void (*RunVfsBlockDigestRunsByMountFn)(const char *mountToken,
+                                           uint32_t startBlock,
+                                           uint32_t blockCount);
+    void (*RunVfsBlockDigestTransitionsByMountFn)(const char *mountToken,
+                                                  uint32_t startBlock,
+                                                  uint32_t blockCount);
+    void (*RunVfsBlockDigestDensityByMountFn)(const char *mountToken,
+                                              uint32_t startBlock,
+                                              uint32_t blockCount);
+    void (*RunVfsBlockDigestRatioByMountFn)(const char *mountToken,
+                                            uint32_t startBlock,
+                                            uint32_t blockCount);
+    void (*RunVfsBlockDigestBalanceByMountFn)(const char *mountToken,
+                                              uint32_t startBlock,
+                                              uint32_t blockCount);
+    void (*RunVfsBlockDigestSkewByMountFn)(const char *mountToken,
+                                           uint32_t startBlock,
+                                           uint32_t blockCount);
+    void (*RunVfsBlockDigestTiltByMountFn)(const char *mountToken,
+                                           uint32_t startBlock,
+                                           uint32_t blockCount);
+    void (*RunVfsBlockDigestBiasByMountFn)(const char *mountToken,
+                                           uint32_t startBlock,
+                                           uint32_t blockCount);
+    void (*RunLogSaveByMountFn)(const char *mountToken, uint32_t startBlock, uint32_t blockCount);
     void (*RunServiceDbStatsFn)();
     void (*RunServiceDbFindFn)(uint32_t serviceId);
     void (*RunPortPolicyStatsFn)();

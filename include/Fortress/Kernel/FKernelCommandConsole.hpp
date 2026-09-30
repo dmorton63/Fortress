@@ -47,6 +47,11 @@ class FKernelCommandConsole {
     static EHudLogViewMode GetHudLogViewMode();
     static EHudLogDetailMode GetHudLogDetailMode();
     static bool IsTerminalModeEnabled();
+    static bool IsTerminalWindowEnabled();
+    static bool TryGetTerminalWindowBounds(Fortress::Core::int32 &outX,
+                         Fortress::Core::int32 &outY,
+                         Fortress::Core::int32 &outWidth,
+                         Fortress::Core::int32 &outHeight);
     static bool IsHudParallelStatsEnabled();
     static Fortress::Core::usize GetLogCount();
     static const char *GetLogLine(Fortress::Core::usize index);

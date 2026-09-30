@@ -126,7 +126,11 @@ bool TryProcessUtilityCommand(FKernelUtilityCommandContext &context) {
         context.SetHudLogShowWarnFn == nullptr || context.SetHudLogShowAllIssuesFn == nullptr ||
         context.SetHudLogBootFn == nullptr || context.SetHudLogHiddenFn == nullptr ||
         context.RunTerminalModeQueryFn == nullptr || context.SetTerminalModeOnFn == nullptr ||
-        context.SetTerminalModeOffFn == nullptr ||
+        context.SetTerminalModeOffFn == nullptr || context.RunTerminalFilterQueryFn == nullptr ||
+        context.SetTerminalFilterQuietFn == nullptr || context.SetTerminalFilterNormalFn == nullptr ||
+        context.SetTerminalFilterFullFn == nullptr || context.RunTerminalWindowQueryFn == nullptr ||
+        context.SetTerminalWindowOnFn == nullptr || context.SetTerminalWindowOffFn == nullptr ||
+        context.ToggleTerminalWindowFn == nullptr ||
         context.RunParallelHudQueryFn == nullptr || context.SetParallelHudOnFn == nullptr ||
         context.SetParallelHudOffFn == nullptr ||
         context.RunKbdLayoutQueryFn == nullptr || context.RunKbdLayoutSetUsFn == nullptr ||
@@ -134,7 +138,14 @@ bool TryProcessUtilityCommand(FKernelUtilityCommandContext &context) {
         context.RunTextShaperQueryFn == nullptr || context.RunTextShaperSetBasicFn == nullptr ||
         context.RunTextShaperSetWrapFn == nullptr || context.RunFontCacheQueryFn == nullptr ||
         context.RunFontCacheResetFn == nullptr || context.RunHelpFn == nullptr ||
-        context.RunEventHealthFn == nullptr || context.RunStatsFn == nullptr ||
+        context.RunEventHealthFn == nullptr || context.RunSubsystemHealthFn == nullptr ||
+        context.RunSubsystemHealthBriefFn == nullptr || context.RunSubsystemHealthForceFn == nullptr ||
+        context.RunSubsystemHealthIntervalFn == nullptr ||
+        context.RunAiMonitorFn == nullptr || context.RunAiMonitorEvaluateFn == nullptr ||
+        context.RunAiMonitorPolicySetFn == nullptr ||
+        context.RunAiMonitorThresholdFn == nullptr ||
+        context.RunAiMonitorStateFn == nullptr ||
+        context.RunStatsFn == nullptr ||
         context.RunRenderLayersFn == nullptr || context.ClearCommandInputFn == nullptr) {
         return false;
     }
@@ -196,6 +207,48 @@ bool TryProcessUtilityCommand(FKernelUtilityCommandContext &context) {
 
     if (context.StrEqFn(context.CommandBuffer, "terminal status")) {
         context.RunTerminalModeQueryFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "terminal filter") ||
+        context.StrEqFn(context.CommandBuffer, "terminal filter status")) {
+        context.RunTerminalFilterQueryFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "terminal filter quiet")) {
+        context.SetTerminalFilterQuietFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "terminal filter normal")) {
+        context.SetTerminalFilterNormalFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "terminal filter full")) {
+        context.SetTerminalFilterFullFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "terminal window") ||
+        context.StrEqFn(context.CommandBuffer, "terminal window status")) {
+        context.RunTerminalWindowQueryFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "terminal window on")) {
+        context.SetTerminalWindowOnFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "terminal window off")) {
+        context.SetTerminalWindowOffFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "terminal window toggle")) {
+        context.ToggleTerminalWindowFn();
         return true;
     }
 
@@ -281,6 +334,100 @@ bool TryProcessUtilityCommand(FKernelUtilityCommandContext &context) {
 
     if (context.StrEqFn(context.CommandBuffer, "eventhealth")) {
         context.RunEventHealthFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "subsyshealth") ||
+        context.StrEqFn(context.CommandBuffer, "subsys health")) {
+        context.RunSubsystemHealthFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "subsyshealth brief") ||
+        context.StrEqFn(context.CommandBuffer, "subsys health brief")) {
+        context.RunSubsystemHealthBriefFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "subsyshealth force") ||
+        context.StrEqFn(context.CommandBuffer, "subsys health force")) {
+        context.RunSubsystemHealthForceFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "subsyshealth interval") ||
+        context.StrEqFn(context.CommandBuffer, "subsys health interval")) {
+        (void)context.RunSubsystemHealthIntervalFn(nullptr);
+        return true;
+    }
+
+    if (context.StartsWithFn(context.CommandBuffer, "subsyshealth interval ")) {
+        (void)context.RunSubsystemHealthIntervalFn(context.CommandBuffer + 21);
+        return true;
+    }
+
+    if (context.StartsWithFn(context.CommandBuffer, "subsys health interval ")) {
+        (void)context.RunSubsystemHealthIntervalFn(context.CommandBuffer + 22);
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "aimon") ||
+        context.StrEqFn(context.CommandBuffer, "ai monitor")) {
+        context.RunAiMonitorFn();
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "aimon policy") ||
+        context.StrEqFn(context.CommandBuffer, "ai monitor policy")) {
+        (void)context.RunAiMonitorPolicySetFn(nullptr);
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "aimon threshold") ||
+        context.StrEqFn(context.CommandBuffer, "ai monitor threshold")) {
+        (void)context.RunAiMonitorThresholdFn(nullptr);
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "aimon state") ||
+        context.StrEqFn(context.CommandBuffer, "ai monitor state")) {
+        (void)context.RunAiMonitorStateFn(nullptr);
+        return true;
+    }
+
+    if (context.StartsWithFn(context.CommandBuffer, "aimon policy ")) {
+        (void)context.RunAiMonitorPolicySetFn(context.CommandBuffer + 13);
+        return true;
+    }
+
+    if (context.StartsWithFn(context.CommandBuffer, "aimon threshold ")) {
+        (void)context.RunAiMonitorThresholdFn(context.CommandBuffer + 16);
+        return true;
+    }
+
+    if (context.StartsWithFn(context.CommandBuffer, "ai monitor policy ")) {
+        (void)context.RunAiMonitorPolicySetFn(context.CommandBuffer + 18);
+        return true;
+    }
+
+    if (context.StartsWithFn(context.CommandBuffer, "ai monitor threshold ")) {
+        (void)context.RunAiMonitorThresholdFn(context.CommandBuffer + 21);
+        return true;
+    }
+
+    if (context.StartsWithFn(context.CommandBuffer, "aimon state ")) {
+        (void)context.RunAiMonitorStateFn(context.CommandBuffer + 12);
+        return true;
+    }
+
+    if (context.StartsWithFn(context.CommandBuffer, "ai monitor state ")) {
+        (void)context.RunAiMonitorStateFn(context.CommandBuffer + 17);
+        return true;
+    }
+
+    if (context.StrEqFn(context.CommandBuffer, "aimon eval") ||
+        context.StrEqFn(context.CommandBuffer, "ai monitor eval")) {
+        context.RunAiMonitorEvaluateFn();
         return true;
     }
 

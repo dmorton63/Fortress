@@ -521,12 +521,42 @@ static void ExecuteDesktopSurfacesPass(const FFramePassContext &context) {
 }
 
 static void ExecuteHudPass(const FFramePassContext &context) {
-    const Fortress::Core::int32 panelX = 8;
-    const Fortress::Core::int32 panelY = 8;
-    const Fortress::Core::int32 panelWidth =
+    Fortress::Core::int32 panelX = 8;
+    Fortress::Core::int32 panelY = 8;
+    Fortress::Core::int32 panelWidth =
         static_cast<Fortress::Core::int32>(context.FrameContext.BackSurface.Desc.Width) - (panelX * 2);
-    const Fortress::Core::int32 panelHeight =
+    Fortress::Core::int32 panelHeight =
         static_cast<Fortress::Core::int32>(context.FrameContext.BackSurface.Desc.Height) - (panelY * 2);
+
+    if (FKernelCommandConsole::IsTerminalModeEnabled()) {
+        Fortress::Core::int32 terminalX = 0;
+        Fortress::Core::int32 terminalY = 0;
+        Fortress::Core::int32 terminalWidth = 0;
+        Fortress::Core::int32 terminalHeight = 0;
+        if (FKernelCommandConsole::TryGetTerminalWindowBounds(terminalX, terminalY, terminalWidth, terminalHeight)) {
+            panelX = terminalX;
+            panelY = terminalY;
+            panelWidth = terminalWidth;
+            panelHeight = terminalHeight;
+        }
+    }
+
+    const Fortress::Core::int32 screenWidth = static_cast<Fortress::Core::int32>(context.FrameContext.BackSurface.Desc.Width);
+    const Fortress::Core::int32 screenHeight = static_cast<Fortress::Core::int32>(context.FrameContext.BackSurface.Desc.Height);
+    if (panelX < 0) {
+        panelWidth += panelX;
+        panelX = 0;
+    }
+    if (panelY < 0) {
+        panelHeight += panelY;
+        panelY = 0;
+    }
+    if (panelX + panelWidth > screenWidth) {
+        panelWidth = screenWidth - panelX;
+    }
+    if (panelY + panelHeight > screenHeight) {
+        panelHeight = screenHeight - panelY;
+    }
 
     if (panelWidth <= 0 || panelHeight <= 0) {
         return;
@@ -582,10 +612,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
     const Fortress::Core::int32 logBottomY = pinnedLogHintY - 8;
 
     if (FKernelCommandConsole::IsTerminalModeEnabled()) {
-        DrawHudTextLine("FORTRESS TERMINAL", Fortress::Video::FColor::RGB(255, 255, 210), cursorY);
-        cursorY += lineAdvance;
-
-        DrawHudTextLine("TYPE HELP FOR COMMANDS", Fortress::Video::FColor::RGB(210, 255, 220), cursorY);
+        DrawHudTextLine("TERMINAL", Fortress::Video::FColor::RGB(255, 255, 210), cursorY);
         cursorY += lineAdvance;
 
         DrawFilledRect(context.FrameContext.BackSurface,
@@ -632,7 +659,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
             }
         }
 
-        DrawHudTextLine("TERMINAL MODE ON  (TERMINAL OFF TO EXIT)", Fortress::Video::FColor::RGB(235, 230, 170), pinnedLogHintY);
+        DrawHudTextLine("TERMINAL ON", Fortress::Video::FColor::RGB(235, 230, 170), pinnedLogHintY);
 
         DrawFilledRect(context.FrameContext.BackSurface,
                        separatorX,
@@ -673,7 +700,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
         GInputCaretFrameCounter++;
         const bool caretVisible = ((GInputCaretFrameCounter / 18u) % 2u) == 0u;
 
-        char inputDisplayLine[96] = {};
+        char inputDisplayLine[256] = {};
         BuildInputDisplayLine(FKernelCommandConsole::GetCommandBuffer(),
                               maxInputChars,
                               caretVisible,

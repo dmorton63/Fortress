@@ -345,3 +345,107 @@ Batch 1 focuses on subsystem progress outside USB/xHCI, aligned to Desktop Compo
 8. [x] Emit digest-bias summary with non-zero and zero block counts.
 9. [x] Emit bias metrics (`DOM/BIASBLK/BIASPM`) across the range.
 10. [x] Update help text and utility context wiring for digest-bias commands.
+
+## Batch 27 (10 items)
+
+1. [x] Add subsystem baseline architecture document and ownership map for non-VFS domains.
+2. [x] Add kernel subsystem phase enum and runtime state tracker (Boot, Init, Ready, Degraded).
+3. [x] Add subsystem health snapshot struct for scheduler, event manager, services, network, security, desktop, and window stacks.
+4. [x] Add diagnostics API to publish subsystem health snapshots through runtime diagnostics.
+5. [x] Add scheduler health metrics bridge (ready depth, preemption count, starvation counter, tick drift).
+6. [x] Add event manager health metrics bridge (queue depth, fan-out latency, dropped events, handler faults).
+7. [x] Add service subsystem health metrics bridge (service count, failed starts, restart attempts, dependency violations).
+8. [x] Add security subsystem baseline health metrics (denied capability checks, policy load status, audit queue pressure).
+9. [x] Add network subsystem baseline health metrics stubs (interface count, RX/TX counters, drop counters, link state).
+10. [x] Add AI execution monitoring subsystem scaffold with telemetry ingress interface and no-op policy evaluator hook.
+
+## Batch 28 (10 items)
+
+1. [x] Add command utility callback hooks for subsystem-health and AI-monitor introspection commands.
+2. [x] Add `subsyshealth` command to print published subsystem health snapshot metrics.
+3. [x] Add `subsys health` alias command form for subsystem health introspection.
+4. [x] Add `aimon` command to print AI monitor telemetry and policy/action state.
+5. [x] Add `aimon eval` command to force policy evaluation of current telemetry.
+6. [x] Add `ai monitor` and `ai monitor eval` alias command forms.
+7. [x] Add static runtime diagnostics accessor for latest published subsystem health snapshot.
+8. [x] Add AI monitor accessor APIs for policy-installed state and last action value.
+9. [x] Install explicit no-op AI policy evaluator hook during kernel bootstrap.
+10. [x] Update utility help text with subsystem/AI observability command family.
+
+## Batch 29 (10 items)
+
+1. [x] Add built-in AI policy mode enum for `NOOP/ALERT/THROTTLE/ISOLATE/RESTART` profiles.
+2. [x] Implement built-in AI policy evaluation path when no custom evaluator is installed.
+3. [x] Add AI monitor API to set/query built-in policy mode and mode-name string.
+4. [x] Add utility callback hook for AI monitor policy command parsing and dispatch.
+5. [x] Add `aimon policy` command to query current built-in policy mode.
+6. [x] Add `aimon policy <mode>` command to set built-in policy mode.
+7. [x] Add `ai monitor policy` alias command family.
+8. [x] Extend `aimon` output with custom-policy installed flag and active built-in policy mode.
+9. [x] Switch bootstrap AI monitor initialization to explicit built-in policy mode setup.
+10. [x] Update utility help text with AI policy command usage.
+
+## Batch 30 (10 items)
+
+1. [x] Add AI policy threshold struct for built-in policy tuning (alert/throttle/isolate/restart).
+2. [x] Add AI monitor APIs to get/set/reset built-in policy thresholds.
+3. [x] Route built-in policy evaluation through configurable thresholds instead of hard-coded constants.
+4. [x] Add utility callback hook for AI threshold command handling.
+5. [x] Add `aimon threshold` command to print current threshold values.
+6. [x] Add `aimon threshold reset` command to restore default threshold values.
+7. [x] Add `aimon threshold set <key> <value>` command with validation and key map.
+8. [x] Add `ai monitor threshold` alias command family.
+9. [x] Extend `aimon` output with threshold summaries for live policy tuning context.
+10. [x] Update utility help text with AI threshold command usage and supported keys.
+
+## Batch 31 (10 items)
+
+1. [x] Add runtime diagnostics API to force an immediate subsystem health snapshot publish.
+2. [x] Add runtime diagnostics API to get/set/reset subsystem health publish interval ticks.
+3. [x] Update runtime diagnostics publish scheduler to honor force-publish requests and configurable interval.
+4. [x] Add utility callback hooks for subsystem health `brief`, `force`, and `interval` controls.
+5. [x] Add `subsyshealth brief` command to emit compact phase/tick/ready/event/security summary.
+6. [x] Add `subsyshealth force` command to request immediate subsystem snapshot publication.
+7. [x] Add `subsyshealth interval [show|reset|set <ticks>|<ticks>]` command family.
+8. [x] Add `aimon threshold export` command to emit replay-ready policy/threshold summaries.
+9. [x] Add `aimon threshold profile [default|latency|strict]` presets for operational tuning.
+10. [x] Update utility help text and command parsing/wiring for all new subsystem and AI controls.
+
+## Batch 32 (10 items)
+
+1. [x] Add AI monitor policy-state snapshot struct (mode + thresholds) for atomic replay.
+2. [x] Add AI monitor APIs to get/set/reset full policy-state snapshots.
+3. [x] Add utility callback hook and parser wiring for `aimon state` command family.
+4. [x] Add `aimon state` / `aimon state show` command to print current mode + thresholds.
+5. [x] Add `aimon state reset` command to restore no-op mode with default thresholds.
+6. [x] Add `aimon state export` command to emit replay-ready import lines.
+7. [x] Add `aimon state import mode <mode> <key value...>` command with key/value validation.
+8. [x] Add `ai monitor state` alias command family.
+9. [x] Add policy-mode parse helpers to unify mode-token handling across state import flow.
+10. [x] Update utility help text for AI policy-state show/export/import/reset operations.
+
+## Batch 33 (10 items)
+
+1. [x] Add terminal-window state tracking (enabled flag + compositor surface ID).
+2. [x] Add compositor-backed terminal window creation helper with default bounds.
+3. [x] Add terminal window status command path with ID and bounds reporting.
+4. [x] Add `terminal window on` command to open/focus/raise terminal window and enable terminal mode.
+5. [x] Add `terminal window off` command to hide terminal window and disable terminal mode.
+6. [x] Add `terminal window toggle` command for quick open/close workflow.
+7. [x] Extend utility command context/validation with terminal-window callbacks.
+8. [x] Extend utility parser with `terminal window [on|off|toggle|status]` command family.
+9. [x] Render terminal panel inside compositor surface bounds when terminal window is enabled.
+10. [x] Update help text and shutdown/hidelog behavior so terminal-off states close the window cleanly.
+
+## Batch 34 (10 items)
+
+1. [x] Add system-log channel model for runtime/subsystem/desktop/warn/error/audit routing.
+2. [x] Add terminal filter state with preset route masks (`quiet`, `normal`, `full`).
+3. [x] Add utility callback hooks for terminal filter query/set operations.
+4. [x] Add command parsing for `terminal filter [quiet|normal|full|status]`.
+5. [x] Add terminal status output to include current filter preset.
+6. [x] Route `PushSystemLog` through channel classification instead of unconditional terminal-mode suppression.
+7. [x] Preserve command-response logs as direct output (unfiltered by system channel routing).
+8. [x] Update help text to document terminal filter controls.
+9. [x] Reset terminal filter state to default (`normal`) on console initialize.
+10. [x] Keep terminal window open/close flows compatible with new routing behavior.

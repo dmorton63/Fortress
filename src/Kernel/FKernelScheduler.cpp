@@ -30,6 +30,8 @@ static Fortress::Core::uint32 GNextTaskId = 1;
 static Fortress::Core::uint32 GLastScheduledSlot = 0;
 static Fortress::Core::uint64 GTickCount = 0;
 static Fortress::Core::uint32 GLastScheduledTaskId = 0;
+static Fortress::Core::uint64 GPreemptionCount = 0;
+static Fortress::Core::uint64 GStarvationTickCount = 0;
 static FTaskSlot GTaskSlots[GMaxTasks] = {};
 static FCoreReadyQueue GReadyQueues[GMaxCores] = {};
 static Fortress::Core::uint32 GRunningSlotByCore[GMaxCores] = {};
@@ -116,6 +118,8 @@ bool FKernelScheduler::Initialize(Fortress::Core::uint32 bootstrapCoreId, Fortre
     GLastScheduledSlot = 0;
     GTickCount = 0;
     GLastScheduledTaskId = 0;
+    GPreemptionCount = 0;
+    GStarvationTickCount = 0;
 
     for (Fortress::Core::uint32 i = 0; i < GMaxTasks; i++) {
         GTaskSlots[i] = FTaskSlot{};
@@ -136,6 +140,8 @@ void FKernelScheduler::OnTick() {
 
     GTickCount++;
 
+    Fortress::Core::uint64 preemptionsThisTick = 0;
+
     for (Fortress::Core::uint32 coreIndex = 0; coreIndex < GMaxCores; coreIndex++) {
         const Fortress::Core::uint32 runningSlot = GRunningSlotByCore[coreIndex];
         if (runningSlot >= GMaxTasks) {
@@ -144,9 +150,12 @@ void FKernelScheduler::OnTick() {
 
         if (GTaskSlots[runningSlot].InUse && GTaskSlots[runningSlot].State == EKernelTaskState::Running) {
             GTaskSlots[runningSlot].State = EKernelTaskState::Ready;
+            preemptionsThisTick++;
         }
         GRunningSlotByCore[coreIndex] = GInvalidSlot;
     }
+
+    GPreemptionCount += preemptionsThisTick;
 
     RebuildReadyQueues();
 
@@ -187,6 +196,7 @@ void FKernelScheduler::OnTick() {
     }
 
     GLastScheduledTaskId = 0;
+    GStarvationTickCount++;
 }
 
 bool FKernelScheduler::CreateTask(const FKernelTaskCreateInfo &createInfo, FKernelTaskHandle &outHandle) {
@@ -243,6 +253,8 @@ void FKernelScheduler::GetStats(FKernelSchedulerStats &outStats) {
         .RunningTaskCount = CountTasksInState(EKernelTaskState::Running),
         .BlockedTaskCount = CountTasksInState(EKernelTaskState::Blocked),
         .LastScheduledTaskId = GLastScheduledTaskId,
+        .PreemptionCount = GPreemptionCount,
+        .StarvationTickCount = GStarvationTickCount,
     };
 
     (void)GBootstrapCoreId;

@@ -3,9 +3,11 @@
 #include "Fortress/Kernel/FKernelCommandConsole.hpp"
 #include "Fortress/Kernel/FKernelCommandControlPlane.hpp"
 #include "Fortress/Kernel/FKernelApWorker.hpp"
+#include "Fortress/Kernel/FKernelAIExecutionMonitor.hpp"
 #include "Fortress/Kernel/FKernelCoreDispatch.hpp"
 #include "Fortress/Kernel/FKernelInputEventPlane.hpp"
 #include "Fortress/Kernel/FKernelIrqControlPlane.hpp"
+#include "Fortress/Kernel/FKernelNetworkTelemetry.hpp"
 #include "Fortress/Kernel/FKernelRuntimeIds.hpp"
 #include "Fortress/Kernel/FKernelScheduler.hpp"
 #include "Fortress/Kernel/FKernelSchedulerEventPlane.hpp"
@@ -17,6 +19,20 @@
 #include "Fortress/Video/FVideoConsole.hpp"
 
 namespace Fortress::Kernel {
+
+namespace {
+
+static Fortress::Core::uint64 AbsDiffU64(Fortress::Core::uint64 a, Fortress::Core::uint64 b) {
+    return (a >= b) ? (a - b) : (b - a);
+}
+
+static bool GHavePublishedSubsystemHealthSnapshot = false;
+static FKernelSubsystemHealthSnapshot GPublishedSubsystemHealthSnapshot = {};
+static bool GSubsystemHealthPublishForced = false;
+static constexpr Fortress::Core::uint64 GSubsystemHealthPublishIntervalDefaultTicks = 900u;
+static Fortress::Core::uint64 GSubsystemHealthPublishIntervalTicks = GSubsystemHealthPublishIntervalDefaultTicks;
+
+} // namespace
 
 bool FKernelRuntimeDiagnostics::Initialize(FDesktopRuntime *desktopRuntime) {
     DesktopRuntime = desktopRuntime;
@@ -93,10 +109,12 @@ bool FKernelRuntimeDiagnostics::Initialize(FDesktopRuntime *desktopRuntime) {
     }
 
     FKernelCommandConsole::PushSystemLog("EVENT FLOW READY");
+    LastSubsystemHealthSnapshot = FKernelSubsystemHealthSnapshot{};
     return true;
 }
 
 void FKernelRuntimeDiagnostics::Tick(FKernelRuntimeContext &runtime) {
+    TryPublishSubsystemHealthSnapshot(runtime);
     TryLogSchedulerStats();
     TryLogEventFlowStats();
     TryLogTextPipelineStats(runtime);
@@ -104,6 +122,158 @@ void FKernelRuntimeDiagnostics::Tick(FKernelRuntimeContext &runtime) {
     TryLogIrqStats();
     TryLogCoreDispatchStats();
     TryLogServicePortStats();
+}
+
+void FKernelRuntimeDiagnostics::PublishSubsystemHealthSnapshot(const FKernelSubsystemHealthSnapshot &snapshot) {
+    LastSubsystemHealthSnapshot = snapshot;
+    GPublishedSubsystemHealthSnapshot = snapshot;
+    GHavePublishedSubsystemHealthSnapshot = true;
+
+    char line[240] = {};
+    size_t pos = 0;
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, "SUBSYS HEALTH PH ");
+    FKernelTextFormat::AppendString(line,
+                                    sizeof(line),
+                                    pos,
+                                    FKernelSubsystemStateTracker::GetPhaseName(snapshot.Phase));
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, " T ");
+    FKernelTextFormat::AppendUInt(line, sizeof(line), pos, snapshot.TickCount);
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, " SRDY ");
+    FKernelTextFormat::AppendUInt(line, sizeof(line), pos, snapshot.Scheduler.ReadyDepth);
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, " SPRE ");
+    FKernelTextFormat::AppendUInt(line, sizeof(line), pos, snapshot.Scheduler.PreemptionCount);
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, " SSTRV ");
+    FKernelTextFormat::AppendUInt(line, sizeof(line), pos, snapshot.Scheduler.StarvationCount);
+    FKernelTextFormat::AppendString(line, sizeof(line), pos, " SDRFTUS ");
+    FKernelTextFormat::AppendUInt(line, sizeof(line), pos, snapshot.Scheduler.TickDriftMicros);
+    FKernelCommandConsole::PushSystemLog(line);
+
+    const FKernelAIExecutionTelemetry aiTelemetry{
+        .TickCount = snapshot.TickCount,
+        .SchedulerReadyDepth = snapshot.Scheduler.ReadyDepth,
+        .EventQueueDepth = snapshot.EventManager.QueueDepth,
+        .DeniedCapabilityChecks = snapshot.Security.DeniedCapabilityChecks,
+    };
+    FKernelAIExecutionMonitor::IngestTelemetry(aiTelemetry);
+
+    const EKernelAIExecutionAction action = FKernelAIExecutionMonitor::EvaluateLastTelemetry();
+    if (action != EKernelAIExecutionAction::NoAction) {
+        char aiLine[96] = {};
+        size_t aiPos = 0;
+        FKernelTextFormat::AppendString(aiLine, sizeof(aiLine), aiPos, "AI MON ACTION ");
+        FKernelTextFormat::AppendUInt(aiLine,
+                                      sizeof(aiLine),
+                                      aiPos,
+                                      static_cast<Fortress::Core::uint64>(action));
+        FKernelCommandConsole::PushSystemLog(aiLine);
+    }
+}
+
+void FKernelRuntimeDiagnostics::GetLastSubsystemHealthSnapshot(FKernelSubsystemHealthSnapshot &outSnapshot) const {
+    outSnapshot = LastSubsystemHealthSnapshot;
+}
+
+bool FKernelRuntimeDiagnostics::TryGetPublishedSubsystemHealthSnapshot(FKernelSubsystemHealthSnapshot &outSnapshot) {
+    if (!GHavePublishedSubsystemHealthSnapshot) {
+        return false;
+    }
+
+    outSnapshot = GPublishedSubsystemHealthSnapshot;
+    return true;
+}
+
+void FKernelRuntimeDiagnostics::RequestSubsystemHealthPublish() {
+    GSubsystemHealthPublishForced = true;
+}
+
+Fortress::Core::uint64 FKernelRuntimeDiagnostics::GetSubsystemHealthPublishIntervalTicks() {
+    return GSubsystemHealthPublishIntervalTicks;
+}
+
+bool FKernelRuntimeDiagnostics::SetSubsystemHealthPublishIntervalTicks(Fortress::Core::uint64 intervalTicks) {
+    if (intervalTicks == 0u || intervalTicks > 60000u) {
+        return false;
+    }
+
+    GSubsystemHealthPublishIntervalTicks = intervalTicks;
+    return true;
+}
+
+void FKernelRuntimeDiagnostics::ResetSubsystemHealthPublishIntervalTicks() {
+    GSubsystemHealthPublishIntervalTicks = GSubsystemHealthPublishIntervalDefaultTicks;
+}
+
+void FKernelRuntimeDiagnostics::BuildSubsystemHealthSnapshot(FKernelRuntimeContext &runtime,
+                                                             FKernelSubsystemHealthSnapshot &outSnapshot) {
+    outSnapshot = FKernelSubsystemHealthSnapshot{};
+    outSnapshot.Phase = runtime.SubsystemState.Phase;
+
+    FKernelSchedulerStats schedulerStats{};
+    FKernelScheduler::GetStats(schedulerStats);
+    outSnapshot.TickCount = schedulerStats.TickCount;
+    outSnapshot.Scheduler.ReadyDepth = schedulerStats.ReadyTaskCount;
+    outSnapshot.Scheduler.PreemptionCount = schedulerStats.PreemptionCount;
+    outSnapshot.Scheduler.StarvationCount = schedulerStats.StarvationTickCount;
+
+    Fortress::Platform::FTimerX86Stats timerStats{};
+    Fortress::Platform::FTimerX86::GetStats(timerStats);
+    static constexpr Fortress::Core::uint64 SchedulerTargetTickMicros = 16666u;
+    outSnapshot.Scheduler.TickDriftMicros = AbsDiffU64(timerStats.LastDeltaMicros, SchedulerTargetTickMicros);
+
+    FEventManagerStats eventStats{};
+    FEventManager::GetStats(eventStats);
+    outSnapshot.EventManager.QueueDepth = eventStats.QueueDepth;
+    outSnapshot.EventManager.FanoutLatencyMicros = eventStats.FanoutLatencyMicros;
+    outSnapshot.EventManager.DroppedEvents = eventStats.DroppedCount;
+    outSnapshot.EventManager.HandlerFaultCount = eventStats.HandlerFaultCount;
+
+    FServiceRegistryStats serviceStats{};
+    FServiceRegistry::GetStats(serviceStats);
+    outSnapshot.Services.ServiceCount = serviceStats.ServiceCount;
+    outSnapshot.Services.FailedStarts = serviceStats.FailedStartCount;
+    outSnapshot.Services.RestartAttempts = serviceStats.RestartAttemptCount;
+    outSnapshot.Services.DependencyViolations = serviceStats.DependencyViolationCount;
+
+    FServiceRegistryDatabaseAdapterStats adapterStats{};
+    FServiceRegistryDatabaseAdapter::GetStats(adapterStats);
+    outSnapshot.Services.FailedStarts += adapterStats.FailedLookupCount;
+
+    FPortManagerStats portStats{};
+    FPortManager::GetStats(portStats);
+    outSnapshot.Security.DeniedCapabilityChecks = portStats.DeniedAccessCount;
+    outSnapshot.Security.PolicyLoaded = (serviceStats.ServiceCount > 0u);
+    outSnapshot.Security.AuditQueuePressure = portStats.ActiveLeaseCount;
+
+    FKernelNetworkStats networkStats{};
+    FKernelNetworkTelemetry::GetStats(networkStats);
+    outSnapshot.Network.InterfaceCount = networkStats.InterfaceCount;
+    outSnapshot.Network.RxCount = networkStats.RxCount;
+    outSnapshot.Network.TxCount = networkStats.TxCount;
+    outSnapshot.Network.DropCount = networkStats.DropCount;
+    outSnapshot.Network.LinkUp = networkStats.LinkUp;
+
+    if (DesktopRuntime != nullptr) {
+        outSnapshot.DesktopWindow.DesktopReady = DesktopRuntime->IsReady();
+        FDesktopCompositorStats compositorStats{};
+        DesktopRuntime->GetCompositor().GetStats(compositorStats);
+        outSnapshot.DesktopWindow.SurfaceCount = compositorStats.SurfaceCount;
+        outSnapshot.DesktopWindow.DirtySurfaceCount = compositorStats.DirtySurfaceCount;
+        outSnapshot.DesktopWindow.HighestZOrder = compositorStats.HighestZOrder;
+    }
+}
+
+void FKernelRuntimeDiagnostics::TryPublishSubsystemHealthSnapshot(FKernelRuntimeContext &runtime) {
+    FKernelSchedulerStats schedulerStats{};
+    FKernelScheduler::GetStats(schedulerStats);
+    if (!GSubsystemHealthPublishForced && schedulerStats.TickCount < NextSubsystemHealthTick) {
+        return;
+    }
+
+    FKernelSubsystemHealthSnapshot snapshot{};
+    BuildSubsystemHealthSnapshot(runtime, snapshot);
+    PublishSubsystemHealthSnapshot(snapshot);
+    GSubsystemHealthPublishForced = false;
+    NextSubsystemHealthTick = schedulerStats.TickCount + GSubsystemHealthPublishIntervalTicks;
 }
 
 void FKernelRuntimeDiagnostics::HandleDesktopInputEvent(const FKernelEvent &event, void *context) {

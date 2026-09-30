@@ -87,6 +87,14 @@ struct FKernelUtilityCommandContext {
     void (*RunTerminalModeQueryFn)();
     void (*SetTerminalModeOnFn)();
     void (*SetTerminalModeOffFn)();
+    void (*RunTerminalFilterQueryFn)();
+    void (*SetTerminalFilterQuietFn)();
+    void (*SetTerminalFilterNormalFn)();
+    void (*SetTerminalFilterFullFn)();
+    void (*RunTerminalWindowQueryFn)();
+    void (*SetTerminalWindowOnFn)();
+    void (*SetTerminalWindowOffFn)();
+    void (*ToggleTerminalWindowFn)();
     void (*RunParallelHudQueryFn)();
     void (*SetParallelHudOnFn)();
     void (*SetParallelHudOffFn)();
@@ -105,6 +113,15 @@ struct FKernelUtilityCommandContext {
 
     void (*RunHelpFn)();
     void (*RunEventHealthFn)();
+    void (*RunSubsystemHealthFn)();
+    void (*RunSubsystemHealthBriefFn)();
+    void (*RunSubsystemHealthForceFn)();
+    bool (*RunSubsystemHealthIntervalFn)(const char *args);
+    void (*RunAiMonitorFn)();
+    void (*RunAiMonitorEvaluateFn)();
+    bool (*RunAiMonitorPolicySetFn)(const char *args);
+    bool (*RunAiMonitorThresholdFn)(const char *args);
+    bool (*RunAiMonitorStateFn)(const char *args);
     void (*RunStatsFn)();
     void (*RunRenderLayersFn)();
 

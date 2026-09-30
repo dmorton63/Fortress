@@ -22,9 +22,12 @@ using FKernelEventHandler = void (*)(const FKernelEvent &event, void *context);
 
 struct FEventManagerStats {
     Fortress::Core::uint32 SubscriptionCount = 0;
+    Fortress::Core::uint32 QueueDepth = 0;
     Fortress::Core::uint64 PublishedCount = 0;
     Fortress::Core::uint64 DispatchedCount = 0;
     Fortress::Core::uint64 DroppedCount = 0;
+    Fortress::Core::uint64 FanoutLatencyMicros = 0;
+    Fortress::Core::uint64 HandlerFaultCount = 0;
 };
 
 class FEventManager {

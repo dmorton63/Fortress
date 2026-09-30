@@ -9,7 +9,9 @@
 #include "Fortress/Kernel/FKernelCommandConsole.hpp"
 #include "Fortress/Kernel/FKernelConfig.hpp"
 #include "Fortress/Kernel/FKernelApWorker.hpp"
+#include "Fortress/Kernel/FKernelAIExecutionMonitor.hpp"
 #include "Fortress/Kernel/FKernelCoreDispatch.hpp"
+#include "Fortress/Kernel/FKernelNetworkTelemetry.hpp"
 #include "Fortress/Kernel/FKernelCubeScene.hpp"
 #include "Fortress/Kernel/FEventManager.hpp"
 #include "Fortress/Kernel/FKernelIrqControlPlane.hpp"
@@ -415,6 +417,19 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
         return false;
     }
 
+    if (!FKernelNetworkTelemetry::Initialize()) {
+        return false;
+    }
+
+    FKernelNetworkTelemetry::SetInterfaceCount(0u);
+    FKernelNetworkTelemetry::SetLinkState(false);
+
+    if (!FKernelAIExecutionMonitor::Initialize()) {
+        return false;
+    }
+
+    FKernelAIExecutionMonitor::SetBuiltInPolicyMode(EKernelAIBuiltInPolicyMode::NoOp);
+
     if (!FServiceRegistry::Initialize()) {
         return false;
     }
@@ -759,6 +774,7 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
         .Console = &GConsole,
         .Renderer3D = GRenderer3D,
         .CubeScene = &GCubeScene,
+        .SubsystemState = {},
     };
 
     return true;

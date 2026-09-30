@@ -35,6 +35,8 @@ struct FKernelSchedulerStats {
     Fortress::Core::uint32 RunningTaskCount = 0;
     Fortress::Core::uint32 BlockedTaskCount = 0;
     Fortress::Core::uint32 LastScheduledTaskId = 0;
+    Fortress::Core::uint64 PreemptionCount = 0;
+    Fortress::Core::uint64 StarvationTickCount = 0;
 };
 
 class FKernelScheduler {

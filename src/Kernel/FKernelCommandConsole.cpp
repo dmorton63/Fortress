@@ -9,8 +9,10 @@
 #include "Fortress/Kernel/FKernelCommandHeap.hpp"
 #include "Fortress/Kernel/FKernelCommandMemoryMap.hpp"
 #include "Fortress/Kernel/FKernelApWorker.hpp"
+#include "Fortress/Kernel/FKernelAIExecutionMonitor.hpp"
 #include "Fortress/Kernel/FKernelCoreDispatch.hpp"
 #include "Fortress/Kernel/FKernelCommandRuntimeControl.hpp"
+#include "Fortress/Kernel/FKernelRuntimeDiagnostics.hpp"
 #include "Fortress/Kernel/FKernelCommandUtility.hpp"
 #include "Fortress/Kernel/FKernelCommandXhci.hpp"
 #include "Fortress/Kernel/FCpuCoreManager.hpp"
@@ -20,6 +22,7 @@
 #include "Fortress/Kernel/FKeyboardManager.hpp"
 #include "Fortress/Kernel/FKernelInputEventPlane.hpp"
 #include "Fortress/Kernel/FKernelRuntimeIds.hpp"
+#include "Fortress/Kernel/FKernelSubsystemStateTracker.hpp"
 #include "Fortress/Kernel/FKernelSchedulerEventPlane.hpp"
 #include "Fortress/Kernel/FMessageBus.hpp"
 #include "Fortress/Kernel/FPortManager.hpp"
@@ -89,7 +92,7 @@ static bool GPaused = false;
 static constexpr size_t GMaxLogLines = 32;
 static constexpr size_t GMaxBootLogLines = 128;
 
-static char GCommandBuffer[64] = {};
+static char GCommandBuffer[512] = {};
 static size_t GCommandLength = 0;
 
 #if defined(FORTRESS_PARALLEL_PROBE_AUTORUN)
@@ -123,6 +126,29 @@ static bool GBootLogFrozen = false;
 static FKernelCommandConsole::EHudLogViewMode GHudLogViewMode = FKernelCommandConsole::EHudLogViewMode::Hidden;
 static FKernelCommandConsole::EHudLogDetailMode GHudLogDetailMode = FKernelCommandConsole::EHudLogDetailMode::Tail;
 static bool GTerminalModeEnabled = false;
+static bool GTerminalWindowEnabled = false;
+static Fortress::Kernel::FDesktopSurfaceId GTerminalWindowSurfaceId = Fortress::Kernel::DesktopInvalidSurfaceId;
+
+enum class ESystemLogChannel : uint32_t {
+    Runtime = 1u << 0,
+    Subsystem = 1u << 1,
+    Desktop = 1u << 2,
+    Warning = 1u << 3,
+    Error = 1u << 4,
+    Audit = 1u << 5,
+};
+
+static constexpr uint32_t GSystemLogMaskQuiet = static_cast<uint32_t>(ESystemLogChannel::Warning) |
+                                                static_cast<uint32_t>(ESystemLogChannel::Error);
+static constexpr uint32_t GSystemLogMaskNormal = GSystemLogMaskQuiet |
+                                                                                                 static_cast<uint32_t>(ESystemLogChannel::Audit);
+static constexpr uint32_t GSystemLogMaskFull = GSystemLogMaskNormal |
+                                               static_cast<uint32_t>(ESystemLogChannel::Runtime) |
+                                                                                             static_cast<uint32_t>(ESystemLogChannel::Desktop) |
+                                               static_cast<uint32_t>(ESystemLogChannel::Subsystem);
+
+static uint32_t GSystemLogRouteMask = GSystemLogMaskNormal;
+
 static bool GHudParallelStatsEnabled = false;
 static bool GSerialMirrorReady = false;
 static bool GSerialMirrorFaulted = false;
@@ -233,6 +259,12 @@ struct FCachedCommandPortLease {
 
 static FCachedCommandPortLease GCommandPortLeases[GMaxCommandPortLeases] = {};
 static void ProcessCommand();
+static void SetTerminalModeOn();
+static void SetTerminalModeOff();
+static void RunTerminalFilterQuery();
+static void SetTerminalFilterQuiet();
+static void SetTerminalFilterNormal();
+static void SetTerminalFilterFull();
 
 static int32_t FindCachedCommandPortLeaseIndex(uint16_t portId) {
     for (uint32_t i = 0u; i < GMaxCommandPortLeases; i++) {
@@ -9093,12 +9125,156 @@ static void SetHudLogBoot() {
 
 static void SetHudLogHidden() {
     GTerminalModeEnabled = false;
+    GTerminalWindowEnabled = false;
+    if (GBoundDesktopCompositor != nullptr && GBoundDesktopCompositor->IsReady() &&
+        GTerminalWindowSurfaceId != Fortress::Kernel::DesktopInvalidSurfaceId &&
+        GBoundDesktopCompositor->SurfaceExists(GTerminalWindowSurfaceId)) {
+        (void)GBoundDesktopCompositor->SetSurfaceVisible(GTerminalWindowSurfaceId, false);
+    }
     GHudLogViewMode = FKernelCommandConsole::EHudLogViewMode::Hidden;
     PushLog("HUD LOG HIDE");
 }
 
 static void RunTerminalModeQuery() {
     PushLog(GTerminalModeEnabled ? "TERMINAL ON" : "TERMINAL OFF");
+    RunTerminalFilterQuery();
+}
+
+static const char *GetTerminalFilterName() {
+    if (GSystemLogRouteMask == GSystemLogMaskQuiet) {
+        return "QUIET";
+    }
+    if (GSystemLogRouteMask == GSystemLogMaskFull) {
+        return "FULL";
+    }
+    return "NORMAL";
+}
+
+static void RunTerminalFilterQuery() {
+    char line[96] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "TERMINAL FILTER ");
+    AppendString(line, sizeof(line), pos, GetTerminalFilterName());
+    PushLog(line);
+}
+
+static void SetTerminalFilterQuiet() {
+    GSystemLogRouteMask = GSystemLogMaskQuiet;
+    PushLog("TERMINAL FILTER QUIET");
+}
+
+static void SetTerminalFilterNormal() {
+    GSystemLogRouteMask = GSystemLogMaskNormal;
+    PushLog("TERMINAL FILTER NORMAL");
+}
+
+static void SetTerminalFilterFull() {
+    GSystemLogRouteMask = GSystemLogMaskFull;
+    PushLog("TERMINAL FILTER FULL");
+}
+
+static bool EnsureTerminalWindowSurface() {
+    if (GBoundDesktopCompositor == nullptr || !GBoundDesktopCompositor->IsReady()) {
+        return false;
+    }
+
+    if (GTerminalWindowSurfaceId != Fortress::Kernel::DesktopInvalidSurfaceId &&
+        GBoundDesktopCompositor->SurfaceExists(GTerminalWindowSurfaceId)) {
+        return true;
+    }
+
+    Fortress::Kernel::FDesktopSurfaceId surfaceId = Fortress::Kernel::DesktopInvalidSurfaceId;
+    if (!GBoundDesktopCompositor->CreateSurface(Fortress::Kernel::DesktopInvalidSurfaceId,
+                                                Fortress::Kernel::FDesktopRect{.X = 96,
+                                                                               .Y = 72,
+                                                                               .Width = 920,
+                                                                               .Height = 560},
+                                                900u,
+                                                surfaceId)) {
+        return false;
+    }
+
+    GTerminalWindowSurfaceId = surfaceId;
+    return true;
+}
+
+static void RunTerminalWindowQuery() {
+    if (!GTerminalWindowEnabled) {
+        PushLog("TERMINAL WINDOW OFF");
+        return;
+    }
+
+    if (GBoundDesktopCompositor == nullptr || !GBoundDesktopCompositor->IsReady() ||
+        GTerminalWindowSurfaceId == Fortress::Kernel::DesktopInvalidSurfaceId ||
+        !GBoundDesktopCompositor->SurfaceExists(GTerminalWindowSurfaceId)) {
+        PushLog("TERMINAL WINDOW ON SURFACE MISSING");
+        return;
+    }
+
+    Fortress::Kernel::FDesktopRect bounds{};
+    if (!GBoundDesktopCompositor->GetSurfaceBounds(GTerminalWindowSurfaceId, bounds)) {
+        PushLog("TERMINAL WINDOW ON BOUNDS MISSING");
+        return;
+    }
+
+    char line[128] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "TERMINAL WINDOW ON ID ");
+    AppendUInt(line, sizeof(line), pos, static_cast<uint64_t>(GTerminalWindowSurfaceId));
+    AppendString(line, sizeof(line), pos, " X ");
+    AppendUInt(line, sizeof(line), pos, static_cast<uint64_t>(bounds.X));
+    AppendString(line, sizeof(line), pos, " Y ");
+    AppendUInt(line, sizeof(line), pos, static_cast<uint64_t>(bounds.Y));
+    AppendString(line, sizeof(line), pos, " W ");
+    AppendUInt(line, sizeof(line), pos, static_cast<uint64_t>(bounds.Width));
+    AppendString(line, sizeof(line), pos, " H ");
+    AppendUInt(line, sizeof(line), pos, static_cast<uint64_t>(bounds.Height));
+    PushLog(line);
+}
+
+static void SetTerminalWindowOn() {
+    if (!EnsureTerminalWindowSurface()) {
+        PushLog("TERMINAL WINDOW ON FAIL");
+        return;
+    }
+
+    if (GBoundDesktopCompositor != nullptr && GBoundDesktopCompositor->IsReady()) {
+        (void)GBoundDesktopCompositor->SetSurfaceVisible(GTerminalWindowSurfaceId, true);
+        (void)GBoundDesktopCompositor->RaiseSurface(GTerminalWindowSurfaceId);
+        Fortress::Kernel::FDesktopRect bounds{};
+        if (GBoundDesktopCompositor->GetSurfaceBounds(GTerminalWindowSurfaceId, bounds)) {
+            (void)GBoundDesktopCompositor->MarkSurfaceDamaged(GTerminalWindowSurfaceId, bounds);
+        }
+    }
+
+    if (GBoundDesktopInputRouter != nullptr && GBoundDesktopInputRouter->IsReady()) {
+        (void)GBoundDesktopInputRouter->SetFocus(GTerminalWindowSurfaceId);
+    }
+
+    GTerminalWindowEnabled = true;
+    SetTerminalModeOn();
+    PushLog("TERMINAL WINDOW ON");
+}
+
+static void SetTerminalWindowOff() {
+    GTerminalWindowEnabled = false;
+
+    if (GBoundDesktopCompositor != nullptr && GBoundDesktopCompositor->IsReady() &&
+        GTerminalWindowSurfaceId != Fortress::Kernel::DesktopInvalidSurfaceId &&
+        GBoundDesktopCompositor->SurfaceExists(GTerminalWindowSurfaceId)) {
+        (void)GBoundDesktopCompositor->SetSurfaceVisible(GTerminalWindowSurfaceId, false);
+    }
+
+    SetTerminalModeOff();
+    PushLog("TERMINAL WINDOW OFF");
+}
+
+static void ToggleTerminalWindow() {
+    if (GTerminalWindowEnabled) {
+        SetTerminalWindowOff();
+    } else {
+        SetTerminalWindowOn();
+    }
 }
 
 static void SetTerminalModeOn() {
@@ -9110,6 +9286,12 @@ static void SetTerminalModeOn() {
 
 static void SetTerminalModeOff() {
     GTerminalModeEnabled = false;
+    GTerminalWindowEnabled = false;
+    if (GBoundDesktopCompositor != nullptr && GBoundDesktopCompositor->IsReady() &&
+        GTerminalWindowSurfaceId != Fortress::Kernel::DesktopInvalidSurfaceId &&
+        GBoundDesktopCompositor->SurfaceExists(GTerminalWindowSurfaceId)) {
+        (void)GBoundDesktopCompositor->SetSurfaceVisible(GTerminalWindowSurfaceId, false);
+    }
     PushLog("TERMINAL OFF");
 }
 
@@ -9236,7 +9418,7 @@ static void RunFontCacheReset() {
 }
 
 static void RunUtilityHelp() {
-    PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS] STATS EVENTHEALTH EVENTBURST VFSSTAT VFSMOUNTS VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 VFSMRESOLVE VFSMBLK VFSBLKDIGEST LOGSAVE LOGSAVEBOOT LOGSAVEMOUNT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
+    PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS|FILTER [QUIET|NORMAL|FULL|STATUS]|WINDOW ON|OFF|TOGGLE|STATUS] STATS EVENTHEALTH SUBSYSHEALTH [BRIEF|FORCE|INTERVAL] AIMON [EVAL|POLICY|THRESHOLD|STATE] EVENTBURST VFSSTAT VFSMOUNTS VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 VFSMRESOLVE VFSMBLK VFSBLKDIGEST LOGSAVE LOGSAVEBOOT LOGSAVEMOUNT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
     PushLog("KBD: KBDLAYOUT [US|DVORAK] KBDMODS");
     PushLog("TEXT: TEXTSHAPER [BASIC|WRAP [PX]]");
     PushLog("VFS: VFSRESOLVE /ABS/PATH | VFSBOOT NAME | VFSBOOTBLK INDEX | VFSBOOT0");
@@ -9298,7 +9480,15 @@ static void RunUtilityHelp() {
     PushLog("CPU: PARALLEL [ON|OFF] PARALLEL DRAIN [ON|OFF] PARALLELTEST [N] PARALLELCANARY [N] PARALLELPROBE (DRAIN=>AP_PROBE)");
     PushLog("CPU: PARALLELHUD [ON|OFF] (HUD PARALLEL STATS SECTION)");
     PushLog("EVENT: EVENTHEALTH EVENTBURST [N] (N: 1..200000, DEFAULT 2048)");
-    PushLog("HUD: SHOWLOG BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS] LAYERS");
+    PushLog("OBS: SUBSYSHEALTH | SUBSYS HEALTH | SUBSYSHEALTH BRIEF | SUBSYSHEALTH FORCE");
+    PushLog("OBS: SUBSYSHEALTH INTERVAL [SHOW|RESET|SET TICKS|TICKS]");
+    PushLog("OBS: AIMON | AI MONITOR | AIMON EVAL");
+    PushLog("OBS: AIMON POLICY [NOOP|ALERT|THROTTLE|ISOLATE|RESTART]");
+    PushLog("OBS: AIMON THRESHOLD [SHOW|RESET|SET KEY VALUE|EXPORT|PROFILE NAME]");
+    PushLog("OBS: AIMON THRESHOLD SET [ALERTDENY|ALERTEQ|THROTTLEEQ|ISOLATEDENY|ISOLATEEQ|RESTARTEQ|RESTARTDENY] V");
+    PushLog("OBS: AIMON THRESHOLD PROFILE [DEFAULT|LATENCY|STRICT]");
+    PushLog("OBS: AIMON STATE [SHOW|EXPORT|IMPORT MODE <M> <KEY VAL...>|RESET]");
+    PushLog("HUD: SHOWLOG BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS|FILTER [QUIET|NORMAL|FULL|STATUS]|WINDOW ON|OFF|TOGGLE|STATUS] LAYERS");
     PushLog("VFS: VFSSTAT VFSMOUNTS VFSRESOLVE /ABS/PATH");
     PushLog("VFS: LOGSAVE /MOUNT START_BLOCK BLOCK_COUNT (writes boot+runtime logs to /MOUNT/blk/N)");
     PushLog("PMM: PALLOC [N] PFREE PRESERVE LOW");
@@ -9315,6 +9505,700 @@ static void RunUtilityHelp() {
     PushLog("XHCI: XHCIHID [COMPACT|CORE|VERBOSE]");
     PushLog("HEAP: KALLOC BYTES KFREE VA");
     PushLog("MEM: MEMTEST XHCIMEMTEST MMIOTEST");
+}
+
+static const char *GetAiActionName(Fortress::Kernel::EKernelAIExecutionAction action) {
+    switch (action) {
+    case Fortress::Kernel::EKernelAIExecutionAction::NoAction:
+        return "NOACTION";
+    case Fortress::Kernel::EKernelAIExecutionAction::Alert:
+        return "ALERT";
+    case Fortress::Kernel::EKernelAIExecutionAction::Throttle:
+        return "THROTTLE";
+    case Fortress::Kernel::EKernelAIExecutionAction::Isolate:
+        return "ISOLATE";
+    case Fortress::Kernel::EKernelAIExecutionAction::Restart:
+        return "RESTART";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *GetAiPolicyModeName(Fortress::Kernel::EKernelAIBuiltInPolicyMode mode) {
+    switch (mode) {
+    case Fortress::Kernel::EKernelAIBuiltInPolicyMode::NoOp:
+        return "NOOP";
+    case Fortress::Kernel::EKernelAIBuiltInPolicyMode::Alert:
+        return "ALERT";
+    case Fortress::Kernel::EKernelAIBuiltInPolicyMode::Throttle:
+        return "THROTTLE";
+    case Fortress::Kernel::EKernelAIBuiltInPolicyMode::Isolate:
+        return "ISOLATE";
+    case Fortress::Kernel::EKernelAIBuiltInPolicyMode::Restart:
+        return "RESTART";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static bool TryParseAiPolicyMode(const char *modeToken, Fortress::Kernel::EKernelAIBuiltInPolicyMode &outMode) {
+    if (modeToken == nullptr) {
+        return false;
+    }
+
+    if (StrEq(modeToken, "noop")) {
+        outMode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::NoOp;
+        return true;
+    }
+    if (StrEq(modeToken, "alert")) {
+        outMode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::Alert;
+        return true;
+    }
+    if (StrEq(modeToken, "throttle")) {
+        outMode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::Throttle;
+        return true;
+    }
+    if (StrEq(modeToken, "isolate")) {
+        outMode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::Isolate;
+        return true;
+    }
+    if (StrEq(modeToken, "restart")) {
+        outMode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::Restart;
+        return true;
+    }
+
+    return false;
+}
+
+static void RunUtilitySubsystemHealth() {
+    Fortress::Kernel::FKernelSubsystemHealthSnapshot snapshot{};
+    if (!Fortress::Kernel::FKernelRuntimeDiagnostics::TryGetPublishedSubsystemHealthSnapshot(snapshot)) {
+        Fortress::Kernel::FKernelRuntimeDiagnostics::RequestSubsystemHealthPublish();
+        PushLog("SUBSYS HEALTH SNAPSHOT UNAVAILABLE (FORCE REQUESTED)");
+        return;
+    }
+
+    char line[192] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "SUBSYS PH ");
+    AppendString(line,
+                 sizeof(line),
+                 pos,
+                 Fortress::Kernel::FKernelSubsystemStateTracker::GetPhaseName(snapshot.Phase));
+    AppendString(line, sizeof(line), pos, " T ");
+    AppendUInt(line, sizeof(line), pos, snapshot.TickCount);
+    AppendString(line, sizeof(line), pos, " SRDY ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Scheduler.ReadyDepth);
+    AppendString(line, sizeof(line), pos, " SDRFTUS ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Scheduler.TickDriftMicros);
+    PushLog(line);
+
+    pos = 0;
+    line[0] = '\0';
+    AppendString(line, sizeof(line), pos, "SUBSYS EVT Q ");
+    AppendUInt(line, sizeof(line), pos, snapshot.EventManager.QueueDepth);
+    AppendString(line, sizeof(line), pos, " FANUS ");
+    AppendUInt(line, sizeof(line), pos, snapshot.EventManager.FanoutLatencyMicros);
+    AppendString(line, sizeof(line), pos, " DROP ");
+    AppendUInt(line, sizeof(line), pos, snapshot.EventManager.DroppedEvents);
+    AppendString(line, sizeof(line), pos, " HF ");
+    AppendUInt(line, sizeof(line), pos, snapshot.EventManager.HandlerFaultCount);
+    PushLog(line);
+
+    pos = 0;
+    line[0] = '\0';
+    AppendString(line, sizeof(line), pos, "SUBSYS SVC C ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Services.ServiceCount);
+    AppendString(line, sizeof(line), pos, " FAIL ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Services.FailedStarts);
+    AppendString(line, sizeof(line), pos, " RST ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Services.RestartAttempts);
+    AppendString(line, sizeof(line), pos, " DEP ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Services.DependencyViolations);
+    PushLog(line);
+
+    pos = 0;
+    line[0] = '\0';
+    AppendString(line, sizeof(line), pos, "SUBSYS SEC DENY ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Security.DeniedCapabilityChecks);
+    AppendString(line, sizeof(line), pos, " POL ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Security.PolicyLoaded ? 1u : 0u);
+    AppendString(line, sizeof(line), pos, " AUDQ ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Security.AuditQueuePressure);
+    PushLog(line);
+
+    pos = 0;
+    line[0] = '\0';
+    AppendString(line, sizeof(line), pos, "SUBSYS NET IF ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Network.InterfaceCount);
+    AppendString(line, sizeof(line), pos, " RX ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Network.RxCount);
+    AppendString(line, sizeof(line), pos, " TX ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Network.TxCount);
+    AppendString(line, sizeof(line), pos, " DROP ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Network.DropCount);
+    AppendString(line, sizeof(line), pos, " LINK ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Network.LinkUp ? 1u : 0u);
+    PushLog(line);
+}
+
+static void RunUtilitySubsystemHealthBrief() {
+    Fortress::Kernel::FKernelSubsystemHealthSnapshot snapshot{};
+    if (!Fortress::Kernel::FKernelRuntimeDiagnostics::TryGetPublishedSubsystemHealthSnapshot(snapshot)) {
+        Fortress::Kernel::FKernelRuntimeDiagnostics::RequestSubsystemHealthPublish();
+        PushLog("SUBSYS HEALTH SNAPSHOT UNAVAILABLE (FORCE REQUESTED)");
+        return;
+    }
+
+    char line[192] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "SUBSYS BRIEF PH ");
+    AppendString(line,
+                 sizeof(line),
+                 pos,
+                 Fortress::Kernel::FKernelSubsystemStateTracker::GetPhaseName(snapshot.Phase));
+    AppendString(line, sizeof(line), pos, " T ");
+    AppendUInt(line, sizeof(line), pos, snapshot.TickCount);
+    AppendString(line, sizeof(line), pos, " SRDY ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Scheduler.ReadyDepth);
+    AppendString(line, sizeof(line), pos, " EQ ");
+    AppendUInt(line, sizeof(line), pos, snapshot.EventManager.QueueDepth);
+    AppendString(line, sizeof(line), pos, " SEC ");
+    AppendUInt(line, sizeof(line), pos, snapshot.Security.DeniedCapabilityChecks);
+    PushLog(line);
+}
+
+static void RunUtilitySubsystemHealthForce() {
+    Fortress::Kernel::FKernelRuntimeDiagnostics::RequestSubsystemHealthPublish();
+    PushLog("SUBSYS HEALTH FORCE REQUESTED");
+}
+
+static bool RunUtilitySubsystemHealthInterval(const char *args) {
+    const char *cursor = args;
+    char tokenA[16] = {};
+    if (cursor == nullptr || !ReadToken(cursor, tokenA, sizeof(tokenA))) {
+        tokenA[0] = '\0';
+    }
+
+    if (tokenA[0] == '\0' || StrEq(tokenA, "show")) {
+        char line[96] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "SUBSYS HEALTH INTERVAL ");
+        AppendUInt(line,
+                   sizeof(line),
+                   pos,
+                   Fortress::Kernel::FKernelRuntimeDiagnostics::GetSubsystemHealthPublishIntervalTicks());
+        PushLog(line);
+        return true;
+    }
+
+    if (StrEq(tokenA, "reset")) {
+        char extraToken[8] = {};
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("SUBSYS HEALTH INTERVAL RESET TOO MANY ARGS");
+            return false;
+        }
+
+        Fortress::Kernel::FKernelRuntimeDiagnostics::ResetSubsystemHealthPublishIntervalTicks();
+        PushLog("SUBSYS HEALTH INTERVAL RESET");
+        return true;
+    }
+
+    uint64_t interval = 0u;
+    if (StrEq(tokenA, "set")) {
+        char intervalToken[20] = {};
+        if (!ReadToken(cursor, intervalToken, sizeof(intervalToken)) || !ParseUInt(intervalToken, interval)) {
+            PushLog("SUBSYS HEALTH INTERVAL SET USAGE TICKS");
+            return false;
+        }
+
+        char extraToken[8] = {};
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("SUBSYS HEALTH INTERVAL SET TOO MANY ARGS");
+            return false;
+        }
+    } else if (!ParseUInt(tokenA, interval)) {
+        PushLog("SUBSYS HEALTH INTERVAL USAGE [SHOW|RESET|SET TICKS|TICKS]");
+        return false;
+    }
+
+    if (!Fortress::Kernel::FKernelRuntimeDiagnostics::SetSubsystemHealthPublishIntervalTicks(interval)) {
+        PushLog("SUBSYS HEALTH INTERVAL RANGE 1..60000");
+        return false;
+    }
+
+    char line[96] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "SUBSYS HEALTH INTERVAL SET ");
+    AppendUInt(line, sizeof(line), pos, interval);
+    PushLog(line);
+    return true;
+}
+
+static void PushAiThresholdSummaryLines(const Fortress::Kernel::FKernelAIPolicyThresholds &thresholds) {
+    char line[192] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "AI MON TH AD ");
+    AppendUInt(line, sizeof(line), pos, thresholds.AlertDeniedMin);
+    AppendString(line, sizeof(line), pos, " AEQ ");
+    AppendUInt(line, sizeof(line), pos, thresholds.AlertEventQueueMin);
+    AppendString(line, sizeof(line), pos, " TEQ ");
+    AppendUInt(line, sizeof(line), pos, thresholds.ThrottleEventQueueMin);
+    AppendString(line, sizeof(line), pos, " ID ");
+    AppendUInt(line, sizeof(line), pos, thresholds.IsolateDeniedMin);
+    PushLog(line);
+
+    pos = 0;
+    line[0] = '\0';
+    AppendString(line, sizeof(line), pos, "AI MON TH IEQ ");
+    AppendUInt(line, sizeof(line), pos, thresholds.IsolateEventQueueMin);
+    AppendString(line, sizeof(line), pos, " REQ ");
+    AppendUInt(line, sizeof(line), pos, thresholds.RestartEventQueueMin);
+    AppendString(line, sizeof(line), pos, " RD ");
+    AppendUInt(line, sizeof(line), pos, thresholds.RestartDeniedMin);
+    PushLog(line);
+}
+
+static void RunUtilityAiMonitor() {
+    Fortress::Kernel::FKernelAIExecutionTelemetry telemetry{};
+    Fortress::Kernel::FKernelAIExecutionMonitor::GetLastTelemetry(telemetry);
+    const Fortress::Kernel::EKernelAIExecutionAction action =
+        Fortress::Kernel::FKernelAIExecutionMonitor::GetLastAction();
+
+    char line[192] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "AI MON CUSTOM ");
+    AppendUInt(line,
+               sizeof(line),
+               pos,
+               Fortress::Kernel::FKernelAIExecutionMonitor::IsPolicyEvaluatorInstalled() ? 1u : 0u);
+    AppendString(line, sizeof(line), pos, " MODE ");
+    AppendString(line, sizeof(line), pos, Fortress::Kernel::FKernelAIExecutionMonitor::GetBuiltInPolicyModeName());
+    AppendString(line, sizeof(line), pos, " ACT ");
+    AppendString(line, sizeof(line), pos, GetAiActionName(action));
+    PushLog(line);
+
+    pos = 0;
+    line[0] = '\0';
+    AppendString(line, sizeof(line), pos, "AI MON T ");
+    AppendUInt(line, sizeof(line), pos, telemetry.TickCount);
+    AppendString(line, sizeof(line), pos, " SRDY ");
+    AppendUInt(line, sizeof(line), pos, telemetry.SchedulerReadyDepth);
+    AppendString(line, sizeof(line), pos, " EQ ");
+    AppendUInt(line, sizeof(line), pos, telemetry.EventQueueDepth);
+    AppendString(line, sizeof(line), pos, " SEC ");
+    AppendUInt(line, sizeof(line), pos, telemetry.DeniedCapabilityChecks);
+    PushLog(line);
+
+    Fortress::Kernel::FKernelAIPolicyThresholds thresholds{};
+    Fortress::Kernel::FKernelAIExecutionMonitor::GetBuiltInPolicyThresholds(thresholds);
+    PushAiThresholdSummaryLines(thresholds);
+}
+
+static bool RunUtilityAiMonitorPolicySet(const char *args) {
+    const char *cursor = args;
+    char modeToken[16] = {};
+    if (cursor == nullptr || !ReadToken(cursor, modeToken, sizeof(modeToken))) {
+        char line[96] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "AI MON POLICY ");
+        AppendString(line, sizeof(line), pos, Fortress::Kernel::FKernelAIExecutionMonitor::GetBuiltInPolicyModeName());
+        PushLog(line);
+        return true;
+    }
+
+    char extraToken[8] = {};
+    if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+        PushLog("AI MON POLICY TOO MANY ARGS");
+        return false;
+    }
+
+    Fortress::Kernel::EKernelAIBuiltInPolicyMode mode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::NoOp;
+    if (StrEq(modeToken, "noop")) {
+        mode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::NoOp;
+    } else if (StrEq(modeToken, "alert")) {
+        mode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::Alert;
+    } else if (StrEq(modeToken, "throttle")) {
+        mode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::Throttle;
+    } else if (StrEq(modeToken, "isolate")) {
+        mode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::Isolate;
+    } else if (StrEq(modeToken, "restart")) {
+        mode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::Restart;
+    } else {
+        PushLog("AI MON POLICY INVALID");
+        PushLog("AI MON POLICY [NOOP|ALERT|THROTTLE|ISOLATE|RESTART]");
+        return false;
+    }
+
+    Fortress::Kernel::FKernelAIExecutionMonitor::SetBuiltInPolicyMode(mode);
+    char line[96] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "AI MON POLICY SET ");
+    AppendString(line, sizeof(line), pos, Fortress::Kernel::FKernelAIExecutionMonitor::GetBuiltInPolicyModeName());
+    PushLog(line);
+    return true;
+}
+
+static bool RunUtilityAiMonitorThreshold(const char *args) {
+    const char *cursor = args;
+    char tokenA[20] = {};
+    if (cursor == nullptr || !ReadToken(cursor, tokenA, sizeof(tokenA))) {
+        tokenA[0] = '\0';
+    }
+
+    if (tokenA[0] == '\0' || StrEq(tokenA, "show")) {
+        Fortress::Kernel::FKernelAIPolicyThresholds thresholds{};
+        Fortress::Kernel::FKernelAIExecutionMonitor::GetBuiltInPolicyThresholds(thresholds);
+        PushAiThresholdSummaryLines(thresholds);
+        return true;
+    }
+
+    if (StrEq(tokenA, "export")) {
+        char extraToken[8] = {};
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("AI MON THRESHOLD EXPORT TOO MANY ARGS");
+            return false;
+        }
+
+        Fortress::Kernel::FKernelAIPolicyThresholds thresholds{};
+        Fortress::Kernel::FKernelAIExecutionMonitor::GetBuiltInPolicyThresholds(thresholds);
+        char line[192] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "AI MON EXPORT POLICY ");
+        AppendString(line, sizeof(line), pos, Fortress::Kernel::FKernelAIExecutionMonitor::GetBuiltInPolicyModeName());
+        PushLog(line);
+
+        pos = 0;
+        line[0] = '\0';
+        AppendString(line, sizeof(line), pos, "AI MON EXPORT TH AD ");
+        AppendUInt(line, sizeof(line), pos, thresholds.AlertDeniedMin);
+        AppendString(line, sizeof(line), pos, " AEQ ");
+        AppendUInt(line, sizeof(line), pos, thresholds.AlertEventQueueMin);
+        AppendString(line, sizeof(line), pos, " TEQ ");
+        AppendUInt(line, sizeof(line), pos, thresholds.ThrottleEventQueueMin);
+        PushLog(line);
+
+        pos = 0;
+        line[0] = '\0';
+        AppendString(line, sizeof(line), pos, "AI MON EXPORT TH ID ");
+        AppendUInt(line, sizeof(line), pos, thresholds.IsolateDeniedMin);
+        AppendString(line, sizeof(line), pos, " IEQ ");
+        AppendUInt(line, sizeof(line), pos, thresholds.IsolateEventQueueMin);
+        AppendString(line, sizeof(line), pos, " REQ ");
+        AppendUInt(line, sizeof(line), pos, thresholds.RestartEventQueueMin);
+        AppendString(line, sizeof(line), pos, " RD ");
+        AppendUInt(line, sizeof(line), pos, thresholds.RestartDeniedMin);
+        PushLog(line);
+        return true;
+    }
+
+    if (StrEq(tokenA, "profile")) {
+        char profileToken[16] = {};
+        if (!ReadToken(cursor, profileToken, sizeof(profileToken))) {
+            PushLog("AI MON THRESHOLD PROFILE [DEFAULT|LATENCY|STRICT]");
+            return false;
+        }
+
+        char extraToken[8] = {};
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("AI MON THRESHOLD PROFILE TOO MANY ARGS");
+            return false;
+        }
+
+        Fortress::Kernel::FKernelAIPolicyThresholds thresholds{};
+        if (StrEq(profileToken, "default")) {
+            thresholds = Fortress::Kernel::FKernelAIPolicyThresholds{};
+        } else if (StrEq(profileToken, "latency")) {
+            thresholds = Fortress::Kernel::FKernelAIPolicyThresholds{
+                .AlertDeniedMin = 2u,
+                .AlertEventQueueMin = 96u,
+                .ThrottleEventQueueMin = 224u,
+                .IsolateDeniedMin = 48u,
+                .IsolateEventQueueMin = 384u,
+                .RestartEventQueueMin = 128u,
+                .RestartDeniedMin = 96u,
+            };
+        } else if (StrEq(profileToken, "strict")) {
+            thresholds = Fortress::Kernel::FKernelAIPolicyThresholds{
+                .AlertDeniedMin = 1u,
+                .AlertEventQueueMin = 16u,
+                .ThrottleEventQueueMin = 64u,
+                .IsolateDeniedMin = 16u,
+                .IsolateEventQueueMin = 128u,
+                .RestartEventQueueMin = 48u,
+                .RestartDeniedMin = 32u,
+            };
+        } else {
+            PushLog("AI MON THRESHOLD PROFILE INVALID");
+            PushLog("AI MON THRESHOLD PROFILE [DEFAULT|LATENCY|STRICT]");
+            return false;
+        }
+
+        Fortress::Kernel::FKernelAIExecutionMonitor::SetBuiltInPolicyThresholds(thresholds);
+        PushLog("AI MON THRESHOLD PROFILE SET");
+        PushAiThresholdSummaryLines(thresholds);
+        return true;
+    }
+
+    if (StrEq(tokenA, "reset")) {
+        char extraToken[8] = {};
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("AI MON THRESHOLD RESET TOO MANY ARGS");
+            return false;
+        }
+
+        Fortress::Kernel::FKernelAIExecutionMonitor::ResetBuiltInPolicyThresholds();
+        PushLog("AI MON THRESHOLD RESET");
+        return true;
+    }
+
+    if (!StrEq(tokenA, "set")) {
+        PushLog("AI MON THRESHOLD USAGE [SHOW|RESET|SET KEY VALUE]");
+        return false;
+    }
+
+    char keyToken[20] = {};
+    char valueToken[24] = {};
+    if (!ReadToken(cursor, keyToken, sizeof(keyToken)) || !ReadToken(cursor, valueToken, sizeof(valueToken))) {
+        PushLog("AI MON THRESHOLD SET USAGE KEY VALUE");
+        return false;
+    }
+
+    char extraToken[8] = {};
+    if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+        PushLog("AI MON THRESHOLD SET TOO MANY ARGS");
+        return false;
+    }
+
+    uint64_t value = 0u;
+    if (!ParseUInt(valueToken, value)) {
+        PushLog("AI MON THRESHOLD VALUE INVALID");
+        return false;
+    }
+
+    Fortress::Kernel::FKernelAIPolicyThresholds thresholds{};
+    Fortress::Kernel::FKernelAIExecutionMonitor::GetBuiltInPolicyThresholds(thresholds);
+
+    if (StrEq(keyToken, "alertdeny")) {
+        thresholds.AlertDeniedMin = value;
+    } else if (StrEq(keyToken, "alerteq")) {
+        if (value > 0xFFFFFFFFu) {
+            PushLog("AI MON THRESHOLD RANGE 0..4294967295");
+            return false;
+        }
+        thresholds.AlertEventQueueMin = static_cast<uint32_t>(value);
+    } else if (StrEq(keyToken, "throttleeq")) {
+        if (value > 0xFFFFFFFFu) {
+            PushLog("AI MON THRESHOLD RANGE 0..4294967295");
+            return false;
+        }
+        thresholds.ThrottleEventQueueMin = static_cast<uint32_t>(value);
+    } else if (StrEq(keyToken, "isolatedeny")) {
+        thresholds.IsolateDeniedMin = value;
+    } else if (StrEq(keyToken, "isolateeq")) {
+        if (value > 0xFFFFFFFFu) {
+            PushLog("AI MON THRESHOLD RANGE 0..4294967295");
+            return false;
+        }
+        thresholds.IsolateEventQueueMin = static_cast<uint32_t>(value);
+    } else if (StrEq(keyToken, "restarteq")) {
+        if (value > 0xFFFFFFFFu) {
+            PushLog("AI MON THRESHOLD RANGE 0..4294967295");
+            return false;
+        }
+        thresholds.RestartEventQueueMin = static_cast<uint32_t>(value);
+    } else if (StrEq(keyToken, "restartdeny")) {
+        thresholds.RestartDeniedMin = value;
+    } else {
+        PushLog("AI MON THRESHOLD KEY INVALID");
+        PushLog("AI MON THRESHOLD KEYS ALERTDENY ALERTEQ THROTTLEEQ ISOLATEDENY ISOLATEEQ RESTARTEQ RESTARTDENY");
+        return false;
+    }
+
+    Fortress::Kernel::FKernelAIExecutionMonitor::SetBuiltInPolicyThresholds(thresholds);
+    PushLog("AI MON THRESHOLD SET");
+    return true;
+}
+
+static bool RunUtilityAiMonitorState(const char *args) {
+    const char *cursor = args;
+    char tokenA[16] = {};
+    if (cursor == nullptr || !ReadToken(cursor, tokenA, sizeof(tokenA))) {
+        tokenA[0] = '\0';
+    }
+
+    if (tokenA[0] == '\0' || StrEq(tokenA, "show")) {
+        Fortress::Kernel::FKernelAIPolicyStateSnapshot snapshot{};
+        Fortress::Kernel::FKernelAIExecutionMonitor::GetPolicyStateSnapshot(snapshot);
+        char line[96] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "AI MON STATE MODE ");
+        AppendString(line, sizeof(line), pos, GetAiPolicyModeName(snapshot.Mode));
+        PushLog(line);
+        PushAiThresholdSummaryLines(snapshot.Thresholds);
+        return true;
+    }
+
+    if (StrEq(tokenA, "reset")) {
+        char extraToken[8] = {};
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("AI MON STATE RESET TOO MANY ARGS");
+            return false;
+        }
+
+        Fortress::Kernel::FKernelAIExecutionMonitor::ResetPolicyStateSnapshot();
+        PushLog("AI MON STATE RESET");
+        return true;
+    }
+
+    if (StrEq(tokenA, "export")) {
+        char extraToken[8] = {};
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("AI MON STATE EXPORT TOO MANY ARGS");
+            return false;
+        }
+
+        Fortress::Kernel::FKernelAIPolicyStateSnapshot snapshot{};
+        Fortress::Kernel::FKernelAIExecutionMonitor::GetPolicyStateSnapshot(snapshot);
+        char line[256] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "AI MON STATE EXPORT AIMON STATE IMPORT MODE ");
+        AppendString(line, sizeof(line), pos, GetAiPolicyModeName(snapshot.Mode));
+        AppendString(line, sizeof(line), pos, " ALERTDENY ");
+        AppendUInt(line, sizeof(line), pos, snapshot.Thresholds.AlertDeniedMin);
+        AppendString(line, sizeof(line), pos, " ALERTEQ ");
+        AppendUInt(line, sizeof(line), pos, snapshot.Thresholds.AlertEventQueueMin);
+        AppendString(line, sizeof(line), pos, " THROTTLEEQ ");
+        AppendUInt(line, sizeof(line), pos, snapshot.Thresholds.ThrottleEventQueueMin);
+        PushLog(line);
+
+        pos = 0;
+        line[0] = '\0';
+        AppendString(line, sizeof(line), pos, "AI MON STATE EXPORT ISOLATEDENY ");
+        AppendUInt(line, sizeof(line), pos, snapshot.Thresholds.IsolateDeniedMin);
+        AppendString(line, sizeof(line), pos, " ISOLATEEQ ");
+        AppendUInt(line, sizeof(line), pos, snapshot.Thresholds.IsolateEventQueueMin);
+        AppendString(line, sizeof(line), pos, " RESTARTEQ ");
+        AppendUInt(line, sizeof(line), pos, snapshot.Thresholds.RestartEventQueueMin);
+        AppendString(line, sizeof(line), pos, " RESTARTDENY ");
+        AppendUInt(line, sizeof(line), pos, snapshot.Thresholds.RestartDeniedMin);
+        PushLog(line);
+        return true;
+    }
+
+    if (!StrEq(tokenA, "import")) {
+        PushLog("AI MON STATE USAGE [SHOW|EXPORT|IMPORT MODE <M> <KEY VAL...>|RESET]");
+        return false;
+    }
+
+    char modeLiteral[8] = {};
+    char modeToken[16] = {};
+    if (!ReadToken(cursor, modeLiteral, sizeof(modeLiteral)) || !ReadToken(cursor, modeToken, sizeof(modeToken)) ||
+        !StrEq(modeLiteral, "mode")) {
+        PushLog("AI MON STATE IMPORT USAGE MODE <NOOP|ALERT|THROTTLE|ISOLATE|RESTART> <KEY VAL...>");
+        return false;
+    }
+
+    Fortress::Kernel::EKernelAIBuiltInPolicyMode mode = Fortress::Kernel::EKernelAIBuiltInPolicyMode::NoOp;
+    if (!TryParseAiPolicyMode(modeToken, mode)) {
+        PushLog("AI MON STATE IMPORT MODE INVALID");
+        return false;
+    }
+
+    Fortress::Kernel::FKernelAIPolicyStateSnapshot snapshot{};
+    Fortress::Kernel::FKernelAIExecutionMonitor::GetPolicyStateSnapshot(snapshot);
+    snapshot.Mode = mode;
+
+    bool setAlertDeny = false;
+    bool setAlertEq = false;
+    bool setThrottleEq = false;
+    bool setIsolateDeny = false;
+    bool setIsolateEq = false;
+    bool setRestartEq = false;
+    bool setRestartDeny = false;
+
+    for (;;) {
+        char keyToken[20] = {};
+        if (!ReadToken(cursor, keyToken, sizeof(keyToken))) {
+            break;
+        }
+
+        char valueToken[24] = {};
+        if (!ReadToken(cursor, valueToken, sizeof(valueToken))) {
+            PushLog("AI MON STATE IMPORT KEY WITHOUT VALUE");
+            return false;
+        }
+
+        uint64_t value = 0u;
+        if (!ParseUInt(valueToken, value)) {
+            PushLog("AI MON STATE IMPORT VALUE INVALID");
+            return false;
+        }
+
+        if (StrEq(keyToken, "alertdeny")) {
+            snapshot.Thresholds.AlertDeniedMin = value;
+            setAlertDeny = true;
+        } else if (StrEq(keyToken, "alerteq")) {
+            if (value > 0xFFFFFFFFu) {
+                PushLog("AI MON STATE IMPORT RANGE 0..4294967295");
+                return false;
+            }
+            snapshot.Thresholds.AlertEventQueueMin = static_cast<uint32_t>(value);
+            setAlertEq = true;
+        } else if (StrEq(keyToken, "throttleeq")) {
+            if (value > 0xFFFFFFFFu) {
+                PushLog("AI MON STATE IMPORT RANGE 0..4294967295");
+                return false;
+            }
+            snapshot.Thresholds.ThrottleEventQueueMin = static_cast<uint32_t>(value);
+            setThrottleEq = true;
+        } else if (StrEq(keyToken, "isolatedeny")) {
+            snapshot.Thresholds.IsolateDeniedMin = value;
+            setIsolateDeny = true;
+        } else if (StrEq(keyToken, "isolateeq")) {
+            if (value > 0xFFFFFFFFu) {
+                PushLog("AI MON STATE IMPORT RANGE 0..4294967295");
+                return false;
+            }
+            snapshot.Thresholds.IsolateEventQueueMin = static_cast<uint32_t>(value);
+            setIsolateEq = true;
+        } else if (StrEq(keyToken, "restarteq")) {
+            if (value > 0xFFFFFFFFu) {
+                PushLog("AI MON STATE IMPORT RANGE 0..4294967295");
+                return false;
+            }
+            snapshot.Thresholds.RestartEventQueueMin = static_cast<uint32_t>(value);
+            setRestartEq = true;
+        } else if (StrEq(keyToken, "restartdeny")) {
+            snapshot.Thresholds.RestartDeniedMin = value;
+            setRestartDeny = true;
+        } else {
+            PushLog("AI MON STATE IMPORT KEY INVALID");
+            PushLog("AI MON STATE IMPORT KEYS ALERTDENY ALERTEQ THROTTLEEQ ISOLATEDENY ISOLATEEQ RESTARTEQ RESTARTDENY");
+            return false;
+        }
+    }
+
+    if (!setAlertDeny || !setAlertEq || !setThrottleEq || !setIsolateDeny || !setIsolateEq || !setRestartEq ||
+        !setRestartDeny) {
+        PushLog("AI MON STATE IMPORT INCOMPLETE KEYS");
+        return false;
+    }
+
+    Fortress::Kernel::FKernelAIExecutionMonitor::SetPolicyStateSnapshot(snapshot);
+    PushLog("AI MON STATE IMPORTED");
+    return true;
+}
+
+static void RunUtilityAiMonitorEvaluate() {
+    const Fortress::Kernel::EKernelAIExecutionAction action =
+        Fortress::Kernel::FKernelAIExecutionMonitor::EvaluateLastTelemetry();
+
+    char line[96] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, "AI MON EVAL ");
+    AppendString(line, sizeof(line), pos, GetAiActionName(action));
+    PushLog(line);
 }
 
 static void RunUtilityEventHealth() {
@@ -9488,6 +10372,14 @@ static bool TryProcessUtilityCommand() {
         .RunTerminalModeQueryFn = RunTerminalModeQuery,
         .SetTerminalModeOnFn = SetTerminalModeOn,
         .SetTerminalModeOffFn = SetTerminalModeOff,
+        .RunTerminalFilterQueryFn = RunTerminalFilterQuery,
+        .SetTerminalFilterQuietFn = SetTerminalFilterQuiet,
+        .SetTerminalFilterNormalFn = SetTerminalFilterNormal,
+        .SetTerminalFilterFullFn = SetTerminalFilterFull,
+        .RunTerminalWindowQueryFn = RunTerminalWindowQuery,
+        .SetTerminalWindowOnFn = SetTerminalWindowOn,
+        .SetTerminalWindowOffFn = SetTerminalWindowOff,
+        .ToggleTerminalWindowFn = ToggleTerminalWindow,
         .RunParallelHudQueryFn = RunParallelHudQuery,
         .SetParallelHudOnFn = SetParallelHudOn,
         .SetParallelHudOffFn = SetParallelHudOff,
@@ -9502,6 +10394,15 @@ static bool TryProcessUtilityCommand() {
         .RunFontCacheResetFn = RunFontCacheReset,
         .RunHelpFn = RunUtilityHelp,
         .RunEventHealthFn = RunUtilityEventHealth,
+        .RunSubsystemHealthFn = RunUtilitySubsystemHealth,
+        .RunSubsystemHealthBriefFn = RunUtilitySubsystemHealthBrief,
+        .RunSubsystemHealthForceFn = RunUtilitySubsystemHealthForce,
+        .RunSubsystemHealthIntervalFn = RunUtilitySubsystemHealthInterval,
+        .RunAiMonitorFn = RunUtilityAiMonitor,
+        .RunAiMonitorEvaluateFn = RunUtilityAiMonitorEvaluate,
+        .RunAiMonitorPolicySetFn = RunUtilityAiMonitorPolicySet,
+        .RunAiMonitorThresholdFn = RunUtilityAiMonitorThreshold,
+        .RunAiMonitorStateFn = RunUtilityAiMonitorState,
         .RunStatsFn = RunUtilityStats,
         .RunRenderLayersFn = RunUtilityRenderLayers,
         .ClearCommandInputFn = ResetCommandInputBuffer,
@@ -9571,7 +10472,7 @@ static void FreezeBootLogOnFirstCommand() {
 
 static void LogSubmittedCommandIfAny() {
     if (GCommandLength > 0) {
-        char submittedLine[96] = {};
+        char submittedLine[256] = {};
         size_t submittedPos = 0;
         AppendString(submittedLine, sizeof(submittedLine), submittedPos, "CMD> ");
         AppendString(submittedLine, sizeof(submittedLine), submittedPos, GCommandBuffer);
@@ -10010,6 +10911,9 @@ void FKernelCommandConsole::Initialize() {
     GHudLogViewMode = FKernelCommandConsole::EHudLogViewMode::Hidden;
     GHudLogDetailMode = FKernelCommandConsole::EHudLogDetailMode::Tail;
     GTerminalModeEnabled = false;
+    GTerminalWindowEnabled = false;
+    GTerminalWindowSurfaceId = Fortress::Kernel::DesktopInvalidSurfaceId;
+    GSystemLogRouteMask = GSystemLogMaskNormal;
     GHudParallelStatsEnabled = false;
     GSerialMirrorReady = false;
     GSerialMirrorFaulted = false;
@@ -10159,6 +11063,44 @@ void FKernelCommandConsole::PushSystemLog(const char *line) {
         return;
     }
 
+    const auto hasChannel = [](uint32_t mask, ESystemLogChannel channel) -> bool {
+        return (mask & static_cast<uint32_t>(channel)) != 0u;
+    };
+
+    uint32_t channelMask = static_cast<uint32_t>(ESystemLogChannel::Audit);
+    if (StartsWith(line, "EVENT ") || StartsWith(line, "SCHED ") || StartsWith(line, "TEXT CACHE") ||
+        StartsWith(line, "TIMER PIT INIT") || StartsWith(line, "IRQ REG ") || StartsWith(line, "CDISP ") ||
+        StartsWith(line, "APW START ")) {
+        channelMask = static_cast<uint32_t>(ESystemLogChannel::Runtime);
+    } else if (StartsWith(line, "SUBSYS ")) {
+        channelMask = static_cast<uint32_t>(ESystemLogChannel::Subsystem);
+    } else if (StartsWith(line, "DESKTOP ") || StartsWith(line, "DSKSURF ")) {
+        channelMask = static_cast<uint32_t>(ESystemLogChannel::Desktop);
+    }
+
+    if (StartsWith(line, "ERR") || StartsWith(line, "FAIL") || StartsWith(line, "PANIC") ||
+        StartsWith(line, "INVALID")) {
+        channelMask |= static_cast<uint32_t>(ESystemLogChannel::Error);
+    }
+
+    if (StartsWith(line, "WARN") || StartsWith(line, "DEGRADED") || StartsWith(line, "RETRY") ||
+        StartsWith(line, "FALLBACK")) {
+        channelMask |= static_cast<uint32_t>(ESystemLogChannel::Warning);
+    }
+
+    if (!hasChannel(GSystemLogRouteMask, ESystemLogChannel::Runtime) &&
+        !hasChannel(GSystemLogRouteMask, ESystemLogChannel::Subsystem) &&
+        !hasChannel(GSystemLogRouteMask, ESystemLogChannel::Desktop) &&
+        !hasChannel(GSystemLogRouteMask, ESystemLogChannel::Warning) &&
+        !hasChannel(GSystemLogRouteMask, ESystemLogChannel::Error) &&
+        !hasChannel(GSystemLogRouteMask, ESystemLogChannel::Audit)) {
+        return;
+    }
+
+    if ((channelMask & GSystemLogRouteMask) == 0u) {
+        return;
+    }
+
     PushLog(line);
 }
 
@@ -10184,6 +11126,38 @@ FKernelCommandConsole::EHudLogDetailMode FKernelCommandConsole::GetHudLogDetailM
 
 bool FKernelCommandConsole::IsTerminalModeEnabled() {
     return GTerminalModeEnabled;
+}
+
+bool FKernelCommandConsole::IsTerminalWindowEnabled() {
+    return GTerminalWindowEnabled;
+}
+
+bool FKernelCommandConsole::TryGetTerminalWindowBounds(Fortress::Core::int32 &outX,
+                                                       Fortress::Core::int32 &outY,
+                                                       Fortress::Core::int32 &outWidth,
+                                                       Fortress::Core::int32 &outHeight) {
+    outX = 0;
+    outY = 0;
+    outWidth = 0;
+    outHeight = 0;
+
+    if (!GTerminalWindowEnabled || GBoundDesktopCompositor == nullptr || !GBoundDesktopCompositor->IsReady() ||
+        GTerminalWindowSurfaceId == Fortress::Kernel::DesktopInvalidSurfaceId ||
+        !GBoundDesktopCompositor->SurfaceExists(GTerminalWindowSurfaceId)) {
+        return false;
+    }
+
+    Fortress::Kernel::FDesktopRect bounds{};
+    if (!GBoundDesktopCompositor->GetSurfaceBounds(GTerminalWindowSurfaceId, bounds) || bounds.Width <= 0 ||
+        bounds.Height <= 0) {
+        return false;
+    }
+
+    outX = bounds.X;
+    outY = bounds.Y;
+    outWidth = bounds.Width;
+    outHeight = bounds.Height;
+    return true;
 }
 
 bool FKernelCommandConsole::IsHudParallelStatsEnabled() {

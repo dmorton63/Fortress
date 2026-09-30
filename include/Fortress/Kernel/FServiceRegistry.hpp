@@ -13,6 +13,9 @@ struct FServiceRegistrationInfo {
 
 struct FServiceRegistryStats {
     Fortress::Core::uint32 ServiceCount = 0;
+    Fortress::Core::uint64 FailedStartCount = 0;
+    Fortress::Core::uint64 RestartAttemptCount = 0;
+    Fortress::Core::uint64 DependencyViolationCount = 0;
 };
 
 class FServiceRegistry {
@@ -23,6 +26,9 @@ class FServiceRegistry {
         static void GetServices(FServiceRegistrationInfo *outServices,
                                                         Fortress::Core::uint32 capacity,
                                                         Fortress::Core::uint32 &outCount);
+    static void RecordServiceRestartAttempt(Fortress::Core::uint32 serviceId);
+    static void RecordServiceDependencyViolation(Fortress::Core::uint32 serviceId,
+                                                 Fortress::Core::uint32 dependencyServiceId);
     static void GetStats(FServiceRegistryStats &outStats);
 };
 

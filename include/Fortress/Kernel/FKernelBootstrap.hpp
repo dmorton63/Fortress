@@ -3,6 +3,8 @@
 
 #include "limine.h"
 
+#include "Fortress/Kernel/FKernelSubsystemStateTracker.hpp"
+
 namespace Fortress::Video {
 class FDisplayDevice;
 class FDisplayManager;
@@ -21,6 +23,7 @@ struct FKernelRuntimeContext {
     Fortress::Video::FVideoConsole *Console;
     Fortress::Video::FRenderer3D *Renderer3D;
     Fortress::Kernel::FKernelCubeScene *CubeScene;
+    Fortress::Kernel::FKernelSubsystemRuntimeState SubsystemState;
 };
 
 class FKernelBootstrap {

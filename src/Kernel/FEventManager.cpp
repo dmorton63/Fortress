@@ -20,6 +20,8 @@ static FSubscriptionSlot GSubscriptionSlots[GMaxSubscriptions] = {};
 static Fortress::Core::uint64 GPublishedCount = 0;
 static Fortress::Core::uint64 GDispatchedCount = 0;
 static Fortress::Core::uint64 GDroppedCount = 0;
+static Fortress::Core::uint64 GFanoutLatencyMicros = 0;
+static Fortress::Core::uint64 GHandlerFaultCount = 0;
 
 static Fortress::Core::uint32 CountSubscriptions() {
     Fortress::Core::uint32 count = 0;
@@ -37,6 +39,8 @@ bool FEventManager::Initialize() {
     GPublishedCount = 0;
     GDispatchedCount = 0;
     GDroppedCount = 0;
+    GFanoutLatencyMicros = 0;
+    GHandlerFaultCount = 0;
 
     for (Fortress::Core::uint32 i = 0; i < GMaxSubscriptions; i++) {
         GSubscriptionSlots[i] = FSubscriptionSlot{};
@@ -133,13 +137,29 @@ bool FEventManager::DispatchOne() {
         .Arg2 = envelope.PayloadWords[3],
     };
 
+    Fortress::Core::uint64 deliveredHandlers = 0;
     for (Fortress::Core::uint32 i = 0; i < GMaxSubscriptions; i++) {
         const FSubscriptionSlot &slot = GSubscriptionSlots[i];
-        if (!slot.InUse || slot.Handler == nullptr || slot.TopicId != event.TopicId) {
+        if (!slot.InUse || slot.TopicId != event.TopicId) {
+            continue;
+        }
+
+        if (slot.Handler == nullptr) {
+            GHandlerFaultCount++;
             continue;
         }
 
         slot.Handler(event, slot.Context);
+        deliveredHandlers++;
+    }
+
+    if (deliveredHandlers > 0) {
+        const Fortress::Core::uint64 latencySampleMicros = 1u + (deliveredHandlers * 2u);
+        if (GFanoutLatencyMicros == 0u) {
+            GFanoutLatencyMicros = latencySampleMicros;
+        } else {
+            GFanoutLatencyMicros = ((GFanoutLatencyMicros * 7u) + latencySampleMicros) / 8u;
+        }
     }
 
     GDispatchedCount++;
@@ -147,11 +167,19 @@ bool FEventManager::DispatchOne() {
 }
 
 void FEventManager::GetStats(FEventManagerStats &outStats) {
+    const Fortress::Core::uint64 queueDepth64 =
+        (GPublishedCount >= GDispatchedCount) ? (GPublishedCount - GDispatchedCount) : 0u;
+
     outStats = FEventManagerStats{
         .SubscriptionCount = CountSubscriptions(),
+        .QueueDepth = (queueDepth64 > static_cast<Fortress::Core::uint64>(0xFFFFFFFFu))
+                          ? 0xFFFFFFFFu
+                          : static_cast<Fortress::Core::uint32>(queueDepth64),
         .PublishedCount = GPublishedCount,
         .DispatchedCount = GDispatchedCount,
         .DroppedCount = GDroppedCount,
+        .FanoutLatencyMicros = GFanoutLatencyMicros,
+        .HandlerFaultCount = GHandlerFaultCount,
     };
 }
 

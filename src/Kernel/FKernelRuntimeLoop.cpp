@@ -12,6 +12,7 @@
 #include "Fortress/Kernel/FKernelRuntimeDiagnostics.hpp"
 #include "Fortress/Kernel/FKernelScheduler.hpp"
 #include "Fortress/Kernel/FKernelSchedulerEventPlane.hpp"
+#include "Fortress/Kernel/FKernelSubsystemStateTracker.hpp"
 #include "Fortress/Platform/FTimerX86.hpp"
 
 namespace Fortress::Kernel {
@@ -64,12 +65,30 @@ void RunRuntimeLoop(FKernelRuntimeContext &runtime) {
     GLongOperationFpsValue = &fpsValue;
     GDispatchDrainCoreId = FCpuCoreManager::GetBootstrapCoreId();
 
+    FKernelSubsystemStateTracker::Initialize(runtime.SubsystemState);
+    FKernelCommandConsole::PushSystemLog("SUBSYS PHASE BOOT");
+    (void)FKernelSubsystemStateTracker::TransitionTo(runtime.SubsystemState, EKernelSubsystemPhase::Init, 0u);
+    FKernelCommandConsole::PushSystemLog("SUBSYS PHASE INIT");
+
     FKernelCommandConsole::SetLongOperationYieldCallback(&PumpLongOperationFrame);
     FKernelSchedulerEventPlane::Initialize();
     FKernelCommandControlPlane::Initialize();
     FKernelInputEventPlane::Initialize();
-    (void)GRuntimeDiagnostics.Initialize(&GDesktopRuntime);
-    (void)GDesktopRuntime.Initialize(runtime);
+    const bool diagnosticsReady = GRuntimeDiagnostics.Initialize(&GDesktopRuntime);
+    const bool desktopReady = GDesktopRuntime.Initialize(runtime);
+    if (diagnosticsReady && desktopReady) {
+        (void)FKernelSubsystemStateTracker::TransitionTo(runtime.SubsystemState, EKernelSubsystemPhase::Ready, 0u);
+        FKernelCommandConsole::PushSystemLog("SUBSYS PHASE READY");
+    } else {
+        (void)FKernelSubsystemStateTracker::TransitionTo(runtime.SubsystemState, EKernelSubsystemPhase::Degraded, 0u);
+        if (!diagnosticsReady) {
+            FKernelCommandConsole::PushSystemLog("SUBSYS DEGRADED: DIAG INIT");
+        }
+        if (!desktopReady) {
+            FKernelCommandConsole::PushSystemLog("SUBSYS DEGRADED: DESKTOP INIT");
+        }
+        FKernelCommandConsole::PushSystemLog("SUBSYS PHASE DEGRADED");
+    }
 
     for (;;) {
         const float deltaTime = Fortress::Platform::FTimerX86::TickSeconds();

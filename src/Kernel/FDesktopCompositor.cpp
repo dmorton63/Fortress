@@ -382,6 +382,21 @@ bool FDesktopCompositor::MarkSurfaceDamaged(FDesktopSurfaceId surfaceId, const F
     return true;
 }
 
+bool FDesktopCompositor::MarkSurfaceDamagedLocal(FDesktopSurfaceId surfaceId, const FDesktopRect &localDamageRect) {
+    const Fortress::Core::int32 index = FindSurfaceIndex(surfaceId);
+    if (index < 0 || !IsRectValid(localDamageRect)) {
+        return false;
+    }
+
+    const FDesktopRect globalDamage{
+        .X = Surfaces[index].Bounds.X + localDamageRect.X,
+        .Y = Surfaces[index].Bounds.Y + localDamageRect.Y,
+        .Width = localDamageRect.Width,
+        .Height = localDamageRect.Height,
+    };
+    return MarkSurfaceDamaged(surfaceId, globalDamage);
+}
+
 bool FDesktopCompositor::PeekSurfaceDirtyRegion(FDesktopSurfaceId surfaceId, FDesktopRect &outDirtyRect) const {
     const Fortress::Core::int32 index = FindSurfaceIndex(surfaceId);
     if (index < 0 || !Surfaces[index].Dirty || !IsRectValid(Surfaces[index].DirtyRect)) {

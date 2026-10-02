@@ -1,5 +1,6 @@
 #include "Fortress/Kernel/FDesktopSurfaceOverlay.hpp"
 
+#include "Fortress/Kernel/FDesktopSurfaceContentHost.hpp"
 #include "Fortress/Video/FColor.hpp"
 
 namespace Fortress::Kernel {
@@ -100,16 +101,16 @@ static Fortress::Video::FColor BuildSurfaceColor(FDesktopSurfaceId surfaceId,
                                                  FDesktopSurfaceId focusSurfaceId,
                                                  FDesktopSurfaceId captureSurfaceId) {
     if (surfaceId == captureSurfaceId) {
-        return Fortress::Video::FColor::RGB(255, 190, 80);
+        return Fortress::Video::FColor::RGB(244, 208, 120);
     }
     if (surfaceId == focusSurfaceId) {
-        return Fortress::Video::FColor::RGB(120, 235, 140);
+        return Fortress::Video::FColor::RGB(170, 214, 252);
     }
 
     const Fortress::Core::uint8 seed = static_cast<Fortress::Core::uint8>((surfaceId * 41u) & 0x7Fu);
-    return Fortress::Video::FColor::RGB(static_cast<Fortress::Core::uint8>(90u + (seed % 50u)),
-                                        static_cast<Fortress::Core::uint8>(110u + ((seed / 2u) % 60u)),
-                                        static_cast<Fortress::Core::uint8>(170u + ((seed / 3u) % 70u)));
+    return Fortress::Video::FColor::RGB(static_cast<Fortress::Core::uint8>(108u + (seed % 36u)),
+                                        static_cast<Fortress::Core::uint8>(144u + ((seed / 2u) % 36u)),
+                                        static_cast<Fortress::Core::uint8>(196u + ((seed / 3u) % 40u)));
 }
 
 static bool ClipRectToSurface(const Fortress::Video::FVideoSurfaceView &surface,
@@ -304,9 +305,12 @@ static Fortress::Core::uint32 SelectTopIndexes(const Fortress::Core::uint64 *val
     return outCount;
 }
 
-void FDesktopSurfaceOverlay::Bind(FDesktopCompositor *compositor, FDesktopInputRouter *inputRouter) {
+void FDesktopSurfaceOverlay::Bind(FDesktopCompositor *compositor,
+                                  FDesktopInputRouter *inputRouter,
+                                  FDesktopSurfaceContentHost *contentHost) {
     Compositor = compositor;
     InputRouter = inputRouter;
+    ContentHost = contentHost;
     FrameStats = FDesktopOverlayFrameStats{};
 }
 
@@ -426,10 +430,15 @@ void FDesktopSurfaceOverlay::Render(const Fortress::Video::FVideoSurfaceView &su
                            repaintRect.Y,
                            repaintRect.Width,
                            repaintRect.Height,
-                           Fortress::Video::FColor::RGB(10, 18, 26));
+                           Fortress::Video::FColor::RGB(176, 204, 236));
 
             DrawDesktopSurfaceFrameDirtyAware(surface, clippedBounds, repaintRect, color);
             drawnPixels += RectArea(repaintRect);
+        }
+
+        if (ContentHost != nullptr) {
+            const bool focusedSurface = snapshots[i].SurfaceId == inputStats.FocusSurfaceId;
+            ContentHost->RenderSurfaceContent(surface, snapshots[i], focusedSurface);
         }
 
         if (hadDirty && dirtyContributorCount > 0u) {

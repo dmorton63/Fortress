@@ -54,6 +54,7 @@ class FDesktopCompositor {
     bool MoveSurface(FDesktopSurfaceId surfaceId, Fortress::Core::int32 x, Fortress::Core::int32 y);
     bool ResizeSurface(FDesktopSurfaceId surfaceId, Fortress::Core::int32 width, Fortress::Core::int32 height);
     bool MarkSurfaceDamaged(FDesktopSurfaceId surfaceId, const FDesktopRect &damageRect);
+    bool MarkSurfaceDamagedLocal(FDesktopSurfaceId surfaceId, const FDesktopRect &localDamageRect);
     bool PeekSurfaceDirtyRegion(FDesktopSurfaceId surfaceId, FDesktopRect &outDirtyRect) const;
     bool ConsumeSurfaceDirtyRegion(FDesktopSurfaceId surfaceId, FDesktopRect &outDirtyRect);
     bool ConsumeCoalescedDirtyRegion(FDesktopRect &outDirtyRect);

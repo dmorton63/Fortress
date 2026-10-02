@@ -7,6 +7,8 @@
 
 namespace Fortress::Kernel {
 
+class FDesktopSurfaceContentHost;
+
 struct FDesktopInputRouterStats {
   FDesktopSurfaceId FocusSurfaceId = DesktopInvalidSurfaceId;
   FDesktopSurfaceId CaptureSurfaceId = DesktopInvalidSurfaceId;
@@ -18,7 +20,10 @@ struct FDesktopInputRouterStats {
     Fortress::Core::uint64 CaptureStaleDropCount = 0;
     Fortress::Core::uint32 LastRoutedKeyAscii = 0;
     Fortress::Core::uint64 PointerSampleCount = 0;
+    Fortress::Core::uint64 PointerPressEdgeCount = 0;
+    Fortress::Core::uint64 PointerHitSurfaceCount = 0;
     Fortress::Core::uint64 PointerFocusClickCount = 0;
+    Fortress::Core::uint64 PointerFocusFailCount = 0;
 };
 
   struct FDesktopSurfaceInputStats {
@@ -39,6 +44,7 @@ class FDesktopInputRouter {
     bool Initialize(FDesktopCompositor *compositor);
     bool IsReady() const;
     void SetPolicyConfig(const FPolicyConfig &policyConfig);
+    void BindSurfaceContentHost(FDesktopSurfaceContentHost *contentHost);
 
     bool SetFocus(FDesktopSurfaceId surfaceId);
     bool FocusNext();
@@ -62,6 +68,7 @@ class FDesktopInputRouter {
     Fortress::Core::int32 FindOrAllocateTrackedSurfaceIndex(FDesktopSurfaceId surfaceId);
 
     FDesktopCompositor *Compositor = nullptr;
+    FDesktopSurfaceContentHost *ContentHost = nullptr;
     FDesktopSurfaceId FocusSurfaceId = DesktopInvalidSurfaceId;
     FDesktopSurfaceId CaptureSurfaceId = DesktopInvalidSurfaceId;
     Fortress::Core::uint64 RoutedKeyCount = 0;
@@ -72,7 +79,10 @@ class FDesktopInputRouter {
     Fortress::Core::uint64 CaptureStaleDropCount = 0;
     Fortress::Core::uint32 LastRoutedKeyAscii = 0;
     Fortress::Core::uint64 PointerSampleCount = 0;
+    Fortress::Core::uint64 PointerPressEdgeCount = 0;
+    Fortress::Core::uint64 PointerHitSurfaceCount = 0;
     Fortress::Core::uint64 PointerFocusClickCount = 0;
+    Fortress::Core::uint64 PointerFocusFailCount = 0;
     FTrackedSurfaceInputStats TrackedSurfaceStats[MaxTrackedSurfaceStats] = {};
     bool PreviousLeftButtonDown = false;
     FPolicyConfig PolicyConfig = {};

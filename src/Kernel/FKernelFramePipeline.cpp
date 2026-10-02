@@ -3,6 +3,7 @@
 #include "Fortress/Kernel/FKernelCommandConsole.hpp"
 #include "Fortress/Kernel/FKernelCommandControlPlane.hpp"
 #include "Fortress/Kernel/FKernelCubeScene.hpp"
+#include "Fortress/Kernel/Generated/FAeroTheme.generated.hpp"
 #include "Fortress/Memory/FKernelHeap.hpp"
 #include "Fortress/Memory/FMemoryArena.hpp"
 #include "Fortress/Memory/FPhysicalMemoryManager.hpp"
@@ -31,6 +32,7 @@ enum class EFramePassId : Fortress::Core::uint8 {
     Clear = 0,
     Scene,
     DesktopSurfaces,
+    SurfaceSelfTest,
     Hud,
     InputPulse,
     CursorOverlay,
@@ -44,6 +46,55 @@ struct FFramePassDesc {
     FFramePassPredicate ShouldRun;
     FFramePassExecute Execute;
 };
+
+struct FDesktopThemePalette {
+    Fortress::Video::FColor WindowBackground;
+    Fortress::Video::FColor TitleBarGradientStart;
+    Fortress::Video::FColor TitleBarGradientEnd;
+    Fortress::Video::FColor ButtonNormal;
+    Fortress::Video::FColor ButtonHover;
+    Fortress::Video::FColor ButtonPressed;
+    Fortress::Video::FColor ButtonGlow;
+    Fortress::Video::FColor TextPrimary;
+    Fortress::Video::FColor TextSecondary;
+    Fortress::Video::FColor Border;
+    Fortress::Video::FColor Shadow;
+    Fortress::Video::FColor AccentPrimary;
+    Fortress::Video::FColor AccentSecondary;
+};
+
+static const FDesktopThemePalette &GetDesktopThemePalette() {
+    using Fortress::Kernel::GeneratedAeroTheme::kAccentPrimary;
+    using Fortress::Kernel::GeneratedAeroTheme::kAccentSecondary;
+    using Fortress::Kernel::GeneratedAeroTheme::kBorder;
+    using Fortress::Kernel::GeneratedAeroTheme::kButtonGlow;
+    using Fortress::Kernel::GeneratedAeroTheme::kButtonHover;
+    using Fortress::Kernel::GeneratedAeroTheme::kButtonNormal;
+    using Fortress::Kernel::GeneratedAeroTheme::kButtonPressed;
+    using Fortress::Kernel::GeneratedAeroTheme::kShadow;
+    using Fortress::Kernel::GeneratedAeroTheme::kTextPrimary;
+    using Fortress::Kernel::GeneratedAeroTheme::kTextSecondary;
+    using Fortress::Kernel::GeneratedAeroTheme::kTitleBarGradientEnd;
+    using Fortress::Kernel::GeneratedAeroTheme::kTitleBarGradientStart;
+    using Fortress::Kernel::GeneratedAeroTheme::kWindowBackground;
+
+    static const FDesktopThemePalette palette{
+        .WindowBackground = kWindowBackground,
+        .TitleBarGradientStart = kTitleBarGradientStart,
+        .TitleBarGradientEnd = kTitleBarGradientEnd,
+        .ButtonNormal = kButtonNormal,
+        .ButtonHover = kButtonHover,
+        .ButtonPressed = kButtonPressed,
+        .ButtonGlow = kButtonGlow,
+        .TextPrimary = kTextPrimary,
+        .TextSecondary = kTextSecondary,
+        .Border = kBorder,
+        .Shadow = kShadow,
+        .AccentPrimary = kAccentPrimary,
+        .AccentSecondary = kAccentSecondary,
+    };
+    return palette;
+}
 
 static Fortress::Core::int32 ClampInt32(Fortress::Core::int32 value,
                                         Fortress::Core::int32 minValue,
@@ -82,17 +133,18 @@ static void DrawFilledRect(const Fortress::Video::FVideoSurfaceView &surface,
                            Fortress::Core::int32 width,
                            Fortress::Core::int32 height,
                            Fortress::Video::FColor color) {
-    if (!surface.IsValid() || width <= 0 || height <= 0 ||
-        surface.Desc.PixelFormat != Fortress::Video::EPixelFormat::Masked32) {
-        return;
-    }
+    const Fortress::Core::uint32 packed =
+        Fortress::Video::FVideoSurfaceOps::PackMasked32(color, surface.Desc.PixelMask);
+    Fortress::Video::FVideoSurfaceOps::FillRect32(surface, x, y, width, height, packed);
+}
 
-    const Fortress::Core::uint32 packed = Fortress::Video::FVideoSurfaceOps::PackMasked32(color, surface.Desc.PixelMask);
-    for (Fortress::Core::int32 py = 0; py < height; py++) {
-        for (Fortress::Core::int32 px = 0; px < width; px++) {
-            Fortress::Video::FVideoSurfaceOps::DrawPixel32(surface, x + px, y + py, packed);
-        }
-    }
+static void DrawFilledRectAlpha(const Fortress::Video::FVideoSurfaceView &surface,
+                                Fortress::Core::int32 x,
+                                Fortress::Core::int32 y,
+                                Fortress::Core::int32 width,
+                                Fortress::Core::int32 height,
+                                Fortress::Video::FColor color) {
+    Fortress::Video::FVideoSurfaceOps::FillRectAlpha32(surface, x, y, width, height, color);
 }
 
 static void DrawVerticalGradientRect(const Fortress::Video::FVideoSurfaceView &surface,
@@ -102,35 +154,61 @@ static void DrawVerticalGradientRect(const Fortress::Video::FVideoSurfaceView &s
                                                                          Fortress::Core::int32 height,
                                                                          Fortress::Video::FColor topColor,
                                                                          Fortress::Video::FColor bottomColor) {
-        if (!surface.IsValid() || width <= 0 || height <= 0 ||
-                surface.Desc.PixelFormat != Fortress::Video::EPixelFormat::Masked32) {
-                return;
-        }
+    Fortress::Video::FVideoSurfaceOps::FillGradientVertical32(surface,
+                                   x,
+                                   y,
+                                   width,
+                                   height,
+                                   topColor,
+                                   bottomColor);
+}
 
-        const Fortress::Core::int32 denom = (height > 1) ? (height - 1) : 1;
-        for (Fortress::Core::int32 py = 0; py < height; py++) {
-                const Fortress::Core::int32 r = static_cast<Fortress::Core::int32>(topColor.R) +
-                                                                                ((static_cast<Fortress::Core::int32>(bottomColor.R) -
-                                                                                    static_cast<Fortress::Core::int32>(topColor.R)) * py) /
-                                                                                        denom;
-                const Fortress::Core::int32 g = static_cast<Fortress::Core::int32>(topColor.G) +
-                                                                                ((static_cast<Fortress::Core::int32>(bottomColor.G) -
-                                                                                    static_cast<Fortress::Core::int32>(topColor.G)) * py) /
-                                                                                        denom;
-                const Fortress::Core::int32 b = static_cast<Fortress::Core::int32>(topColor.B) +
-                                                                                ((static_cast<Fortress::Core::int32>(bottomColor.B) -
-                                                                                    static_cast<Fortress::Core::int32>(topColor.B)) * py) /
-                                                                                        denom;
-                const Fortress::Core::uint32 packed = Fortress::Video::FVideoSurfaceOps::PackMasked32(
-                        Fortress::Video::FColor::RGB(static_cast<Fortress::Core::uint8>(r),
-                                                                                 static_cast<Fortress::Core::uint8>(g),
-                                                                                 static_cast<Fortress::Core::uint8>(b)),
-                        surface.Desc.PixelMask);
+static void DrawHorizontalGradientRect(const Fortress::Video::FVideoSurfaceView &surface,
+                                       Fortress::Core::int32 x,
+                                       Fortress::Core::int32 y,
+                                       Fortress::Core::int32 width,
+                                       Fortress::Core::int32 height,
+                                       Fortress::Video::FColor leftColor,
+                                       Fortress::Video::FColor rightColor) {
+    Fortress::Video::FVideoSurfaceOps::FillGradientHorizontal32(surface,
+                                                                x,
+                                                                y,
+                                                                width,
+                                                                height,
+                                                                leftColor,
+                                                                rightColor);
+}
 
-                for (Fortress::Core::int32 px = 0; px < width; px++) {
-                        Fortress::Video::FVideoSurfaceOps::DrawPixel32(surface, x + px, y + py, packed);
-                }
-        }
+static void DrawHorizontalGradientRectAlpha(const Fortress::Video::FVideoSurfaceView &surface,
+                                            Fortress::Core::int32 x,
+                                            Fortress::Core::int32 y,
+                                            Fortress::Core::int32 width,
+                                            Fortress::Core::int32 height,
+                                            Fortress::Video::FColor leftColor,
+                                            Fortress::Video::FColor rightColor) {
+    Fortress::Video::FVideoSurfaceOps::FillGradientHorizontalAlpha32(surface,
+                                                                     x,
+                                                                     y,
+                                                                     width,
+                                                                     height,
+                                                                     leftColor,
+                                                                     rightColor);
+}
+
+static void DrawVerticalGradientRectAlpha(const Fortress::Video::FVideoSurfaceView &surface,
+                                          Fortress::Core::int32 x,
+                                          Fortress::Core::int32 y,
+                                          Fortress::Core::int32 width,
+                                          Fortress::Core::int32 height,
+                                          Fortress::Video::FColor topColor,
+                                          Fortress::Video::FColor bottomColor) {
+    Fortress::Video::FVideoSurfaceOps::FillGradientVerticalAlpha32(surface,
+                                                                   x,
+                                                                   y,
+                                                                   width,
+                                                                   height,
+                                                                   topColor,
+                                                                   bottomColor);
 }
 
 static Fortress::Video::FColor SampleVerticalGradientColor(Fortress::Video::FColor topColor,
@@ -351,10 +429,22 @@ static void DrawVistaButton(const Fortress::Video::FVideoSurfaceView &surface,
         return;
     }
 
-    // Drop shadow and dark frame.
-    DrawFilledRect(surface, x + 2, y + 2, width, height, Fortress::Video::FColor::RGB(10, 20, 36));
-    DrawFilledRect(surface, x, y, width, height, Fortress::Video::FColor::RGB(34, 68, 116));
-    DrawFilledRect(surface, x + 1, y + 1, width - 2, height - 2, Fortress::Video::FColor::RGB(102, 154, 220));
+    const FDesktopThemePalette &theme = GetDesktopThemePalette();
+
+    // 1) Outer silhouette and soft shadow.
+    DrawFilledRectAlpha(surface,
+                        x + 2,
+                        y + 3,
+                        width,
+                        height,
+                        Fortress::Video::FColor{.R = 0u, .G = 0u, .B = 0u, .A = 0x34u});
+    DrawVerticalGradientRect(surface,
+                             x,
+                             y,
+                             width,
+                             height,
+                             Fortress::Video::FColor::RGB(46, 66, 94),
+                             Fortress::Video::FColor::RGB(24, 38, 60));
 
     const Fortress::Core::int32 innerX = x + 2;
     const Fortress::Core::int32 innerY = y + 2;
@@ -363,50 +453,119 @@ static void DrawVistaButton(const Fortress::Video::FVideoSurfaceView &surface,
     const Fortress::Core::int32 topH = innerH / 2;
     const Fortress::Core::int32 bottomH = innerH - topH;
 
-    // Vista-like stacked gradients: bright upper glass + deeper lower body.
+    // 2) Cool blue glass body.
     DrawVerticalGradientRect(surface,
                              innerX,
                              innerY,
                              innerW,
                              topH,
-                             Fortress::Video::FColor::RGB(246, 252, 255),
-                             Fortress::Video::FColor::RGB(176, 216, 252));
+                             Fortress::Video::FColor::RGB(142, 200, 244),
+                             Fortress::Video::FColor::RGB(70, 138, 212));
     DrawVerticalGradientRect(surface,
                              innerX,
                              innerY + topH,
                              innerW,
                              bottomH,
-                             Fortress::Video::FColor::RGB(106, 166, 236),
-                             Fortress::Video::FColor::RGB(56, 118, 194));
+                             Fortress::Video::FColor::RGB(58, 118, 196),
+                             Fortress::Video::FColor::RGB(34, 74, 136));
 
-    // High-gloss top stripe plus a subtle secondary shine.
-    const Fortress::Core::int32 glossH = topH / 2;
-    if (glossH > 1) {
-        DrawVerticalGradientRect(surface,
-                                 innerX + 1,
-                                 innerY + 1,
-                                 innerW - 2,
-                                 glossH,
-                                 Fortress::Video::FColor::RGB(255, 255, 255),
-                                 Fortress::Video::FColor::RGB(210, 232, 255));
-
-        DrawVerticalGradientRect(surface,
-                                 innerX + 2,
-                                 innerY + glossH,
-                                 innerW - 4,
-                                 2,
-                                 Fortress::Video::FColor::RGB(214, 236, 255),
-                                 Fortress::Video::FColor::RGB(176, 212, 252));
+    // 3) Upper glass sheen.
+    const Fortress::Core::int32 glowH = (innerH * 3) / 10;
+    if (glowH > 1) {
+        DrawVerticalGradientRectAlpha(surface,
+                                      innerX + 1,
+                                      innerY + 1,
+                                      innerW - 2,
+                                      glowH,
+                                      Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 0x8Eu},
+                                      Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 0x12u});
     }
 
-    // Top rim highlight and lower edge shade to increase glass depth cues.
-    DrawFilledRect(surface, innerX + 1, innerY + 1, innerW - 2, 1, Fortress::Video::FColor::RGB(255, 255, 255));
-    DrawFilledRect(surface,
-                   innerX + 1,
-                   innerY + innerH - 2,
-                   innerW - 2,
-                   1,
-                   Fortress::Video::FColor::RGB(44, 96, 166));
+    // 4) Top-half gloss veil.
+    const Fortress::Core::int32 glossH = innerH / 2;
+    if (glossH > 2) {
+        DrawVerticalGradientRectAlpha(surface,
+                                      innerX + 1,
+                                      innerY + 1,
+                                      innerW - 2,
+                                      glossH,
+                                      Fortress::Video::FColor{.R = 206u, .G = 232u, .B = 255u, .A = 0x54u},
+                                      Fortress::Video::FColor{.R = 190u, .G = 224u, .B = 255u, .A = 0x00u});
+    }
+
+    // 5) Central specular sweep (left->center and center->right).
+    const Fortress::Core::int32 sweepY = innerY + 2;
+    const Fortress::Core::int32 sweepH = (innerH > 8) ? ((innerH * 2) / 5) : (innerH / 2);
+    const Fortress::Core::int32 sweepW = innerW - 2;
+    const Fortress::Core::int32 halfSweepW = sweepW / 2;
+    if (sweepH > 2 && halfSweepW > 2) {
+        DrawHorizontalGradientRectAlpha(surface,
+                                        innerX + 1,
+                                        sweepY,
+                                        halfSweepW,
+                                        sweepH,
+                                        Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 0x06u},
+                                        Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 0x62u});
+        DrawHorizontalGradientRectAlpha(surface,
+                                        innerX + 1 + halfSweepW,
+                                        sweepY,
+                                        sweepW - halfSweepW,
+                                        sweepH,
+                                        Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 0x62u},
+                                        Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 0x06u});
+    }
+
+    // 6) Top/left bevel highlight.
+    DrawFilledRectAlpha(surface,
+                        innerX,
+                        innerY,
+                        innerW,
+                        1,
+                        Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 0xB8u});
+    DrawFilledRectAlpha(surface,
+                        innerX,
+                        innerY,
+                        1,
+                        innerH,
+                        Fortress::Video::FColor{.R = 245u, .G = 252u, .B = 255u, .A = 0x7Eu});
+
+    // 7) Bottom/right inner shadow bevel.
+    DrawFilledRectAlpha(surface,
+                        innerX,
+                        innerY + innerH - 1,
+                        innerW,
+                        1,
+                        Fortress::Video::FColor{.R = 6u, .G = 22u, .B = 42u, .A = 0xA8u});
+    DrawFilledRectAlpha(surface,
+                        innerX + innerW - 1,
+                        innerY,
+                        1,
+                        innerH,
+                        Fortress::Video::FColor{.R = 8u, .G = 24u, .B = 44u, .A = 0x88u});
+
+    // 8) Lower tint to restore depth under glass.
+    DrawVerticalGradientRectAlpha(surface,
+                                  innerX + 1,
+                                  innerY + innerH - 4,
+                                  innerW - 2,
+                                  3,
+                                  Fortress::Video::FColor{.R = 0u, .G = 0u, .B = 0u, .A = 0x00u},
+                                  Fortress::Video::FColor{.R = 8u, .G = 18u, .B = 34u, .A = 0x60u});
+
+    // 9) Corner shaping hints for rounded-capsule illusion.
+    Fortress::Video::FVideoSurfaceOps::BlendPixel32(surface, x + 1, y + 1, Fortress::Video::FColor{.R = 0u, .G = 0u, .B = 0u, .A = 0x58u});
+    Fortress::Video::FVideoSurfaceOps::BlendPixel32(surface,
+                                                    x + width - 2,
+                                                    y + 1,
+                                                    Fortress::Video::FColor{.R = 0u, .G = 0u, .B = 0u, .A = 0x58u});
+    Fortress::Video::FVideoSurfaceOps::BlendPixel32(surface,
+                                                    x + 1,
+                                                    y + height - 2,
+                                                    Fortress::Video::FColor{.R = 0u, .G = 0u, .B = 0u, .A = 0x78u});
+    Fortress::Video::FVideoSurfaceOps::BlendPixel32(surface,
+                                                    x + width - 2,
+                                                    y + height - 2,
+                                                    Fortress::Video::FColor{.R = 0u, .G = 0u, .B = 0u, .A = 0x78u});
 
     const Fortress::Core::usize labelLen = StringLength(label);
     const Fortress::Core::int32 glyphAdvance = Fortress::Video::FTextRenderer::GetGlyphAdvance(scale);
@@ -415,15 +574,15 @@ static void DrawVistaButton(const Fortress::Video::FVideoSurfaceView &surface,
     const Fortress::Core::int32 textX = x + (width - textWidth) / 2;
     const Fortress::Core::int32 textY = y + (height - lineAdvance) / 2;
 
-    const Fortress::Video::FColor textBg = SampleVerticalGradientColor(Fortress::Video::FColor::RGB(176, 216, 252),
-                                                                       Fortress::Video::FColor::RGB(92, 146, 220),
+    const Fortress::Video::FColor textBg = SampleVerticalGradientColor(Fortress::Video::FColor::RGB(142, 200, 244),
+                                                                       Fortress::Video::FColor::RGB(34, 74, 136),
                                                                        innerH,
                                                                        (textY - innerY) + (lineAdvance / 2));
     DrawTextLine(surface,
                  font,
                  label,
                  scale,
-                 Fortress::Video::FColor::RGB(246, 252, 255),
+                 theme.TextPrimary,
                  textBg,
                  textX + 1,
                  textY + 1);
@@ -432,7 +591,7 @@ static void DrawVistaButton(const Fortress::Video::FVideoSurfaceView &surface,
                  font,
                  label,
                  scale,
-                 Fortress::Video::FColor::RGB(24, 54, 92),
+                 theme.WindowBackground,
                  textBg,
                  textX,
                  textY);
@@ -495,9 +654,14 @@ static bool ShouldRunClearPass(const FFramePassContext &context) {
 
 static void ExecuteClearPass(const FFramePassContext &context) {
     const Fortress::Video::FVideoSurfaceView &surface = context.FrameContext.BackSurface;
-    const Fortress::Core::uint32 packed = Fortress::Video::FVideoSurfaceOps::PackMasked32(
-        Fortress::Video::FColor::RGB(6, 8, 12), surface.Desc.PixelMask);
-    Fortress::Video::FVideoSurfaceOps::Clear32(surface, packed);
+    const FDesktopThemePalette &theme = GetDesktopThemePalette();
+    DrawVerticalGradientRect(surface,
+                             0,
+                             0,
+                             static_cast<Fortress::Core::int32>(surface.Desc.Width),
+                             static_cast<Fortress::Core::int32>(surface.Desc.Height),
+                             theme.TitleBarGradientStart,
+                             theme.WindowBackground);
 }
 
 static bool ShouldRunScenePass(const FFramePassContext &context) {
@@ -513,11 +677,113 @@ static bool ShouldRunDesktopSurfacesPass(const FFramePassContext &context) {
 }
 
 static void ExecuteDesktopSurfacesPass(const FFramePassContext &context) {
-    if (!context.DesktopRuntime.IsReady() || !context.DesktopRuntime.GetOverlay().IsReady()) {
+    if (!context.DesktopRuntime.GetOverlay().IsReady()) {
         return;
     }
 
     context.DesktopRuntime.GetOverlay().Render(context.FrameContext.BackSurface);
+}
+
+static bool ShouldRunSurfaceSelfTestPass(const FFramePassContext &context) {
+    return context.FrameContext.IsValid() && context.Options.RenderSurfaceSelfTest;
+}
+
+static void DrawAlphaTestBackdrop(const Fortress::Video::FVideoSurfaceView &surface,
+                                  Fortress::Core::int32 x,
+                                  Fortress::Core::int32 y,
+                                  Fortress::Core::int32 width,
+                                  Fortress::Core::int32 height) {
+    const Fortress::Core::uint32 light = Fortress::Video::FVideoSurfaceOps::PackMasked32(
+        Fortress::Video::FColor::RGB(194, 204, 216), surface.Desc.PixelMask);
+    const Fortress::Core::uint32 dark = Fortress::Video::FVideoSurfaceOps::PackMasked32(
+        Fortress::Video::FColor::RGB(130, 144, 160), surface.Desc.PixelMask);
+
+    constexpr Fortress::Core::int32 cell = 8;
+    for (Fortress::Core::int32 py = 0; py < height; py += cell) {
+        for (Fortress::Core::int32 px = 0; px < width; px += cell) {
+            const bool darkCell = (((px / cell) + (py / cell)) & 1) != 0;
+            Fortress::Video::FVideoSurfaceOps::FillRect32(surface,
+                                                          x + px,
+                                                          y + py,
+                                                          cell,
+                                                          cell,
+                                                          darkCell ? dark : light);
+        }
+    }
+}
+
+static void ExecuteSurfaceSelfTestPass(const FFramePassContext &context) {
+    const Fortress::Video::FVideoSurfaceView &surface = context.FrameContext.BackSurface;
+
+    const Fortress::Core::int32 panelX = 24;
+    const Fortress::Core::int32 panelY = 58;
+    const Fortress::Core::int32 panelW = 420;
+    const Fortress::Core::int32 panelH = 190;
+
+    const Fortress::Core::uint32 panelBorder = Fortress::Video::FVideoSurfaceOps::PackMasked32(
+        Fortress::Video::FColor::RGB(36, 44, 56), surface.Desc.PixelMask);
+    const Fortress::Core::uint32 panelBg = Fortress::Video::FVideoSurfaceOps::PackMasked32(
+        Fortress::Video::FColor::RGB(78, 96, 120), surface.Desc.PixelMask);
+
+    Fortress::Video::FVideoSurfaceOps::FillRect32(surface, panelX, panelY, panelW, panelH, panelBorder);
+    Fortress::Video::FVideoSurfaceOps::FillRect32(surface, panelX + 2, panelY + 2, panelW - 4, panelH - 4, panelBg);
+
+    const Fortress::Core::int32 swW = 120;
+    const Fortress::Core::int32 swH = 52;
+    const Fortress::Core::int32 gapX = 12;
+    const Fortress::Core::int32 gapY = 12;
+    const Fortress::Core::int32 row0Y = panelY + 16;
+    const Fortress::Core::int32 row1Y = row0Y + swH + gapY;
+    const Fortress::Core::int32 col0X = panelX + 16;
+    const Fortress::Core::int32 col1X = col0X + swW + gapX;
+    const Fortress::Core::int32 col2X = col1X + swW + gapX;
+
+    // Opaque swatches.
+    const Fortress::Core::uint32 opaqueSolid = Fortress::Video::FVideoSurfaceOps::PackMasked32(
+        Fortress::Video::FColor::RGB(44, 156, 240), surface.Desc.PixelMask);
+    Fortress::Video::FVideoSurfaceOps::FillRect32(surface, col0X, row0Y, swW, swH, opaqueSolid);
+    Fortress::Video::FVideoSurfaceOps::FillGradientVertical32(surface,
+                                                              col1X,
+                                                              row0Y,
+                                                              swW,
+                                                              swH,
+                                                              Fortress::Video::FColor::RGB(128, 226, 255),
+                                                              Fortress::Video::FColor::RGB(28, 122, 204));
+    Fortress::Video::FVideoSurfaceOps::FillGradientHorizontal32(surface,
+                                                                col2X,
+                                                                row0Y,
+                                                                swW,
+                                                                swH,
+                                                                Fortress::Video::FColor::RGB(255, 184, 110),
+                                                                Fortress::Video::FColor::RGB(204, 74, 128));
+
+    // Alpha swatches over checkerboard backdrop.
+    DrawAlphaTestBackdrop(surface, col0X, row1Y, swW, swH);
+    DrawAlphaTestBackdrop(surface, col1X, row1Y, swW, swH);
+    DrawAlphaTestBackdrop(surface, col2X, row1Y, swW, swH);
+
+    Fortress::Video::FVideoSurfaceOps::FillRectAlpha32(surface,
+                                                       col0X,
+                                                       row1Y,
+                                                       swW,
+                                                       swH,
+                                                       Fortress::Video::FColor{.R = 36u, .G = 188u, .B = 250u, .A = 128u});
+    Fortress::Video::FVideoSurfaceOps::FillGradientVerticalAlpha32(
+        surface,
+        col1X,
+        row1Y,
+        swW,
+        swH,
+        Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 200u},
+        Fortress::Video::FColor{.R = 42u, .G = 102u, .B = 220u, .A = 30u});
+    Fortress::Video::FVideoSurfaceOps::FillGradientHorizontalAlpha32(
+        surface,
+        col2X,
+        row1Y,
+        swW,
+        swH,
+        Fortress::Video::FColor{.R = 255u, .G = 72u, .B = 72u, .A = 200u},
+        Fortress::Video::FColor{.R = 72u, .G = 255u, .B = 144u, .A = 36u});
 }
 
 static void ExecuteHudPass(const FFramePassContext &context) {
@@ -562,12 +828,204 @@ static void ExecuteHudPass(const FFramePassContext &context) {
         return;
     }
 
+    static Fortress::Video::FFontManager GFallbackHudFont = {};
+    static bool GFallbackHudFontReady = false;
+    if (!GFallbackHudFontReady) {
+        GFallbackHudFontReady = GFallbackHudFont.Initialize();
+    }
+
+    const bool terminalMode = FKernelCommandConsole::IsTerminalModeEnabled();
+    if (!terminalMode) {
+        const FDesktopThemePalette &theme = GetDesktopThemePalette();
+        const Fortress::Core::int32 screenWidth = static_cast<Fortress::Core::int32>(context.FrameContext.BackSurface.Desc.Width);
+        const Fortress::Core::int32 screenHeight = static_cast<Fortress::Core::int32>(context.FrameContext.BackSurface.Desc.Height);
+
+        const Fortress::Core::int32 topStripX = 0;
+        const Fortress::Core::int32 topStripY = 0;
+        const Fortress::Core::int32 topStripW = screenWidth;
+        const Fortress::Core::int32 topStripH = 44;
+        DrawHorizontalGradientRect(context.FrameContext.BackSurface,
+                       topStripX,
+                       topStripY,
+                       topStripW,
+                       topStripH,
+                       theme.TitleBarGradientStart,
+                       theme.TitleBarGradientEnd);
+        DrawFilledRect(context.FrameContext.BackSurface,
+                       topStripX,
+                       topStripY + topStripH - 2,
+                       topStripW,
+                       2,
+                       theme.Border);
+
+        const Fortress::Core::int32 taskbarH = 52;
+        const Fortress::Core::int32 taskbarY = screenHeight - taskbarH;
+
+        const Fortress::Core::int32 desktopBodyY = topStripH;
+        const Fortress::Core::int32 desktopBodyH = taskbarY - desktopBodyY;
+        if (desktopBodyH > 0) {
+            DrawVerticalGradientRect(context.FrameContext.BackSurface,
+                                     0,
+                                     desktopBodyY,
+                                     screenWidth,
+                                     desktopBodyH,
+                                     theme.WindowBackground,
+                                     theme.TitleBarGradientEnd);
+
+            const Fortress::Core::int32 cardX = 72;
+            const Fortress::Core::int32 cardY = desktopBodyY + 56;
+            const Fortress::Core::int32 cardW = 420;
+            const Fortress::Core::int32 cardH = 180;
+            DrawVerticalGradientRect(context.FrameContext.BackSurface,
+                                     cardX,
+                                     cardY,
+                                     cardW,
+                                     cardH,
+                                     theme.TitleBarGradientStart,
+                                     theme.TitleBarGradientEnd);
+            DrawFilledRect(context.FrameContext.BackSurface,
+                           cardX,
+                           cardY,
+                           cardW,
+                           2,
+                           theme.ButtonNormal);
+            DrawFilledRect(context.FrameContext.BackSurface,
+                           cardX,
+                           cardY + cardH - 2,
+                           cardW,
+                           2,
+                           theme.Border);
+
+            const Fortress::Core::int32 sideX = screenWidth - 300;
+            const Fortress::Core::int32 sideY = desktopBodyY + 80;
+            const Fortress::Core::int32 sideW = 228;
+            const Fortress::Core::int32 sideH = 260;
+            DrawVerticalGradientRect(context.FrameContext.BackSurface,
+                                     sideX,
+                                     sideY,
+                                     sideW,
+                                     sideH,
+                                     theme.TitleBarGradientStart,
+                                     theme.TitleBarGradientEnd);
+            DrawFilledRect(context.FrameContext.BackSurface,
+                           sideX,
+                           sideY,
+                           sideW,
+                           2,
+                           theme.ButtonNormal);
+            DrawFilledRect(context.FrameContext.BackSurface,
+                           sideX,
+                           sideY + sideH - 2,
+                           sideW,
+                           2,
+                           theme.Border);
+        }
+
+        DrawVerticalGradientRect(context.FrameContext.BackSurface,
+                                 0,
+                                 taskbarY,
+                                 screenWidth,
+                                 taskbarH,
+                                 theme.TitleBarGradientStart,
+                                 theme.TitleBarGradientEnd);
+        DrawFilledRect(context.FrameContext.BackSurface,
+                       0,
+                       taskbarY,
+                       screenWidth,
+                       1,
+                       theme.ButtonNormal);
+
+        const Fortress::Core::int32 orbX = 10;
+        const Fortress::Core::int32 orbY = taskbarY + 8;
+        const Fortress::Core::int32 orbSize = 34;
+        DrawVerticalGradientRect(context.FrameContext.BackSurface,
+                                 orbX,
+                                 orbY,
+                                 orbSize,
+                                 orbSize,
+                                 theme.AccentSecondary,
+                                 theme.AccentPrimary);
+        DrawFilledRect(context.FrameContext.BackSurface, orbX, orbY, orbSize, 1, theme.ButtonNormal);
+        DrawFilledRect(context.FrameContext.BackSurface,
+                       orbX,
+                       orbY + orbSize - 1,
+                       orbSize,
+                       1,
+                       theme.Border);
+
+        if (GFallbackHudFontReady) {
+            DrawTextLine(context.FrameContext.BackSurface,
+                         GFallbackHudFont,
+                         "Fortress Vista Shell",
+                         2,
+                         theme.TextPrimary,
+                         theme.TitleBarGradientStart,
+                         topStripX + 16,
+                         topStripY + 14);
+
+            DrawTextLine(context.FrameContext.BackSurface,
+                         GFallbackHudFont,
+                         "Desktop Ready",
+                         2,
+                         theme.TextPrimary,
+                         theme.TitleBarGradientStart,
+                         92,
+                         desktopBodyY + 76);
+
+            DrawTextLine(context.FrameContext.BackSurface,
+                         GFallbackHudFont,
+                         "Open terminal from launcher button in desktop controls",
+                         2,
+                         theme.TextSecondary,
+                         theme.TitleBarGradientStart,
+                         92,
+                         desktopBodyY + 112);
+
+            DrawVistaButton(context.FrameContext.BackSurface,
+                            GFallbackHudFont,
+                            "Open CMD",
+                            92,
+                            desktopBodyY + 138,
+                            164,
+                            34,
+                            2);
+
+            DrawTextLine(context.FrameContext.BackSurface,
+                         GFallbackHudFont,
+                         "System Panels",
+                         2,
+                         theme.TextSecondary,
+                         theme.TitleBarGradientStart,
+                         screenWidth - 274,
+                         desktopBodyY + 100);
+
+            DrawTextLine(context.FrameContext.BackSurface,
+                         GFallbackHudFont,
+                         "Start",
+                         2,
+                         theme.TextPrimary,
+                         theme.AccentPrimary,
+                         orbX + 40,
+                         orbY + 9);
+
+            DrawTextLine(context.FrameContext.BackSurface,
+                         GFallbackHudFont,
+                         "Click terminal launcher button in the desktop panel to open CMD window",
+                         2,
+                         theme.TextSecondary,
+                         theme.TitleBarGradientStart,
+                         170,
+                         taskbarY + 16);
+        }
+        return;
+    }
+
     const Fortress::Core::int32 textX = panelX + 12;
     const Fortress::Core::int32 separatorX = panelX + 8;
     const Fortress::Core::int32 separatorWidth = panelWidth - 16;
     const Fortress::Core::int32 panelBottomY = panelY + panelHeight - 10;
-    const Fortress::Video::FColor panelTopColor = Fortress::Video::FColor::RGB(10, 50, 255);
-    const Fortress::Video::FColor panelBottomColor = Fortress::Video::FColor::RGB(255, 30, 20);
+    const Fortress::Video::FColor panelTopColor = Fortress::Video::FColor::RGB(206, 226, 248);
+    const Fortress::Video::FColor panelBottomColor = Fortress::Video::FColor::RGB(132, 166, 214);
 
     DrawVerticalGradientRect(context.FrameContext.BackSurface,
                              panelX,
@@ -577,12 +1035,6 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                              panelTopColor,
                              panelBottomColor);
 
-    static Fortress::Video::FFontManager GFallbackHudFont = {};
-    static bool GFallbackHudFontReady = false;
-    if (!GFallbackHudFontReady) {
-        GFallbackHudFontReady = GFallbackHudFont.Initialize();
-    }
-
     const auto DrawHudTextLine = [&](const char *line, Fortress::Video::FColor fg, Fortress::Core::int32 y) {
         const Fortress::Video::FColor bg =
             SampleVerticalGradientColor(panelTopColor, panelBottomColor, panelHeight, y - panelY);
@@ -591,9 +1043,9 @@ static void ExecuteHudPass(const FFramePassContext &context) {
 
     if (context.Runtime.Console == nullptr) {
         if (GFallbackHudFontReady) {
-            DrawHudTextLine("FORTRESS HUD", Fortress::Video::FColor::RGB(255, 255, 210), panelY + 12);
+            DrawHudTextLine("FORTRESS HUD", Fortress::Video::FColor::RGB(28, 54, 92), panelY + 12);
             DrawHudTextLine("CONSOLE UNAVAILABLE",
-                            Fortress::Video::FColor::RGB(255, 150, 120),
+                            Fortress::Video::FColor::RGB(108, 54, 38),
                             panelY + 12 + Fortress::Video::FTextRenderer::GetLineAdvance(2));
         }
         return;
@@ -611,8 +1063,8 @@ static void ExecuteHudPass(const FFramePassContext &context) {
     const Fortress::Core::int32 pinnedLogHintY = inputLineY - lineAdvance - 6;
     const Fortress::Core::int32 logBottomY = pinnedLogHintY - 8;
 
-    if (FKernelCommandConsole::IsTerminalModeEnabled()) {
-        DrawHudTextLine("TERMINAL", Fortress::Video::FColor::RGB(255, 255, 210), cursorY);
+    if (terminalMode) {
+        DrawHudTextLine("TERMINAL", Fortress::Video::FColor::RGB(34, 60, 98), cursorY);
         cursorY += lineAdvance;
 
         DrawFilledRect(context.FrameContext.BackSurface,
@@ -620,7 +1072,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                        cursorY,
                        separatorWidth,
                        2,
-                       Fortress::Video::FColor::RGB(40, 80, 120));
+                       Fortress::Video::FColor::RGB(86, 128, 178));
 
         cursorY += lineAdvance;
         const FKernelCommandConsole::EHudLogViewMode logViewMode = FKernelCommandConsole::GetHudLogViewMode();
@@ -652,21 +1104,21 @@ static void ExecuteHudPass(const FFramePassContext &context) {
             const char *line = (logViewMode == FKernelCommandConsole::EHudLogViewMode::BootLog)
                                    ? FKernelCommandConsole::GetBootLogLine(i)
                                    : FKernelCommandConsole::GetLogLine(i);
-            DrawHudTextLine(line, Fortress::Video::FColor::RGB(215, 230, 255), drawY);
+            DrawHudTextLine(line, Fortress::Video::FColor::RGB(30, 58, 96), drawY);
             drawY += lineAdvance;
             if (drawY > logBottomY) {
                 break;
             }
         }
 
-        DrawHudTextLine("TERMINAL ON", Fortress::Video::FColor::RGB(235, 230, 170), pinnedLogHintY);
+        DrawHudTextLine("TERMINAL ON", Fortress::Video::FColor::RGB(48, 78, 112), pinnedLogHintY);
 
         DrawFilledRect(context.FrameContext.BackSurface,
                        separatorX,
                        inputLineY - 4,
                        separatorWidth,
                        2,
-                       Fortress::Video::FColor::RGB(100, 64, 40));
+                       Fortress::Video::FColor::RGB(92, 134, 182));
 
         const Fortress::Video::FColor inputBg =
             SampleVerticalGradientColor(panelTopColor, panelBottomColor, panelHeight, inputLineY - panelY);
@@ -674,7 +1126,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                      GFallbackHudFont,
                      "INPUT> ",
                      2,
-                     Fortress::Video::FColor::RGB(255, 240, 160),
+                     Fortress::Video::FColor::RGB(36, 66, 104),
                      inputBg,
                      textX,
                      inputLineY);
@@ -711,7 +1163,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                      GFallbackHudFont,
                      inputDisplayLine,
                      2,
-                     Fortress::Video::FColor::RGB(255, 255, 230),
+                     Fortress::Video::FColor::RGB(24, 54, 88),
                      inputBg,
                      inputStartX,
                      inputLineY);
@@ -730,10 +1182,10 @@ static void ExecuteHudPass(const FFramePassContext &context) {
         return;
     }
 
-    DrawHudTextLine("FORTRESS HUD", Fortress::Video::FColor::RGB(255, 255, 210), cursorY);
+    DrawHudTextLine("FORTRESS HUD", Fortress::Video::FColor::RGB(34, 58, 94), cursorY);
 
     cursorY += lineAdvance;
-    DrawHudTextLine("TYPE HELP FOR COMMANDS", Fortress::Video::FColor::RGB(210, 255, 220), cursorY);
+    DrawHudTextLine("TYPE HELP FOR COMMANDS", Fortress::Video::FColor::RGB(56, 82, 120), cursorY);
 
     cursorY += lineAdvance;
         DrawFilledRect(context.FrameContext.BackSurface,
@@ -741,7 +1193,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                                      cursorY,
                                      separatorWidth,
                                      2,
-                                     Fortress::Video::FColor::RGB(40, 80, 120));
+                                     Fortress::Video::FColor::RGB(86, 128, 178));
 
     cursorY += 6;
     static char cachedRendererLine[96] = {};
@@ -767,27 +1219,27 @@ static void ExecuteHudPass(const FFramePassContext &context) {
     CapturePersistentSummaryLine("PARALLELPROBE MODE ", cachedParallelProbeLine, sizeof(cachedParallelProbeLine));
 
     if (cachedRendererLine[0] != '\0') {
-        DrawHudTextLine(cachedRendererLine, Fortress::Video::FColor::RGB(255, 230, 170), cursorY);
+        DrawHudTextLine(cachedRendererLine, Fortress::Video::FColor::RGB(48, 78, 116), cursorY);
         cursorY += lineAdvance;
     }
     if (cachedDisplayModeLine[0] != '\0') {
-        DrawHudTextLine(cachedDisplayModeLine, Fortress::Video::FColor::RGB(255, 230, 170), cursorY);
+        DrawHudTextLine(cachedDisplayModeLine, Fortress::Video::FColor::RGB(48, 78, 116), cursorY);
         cursorY += lineAdvance;
     }
     if (cachedVfsLine[0] != '\0') {
-        DrawHudTextLine(cachedVfsLine, Fortress::Video::FColor::RGB(190, 240, 190), cursorY);
+        DrawHudTextLine(cachedVfsLine, Fortress::Video::FColor::RGB(52, 90, 124), cursorY);
         cursorY += lineAdvance;
     }
     if (cachedDesktopSmokeLine[0] != '\0') {
-        DrawHudTextLine(cachedDesktopSmokeLine, Fortress::Video::FColor::RGB(190, 240, 190), cursorY);
+        DrawHudTextLine(cachedDesktopSmokeLine, Fortress::Video::FColor::RGB(52, 90, 124), cursorY);
         cursorY += lineAdvance;
     }
     if (cachedDsksurfSmokeLine[0] != '\0') {
-        DrawHudTextLine(cachedDsksurfSmokeLine, Fortress::Video::FColor::RGB(190, 240, 190), cursorY);
+        DrawHudTextLine(cachedDsksurfSmokeLine, Fortress::Video::FColor::RGB(52, 90, 124), cursorY);
         cursorY += lineAdvance;
     }
     if (cachedDesktopStatsLine[0] != '\0') {
-        DrawHudTextLine(cachedDesktopStatsLine, Fortress::Video::FColor::RGB(180, 220, 255), cursorY);
+        DrawHudTextLine(cachedDesktopStatsLine, Fortress::Video::FColor::RGB(46, 82, 122), cursorY);
         cursorY += lineAdvance;
     }
 
@@ -797,26 +1249,26 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                        cursorY,
                        separatorWidth,
                        2,
-                       Fortress::Video::FColor::RGB(40, 80, 120));
+                       Fortress::Video::FColor::RGB(86, 128, 178));
         cursorY += lineAdvance;
 
-        DrawHudTextLine("PARALLEL HUD", Fortress::Video::FColor::RGB(255, 230, 170), cursorY);
+        DrawHudTextLine("PARALLEL HUD", Fortress::Video::FColor::RGB(48, 78, 116), cursorY);
         cursorY += lineAdvance;
 
         if (cachedCoreDispatchLine[0] != '\0') {
-            DrawHudTextLine(cachedCoreDispatchLine, Fortress::Video::FColor::RGB(180, 220, 255), cursorY);
+            DrawHudTextLine(cachedCoreDispatchLine, Fortress::Video::FColor::RGB(46, 82, 122), cursorY);
             cursorY += lineAdvance;
         }
         if (cachedCoreDispatchPerCoreLine[0] != '\0') {
-            DrawHudTextLine(cachedCoreDispatchPerCoreLine, Fortress::Video::FColor::RGB(180, 220, 255), cursorY);
+            DrawHudTextLine(cachedCoreDispatchPerCoreLine, Fortress::Video::FColor::RGB(46, 82, 122), cursorY);
             cursorY += lineAdvance;
         }
         if (cachedApWorkerLine[0] != '\0') {
-            DrawHudTextLine(cachedApWorkerLine, Fortress::Video::FColor::RGB(180, 220, 255), cursorY);
+            DrawHudTextLine(cachedApWorkerLine, Fortress::Video::FColor::RGB(46, 82, 122), cursorY);
             cursorY += lineAdvance;
         }
         if (cachedParallelProbeLine[0] != '\0') {
-            DrawHudTextLine(cachedParallelProbeLine, Fortress::Video::FColor::RGB(180, 220, 255), cursorY);
+            DrawHudTextLine(cachedParallelProbeLine, Fortress::Video::FColor::RGB(46, 82, 122), cursorY);
             cursorY += lineAdvance;
         }
     }
@@ -826,7 +1278,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                    cursorY,
                    separatorWidth,
                    2,
-                   Fortress::Video::FColor::RGB(40, 80, 120));
+                   Fortress::Video::FColor::RGB(86, 128, 178));
 
     cursorY += lineAdvance;
     const FKernelCommandConsole::EHudLogViewMode logViewMode = FKernelCommandConsole::GetHudLogViewMode();
@@ -862,14 +1314,14 @@ static void ExecuteHudPass(const FFramePassContext &context) {
             if (matchedCount == 0u) {
                 if (detailMode == FKernelCommandConsole::EHudLogDetailMode::Errors) {
                     DrawHudTextLine("NO ISSUE LINES (FAIL|ERR|INVALID|PANIC|TIMEOUT)",
-                                    Fortress::Video::FColor::RGB(210, 220, 180),
+                                    Fortress::Video::FColor::RGB(70, 92, 126),
                                     cursorY);
                 } else if (detailMode == FKernelCommandConsole::EHudLogDetailMode::Warn) {
                     DrawHudTextLine("NO WARN LINES (WARN|DEGRADED|RETRY|FALLBACK)",
-                                    Fortress::Video::FColor::RGB(210, 220, 180),
+                                    Fortress::Video::FColor::RGB(70, 92, 126),
                                     cursorY);
                 } else {
-                    DrawHudTextLine("NO ISSUE/WARN LINES", Fortress::Video::FColor::RGB(210, 220, 180), cursorY);
+                    DrawHudTextLine("NO ISSUE/WARN LINES", Fortress::Video::FColor::RGB(70, 92, 126), cursorY);
                 }
             } else {
                 for (Fortress::Core::usize m = startMatch; m < matchedCount; m++) {
@@ -882,7 +1334,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                             ? Fortress::Video::FColor::RGB(255, 210, 170)
                             : (detailMode == FKernelCommandConsole::EHudLogDetailMode::Warn)
                                   ? Fortress::Video::FColor::RGB(255, 240, 170)
-                                  : Fortress::Video::FColor::RGB(255, 225, 160);
+                                    : Fortress::Video::FColor::RGB(252, 232, 174);
                     DrawHudTextLine(line, highlightColor, cursorY);
                     cursorY += lineAdvance;
                     if (cursorY > logBottomY) {
@@ -913,7 +1365,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                 const char *line = (logViewMode == FKernelCommandConsole::EHudLogViewMode::BootLog)
                                        ? FKernelCommandConsole::GetBootLogLine(i)
                                        : FKernelCommandConsole::GetLogLine(i);
-                DrawHudTextLine(line, Fortress::Video::FColor::RGB(200, 220, 255), drawY);
+                DrawHudTextLine(line, Fortress::Video::FColor::RGB(40, 72, 108), drawY);
                 drawY += lineAdvance;
                 if (drawY > logBottomY) {
                     break;
@@ -926,14 +1378,14 @@ static void ExecuteHudPass(const FFramePassContext &context) {
         (logViewMode == FKernelCommandConsole::EHudLogViewMode::Hidden)
             ? "LOG VIEW OFF  (SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] | BOOTLOG)"
             : "LOG: SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] | BOOTLOG | HIDELOG";
-    DrawHudTextLine(pinnedLogHint, Fortress::Video::FColor::RGB(235, 230, 170), pinnedLogHintY);
+    DrawHudTextLine(pinnedLogHint, Fortress::Video::FColor::RGB(62, 92, 130), pinnedLogHintY);
 
     DrawFilledRect(context.FrameContext.BackSurface,
                    separatorX,
                    inputLineY - 4,
                    separatorWidth,
                    2,
-                   Fortress::Video::FColor::RGB(100, 64, 40));
+                   Fortress::Video::FColor::RGB(92, 134, 182));
 
     const Fortress::Video::FColor inputBg =
         SampleVerticalGradientColor(panelTopColor, panelBottomColor, panelHeight, inputLineY - panelY);
@@ -941,7 +1393,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                  GFallbackHudFont,
                  "INPUT> ",
                  2,
-                 Fortress::Video::FColor::RGB(255, 240, 160),
+                 Fortress::Video::FColor::RGB(36, 66, 104),
                  inputBg,
                  textX,
                  inputLineY);
@@ -978,7 +1430,7 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                  GFallbackHudFont,
                  inputDisplayLine,
                  2,
-                 Fortress::Video::FColor::RGB(255, 255, 230),
+                 Fortress::Video::FColor::RGB(24, 54, 88),
                  inputBg,
                  inputStartX,
                  inputLineY);
@@ -1039,14 +1491,14 @@ FFrameRenderOptions FKernelFramePipeline::BuildFrameRenderOptions(Fortress::Core
                                                                   bool consumeButtonEdges) {
     FFrameRenderOptions options{};
     options.FpsValue = fpsValue;
-    // HUD-only stabilization mode: keep rendering path minimal while desktop text UX is hardened.
-    options.RenderScene = false;
-    options.WireframeEnabled = false;
-    options.RenderDesktopSurfaces = false;
+    // Keep core scene rendering active; command control-plane events toggle optional overlays.
+    options.RenderScene = true;
+    options.WireframeEnabled = FKernelCommandControlPlane::IsWireframeEnabled();
+    options.RenderSurfaceSelfTest = FKernelCommandConsole::IsRenderSurfaceSelfTestEnabled();
+    options.RenderDesktopSurfaces = true;
     options.RenderHud = true;
-    (void)FKernelCommandControlPlane::ConsumeCommandPulseFrame();
-    options.RenderInputPulse = false;
-    options.RenderCursorOverlay = false;
+    options.RenderInputPulse = FKernelCommandControlPlane::ConsumeCommandPulseFrame();
+    options.RenderCursorOverlay = FKernelCommandControlPlane::IsCursorOverlayEnabled();
     options.ConsumeButtonEdges = consumeButtonEdges;
     return options;
 }
@@ -1059,6 +1511,12 @@ void FKernelFramePipeline::RenderFrame(FKernelRuntimeContext &runtime,
     }
 
     Fortress::Video::FDisplayFrameContext frameContext = runtime.DisplayManager->BeginFrame();
+    if (!frameContext.IsValid()) {
+        // Recover from transient mode refresh failures by reusing current mode and acquired back surface.
+        frameContext.Mode = runtime.DisplayManager->GetMode();
+        frameContext.BackSurface = runtime.DisplayManager->AcquireBackSurface();
+        frameContext.ModeChanged = false;
+    }
     if (frameContext.ModeChanged) {
         (void)runtime.CubeScene->UpdateViewport(frameContext.Mode.Width, frameContext.Mode.Height);
     }
@@ -1082,6 +1540,16 @@ void FKernelFramePipeline::RenderFrame(FKernelRuntimeContext &runtime,
 
     // Final HUD composite pass keeps text visible even if earlier passes repaint overlapping regions.
     ExecuteHudPass(passContext);
+
+    // In desktop (non-terminal) mode, keep interactive surface controls visible above HUD decorations.
+    if (!FKernelCommandConsole::IsTerminalModeEnabled() && desktopRuntime.GetOverlay().IsReady()) {
+        desktopRuntime.GetOverlay().Render(frameContext.BackSurface);
+    }
+
+    // Keep renderer self-test visible by compositing it last.
+    if (ShouldRunSurfaceSelfTestPass(passContext)) {
+        ExecuteSurfaceSelfTestPass(passContext);
+    }
 
     runtime.DisplayManager->Present();
 }

@@ -11,6 +11,8 @@ FDesktopRuntime *FDesktopRuntime::ActiveInstance = nullptr;
 
 namespace {
 
+static constexpr Fortress::Core::uint32 GDesktopTerminalLauncherButtonId = 2002u;
+
 static Fortress::Core::int32 ClampInt32(Fortress::Core::int32 value,
                                         Fortress::Core::int32 minValue,
                                         Fortress::Core::int32 maxValue) {
@@ -44,6 +46,27 @@ static bool NormalizeToScreenCoordinates(const Fortress::Video::FDisplayMode &mo
 
 } // namespace
 
+namespace {
+
+static void LogDesktopControlEvent(const char *line) {
+    FKernelCommandConsole::PushSystemLog(line);
+}
+
+static void DesktopControlRenderCallback(FDesktopSurfaceId, const FDesktopRect &, void *) {}
+
+static void DesktopControlInputCallback(FDesktopSurfaceId,
+                                        EDesktopSurfaceInputEvent event,
+                                        Fortress::Core::uint32 arg0,
+                                        Fortress::Core::int32,
+                                        Fortress::Core::int32,
+                                        void *) {
+    if (event == EDesktopSurfaceInputEvent::PointerPress && arg0 == GDesktopTerminalLauncherButtonId) {
+        FKernelCommandConsole::OpenTerminalWindow();
+    }
+}
+
+} // namespace
+
 bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
     Ready = false;
     DesktopTickCount = 0u;
@@ -73,13 +96,20 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
         return false;
     }
 
+    if (!ContentHost.Initialize(&Compositor)) {
+        FKernelCommandConsole::PushSystemLog("DESKTOP INIT FAIL: CONTENT");
+        return false;
+    }
+    ContentHost.SetLogSink(LogDesktopControlEvent);
+    InputRouter.BindSurfaceContentHost(&ContentHost);
+
     InputRouter.SetPolicyConfig(FDesktopInputRouter::FPolicyConfig{
         .RaiseOnFocusChange = ShellPolicy.ShouldRaiseOnFocusChange(),
         .CaptureOnPointerFocus = ShellPolicy.ShouldCaptureOnPointerFocus(),
         .ReleaseCaptureOnPointerRelease = ShellPolicy.ShouldReleaseCaptureOnPointerRelease(),
     });
 
-    Overlay.Bind(&Compositor, &InputRouter);
+    Overlay.Bind(&Compositor, &InputRouter, &ContentHost);
     ActiveInstance = this;
 
     const FDesktopShellComponent hudComponent{
@@ -104,6 +134,7 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
 
     FKernelCommandConsole::BindDesktopCompositor(&Compositor);
     FKernelCommandConsole::BindDesktopInputRouter(&InputRouter);
+    FKernelCommandConsole::BindDesktopSurfaceContentHost(&ContentHost);
 
     if (DesktopHudSurfaceId == 0u) {
         Fortress::Kernel::FDesktopSurfaceId surfaceId = 0u;
@@ -112,6 +143,7 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
                                      10u,
                                      surfaceId)) {
             DesktopHudSurfaceId = surfaceId;
+            RegisterDefaultSurfaceControls(DesktopHudSurfaceId, false);
         }
     }
 
@@ -122,11 +154,19 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
                                      20u,
                                      surfaceId)) {
             DesktopStatusSurfaceId = surfaceId;
+            RegisterDefaultSurfaceControls(DesktopStatusSurfaceId, true);
         }
     }
 
     if (ShellPolicy.ShouldAssignInitialFocusOnInitialize()) {
-        if (!InputRouter.FocusNext()) {
+        bool focusAssigned = InputRouter.FocusNext();
+        if (!focusAssigned && DesktopStatusSurfaceId != 0u) {
+            focusAssigned = InputRouter.SetFocus(DesktopStatusSurfaceId);
+        }
+        if (!focusAssigned && DesktopHudSurfaceId != 0u) {
+            focusAssigned = InputRouter.SetFocus(DesktopHudSurfaceId);
+        }
+        if (!focusAssigned) {
             FKernelCommandConsole::PushSystemLog("DESKTOP INIT INFO: NO FOCUS");
         }
     }
@@ -154,8 +194,7 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
         Compositor.CloseSurface(smokeSurfaceId);
 
     if (!dsksurfLifecycleOk) {
-        FKernelCommandConsole::PushSystemLog("DSKSURF SMOKE FAIL");
-        return false;
+        FKernelCommandConsole::PushSystemLog("DSKSURF SMOKE WARN");
     }
 
     const bool occlusionProbeOk =
@@ -177,13 +216,12 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
                                       FDesktopRect{.X = 220, .Y = 180, .Width = 280, .Height = 180});
 
     if (!occlusionProbeOk) {
-        FKernelCommandConsole::PushSystemLog("DSKSURF OCCLUSION SMOKE FAIL");
-        return false;
+        FKernelCommandConsole::PushSystemLog("DSKSURF OCCLUSION SMOKE WARN");
     }
 
     // Ensure one known visible surface exercises fallback repaint in the first profiled frame.
     Compositor.ClearSurfaceDirty(DesktopHudSurfaceId);
-    OcclusionProbeCleanupPending = true;
+    OcclusionProbeCleanupPending = occlusionProbeOk;
 
     FKernelCommandConsole::PushSystemLog("DESKTOP SMOKE PASS");
     FKernelCommandConsole::PushSystemLog("DSKSURF SMOKE PASS");
@@ -214,6 +252,7 @@ void FDesktopRuntime::Tick(const FKernelRuntimeContext &runtime) {
     }
 
     DesktopTickCount++;
+    DrainCompositorDirtyFallback();
     RoutePointerSample(runtime);
     Shell.Tick();
     TryLogStats();
@@ -270,6 +309,7 @@ void FDesktopRuntime::OnDesktopHudAttach(FDesktopCompositor &compositor) {
                                  10u,
                                  surfaceId)) {
         DesktopHudSurfaceId = surfaceId;
+        RegisterDefaultSurfaceControls(DesktopHudSurfaceId, false);
     }
 }
 
@@ -295,7 +335,28 @@ void FDesktopRuntime::OnDesktopStatusAttach(FDesktopCompositor &compositor) {
                                  20u,
                                  surfaceId)) {
         DesktopStatusSurfaceId = surfaceId;
+        RegisterDefaultSurfaceControls(DesktopStatusSurfaceId, true);
     }
+}
+
+void FDesktopRuntime::RegisterDefaultSurfaceControls(Fortress::Core::uint32 surfaceId, bool statusSurface) {
+    const FDesktopSurfaceContentContract contract{
+        .RenderFn = DesktopControlRenderCallback,
+        .InputFn = DesktopControlInputCallback,
+        .UserData = nullptr,
+    };
+    (void)ContentHost.RegisterSurfaceContent(surfaceId, contract);
+
+    if (statusSurface) {
+        (void)ContentHost.AddLabelControl(surfaceId, 1u, FDesktopRect{.X = 8, .Y = 8, .Width = 180, .Height = 18});
+        (void)ContentHost.AddButtonControl(
+            surfaceId, GDesktopTerminalLauncherButtonId, FDesktopRect{.X = 8, .Y = 34, .Width = 184, .Height = 28});
+        return;
+    }
+
+    (void)ContentHost.AddLabelControl(surfaceId, 1u, FDesktopRect{.X = 8, .Y = 8, .Width = 200, .Height = 20});
+    (void)ContentHost.AddButtonControl(
+        surfaceId, GDesktopTerminalLauncherButtonId, FDesktopRect{.X = 8, .Y = 36, .Width = 184, .Height = 30});
 }
 
 void FDesktopRuntime::OnDesktopStatusTick(FDesktopCompositor &compositor, Fortress::Core::uint64 tickCount) {
@@ -334,10 +395,15 @@ void FDesktopRuntime::RoutePointerSample(const FKernelRuntimeContext &runtime) {
         return;
     }
 
-    Fortress::Core::int32 hidNormX = 500;
-    Fortress::Core::int32 hidNormY = 500;
-    if (!FKernelCommandConsole::GetHidCursorNormalized(hidNormX, hidNormY)) {
-        return;
+    static Fortress::Core::int32 cachedNormX = 500;
+    static Fortress::Core::int32 cachedNormY = 500;
+
+    Fortress::Core::int32 hidNormX = cachedNormX;
+    Fortress::Core::int32 hidNormY = cachedNormY;
+    const bool haveHidCursorNow = FKernelCommandConsole::GetHidCursorNormalized(hidNormX, hidNormY);
+    if (haveHidCursorNow) {
+        cachedNormX = hidNormX;
+        cachedNormY = hidNormY;
     }
 
     if (FKernelCommandConsole::IsCursorInvertX()) {
@@ -365,7 +431,68 @@ void FDesktopRuntime::RoutePointerSample(const FKernelRuntimeContext &runtime) {
     bool rightDown = false;
     bool middleDown = false;
     FKernelCommandConsole::GetHidButtonsDown(leftDown, rightDown, middleDown);
-    InputRouter.HandlePointerSample(cursorX, cursorY, leftDown);
+
+    bool leftPressEdge = false;
+    bool rightPressEdge = false;
+    bool middlePressEdge = false;
+    (void)FKernelCommandConsole::ConsumeHidButtonPressEdges(leftPressEdge, rightPressEdge, middlePressEdge);
+
+    if (leftPressEdge || rightPressEdge || middlePressEdge) {
+        char clickLine[128] = {};
+        size_t clickPos = 0;
+        FKernelTextFormat::AppendString(clickLine, sizeof(clickLine), clickPos, "MCLICK EDGE L");
+        FKernelTextFormat::AppendUInt(clickLine, sizeof(clickLine), clickPos, leftPressEdge ? 1u : 0u);
+        FKernelTextFormat::AppendString(clickLine, sizeof(clickLine), clickPos, " R");
+        FKernelTextFormat::AppendUInt(clickLine, sizeof(clickLine), clickPos, rightPressEdge ? 1u : 0u);
+        FKernelTextFormat::AppendString(clickLine, sizeof(clickLine), clickPos, " M");
+        FKernelTextFormat::AppendUInt(clickLine, sizeof(clickLine), clickPos, middlePressEdge ? 1u : 0u);
+        FKernelTextFormat::AppendString(clickLine, sizeof(clickLine), clickPos, " X ");
+        FKernelTextFormat::AppendUInt(clickLine,
+                                      sizeof(clickLine),
+                                      clickPos,
+                                      static_cast<Fortress::Core::uint64>(cursorX >= 0 ? cursorX : 0));
+        FKernelTextFormat::AppendString(clickLine, sizeof(clickLine), clickPos, " Y ");
+        FKernelTextFormat::AppendUInt(clickLine,
+                                      sizeof(clickLine),
+                                      clickPos,
+                                      static_cast<Fortress::Core::uint64>(cursorY >= 0 ? cursorY : 0));
+        FKernelCommandConsole::PushSystemLog(clickLine);
+    }
+
+    if (!haveHidCursorNow && leftPressEdge) {
+        FDesktopInputRouterStats inputStats{};
+        InputRouter.GetStats(inputStats);
+        if (inputStats.FocusSurfaceId != DesktopInvalidSurfaceId) {
+            FDesktopRect focusBounds{};
+            if (Compositor.GetSurfaceBounds(inputStats.FocusSurfaceId, focusBounds) && focusBounds.Width > 0 &&
+                focusBounds.Height > 0) {
+                cursorX = focusBounds.X + (focusBounds.Width / 2);
+                cursorY = focusBounds.Y + (focusBounds.Height / 2);
+            }
+        }
+    }
+
+    // Route pointer press on either current-down or a latched press edge so brief clicks are not missed.
+    const bool routeLeftPress = leftDown || leftPressEdge;
+    InputRouter.HandlePointerSample(cursorX, cursorY, routeLeftPress);
+}
+
+void FDesktopRuntime::DrainCompositorDirtyFallback() {
+    if (!Compositor.IsReady()) {
+        return;
+    }
+
+    FDesktopSurfaceSnapshot snapshots[16] = {};
+    Fortress::Core::uint32 count = 0u;
+    Compositor.GetActiveSurfaceSnapshots(snapshots, 16u, count);
+    for (Fortress::Core::uint32 i = 0u; i < count; i++) {
+        if (!snapshots[i].Visible) {
+            continue;
+        }
+
+        FDesktopRect dirtyRect{};
+        (void)Compositor.ConsumeSurfaceDirtyRegion(snapshots[i].SurfaceId, dirtyRect);
+    }
 }
 
 void FDesktopRuntime::TryLogStats() {

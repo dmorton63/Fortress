@@ -238,6 +238,51 @@ Companion validation matrix: docs/DesktopSurfaceControlValidationMatrix.md
   - Top dirty contributors: by drawn dirty pixels in frame.
   - Top split contributors: by split attempts in frame.
 
+## 5) Surface Content Host Contract (Batch 35)
+
+- Registration:
+  - Each surface may register one content contract with:
+    - Render callback: optional host-owned content draw hook.
+    - Input callback: optional control event notification hook.
+  - Runtime initializes host after compositor/input router readiness and registers baseline controls for managed desktop surfaces.
+- Control model:
+  - Fixed-capacity control array per surface.
+  - Node fields include: control ID, control type (label/button), local bounds, visible/enabled/focusable flags, focused/pressed state.
+- Focus model:
+  - Focus traversal is scoped to the currently focused desktop surface.
+  - Next traversal key: Tab.
+  - Previous traversal key: Ctrl+K (ASCII 11) for deterministic non-layout-dependent reverse traversal.
+  - If no focusable control is set when a surface receives focus, host assigns first visible+enabled+focusable control.
+- Pointer model:
+  - Pointer press resolves top-most enabled+visible control inside focused/hit surface local bounds.
+  - Button controls toggle pressed state on press.
+  - Control press updates focus when target is focusable.
+- Dirty/Redraw model:
+  - Control invalidation uses compositor local damage helper:
+    - `MarkSurfaceDamagedLocal(surfaceId, localRect)`
+  - Local rect is translated into desktop/global coordinates then merged through existing dirty union and clipping.
+  - Host emits validation log `CTRL REDRAW` when local damage is accepted.
+- Rendering:
+  - Overlay calls host per visible snapshot after base surface fill.
+  - Label/button visuals are deterministic solid fills + frames.
+  - Focused button frame color changes only when owning surface is focused.
+
+## 6) Control Diagnostics and Validation Logs
+
+- Command:
+  - `DSKSURFCONTROLS [ID]` (aliases: `DESKTOPCONTROLS`, `WINDOWCONTROLS`)
+  - No ID: inspect focused surface.
+  - With ID: inspect specified surface.
+- Output summary:
+  - Surface ID, control count, focused control ID.
+- Output rows:
+  - Per-control: control ID, type, local bounds, focused flag, pressed flag.
+- Validation logs:
+  - `CTRL FOCUS`: focus assignment/traversal.
+  - `CTRL CLICK`: pointer click routing/hit-test result.
+  - `CTRL KEY`: key activation path on focused control.
+  - `CTRL REDRAW`: control-local dirty invalidation accepted.
+
 ## 5) Telemetry Contract
 
 Periodic desktop diagnostics must include:

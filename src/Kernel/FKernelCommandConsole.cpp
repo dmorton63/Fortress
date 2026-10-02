@@ -18,6 +18,7 @@
 #include "Fortress/Kernel/FCpuCoreManager.hpp"
 #include "Fortress/Kernel/FDesktopCompositor.hpp"
 #include "Fortress/Kernel/FDesktopInputRouter.hpp"
+#include "Fortress/Kernel/FDesktopSurfaceContentHost.hpp"
 #include "Fortress/Kernel/FEventManager.hpp"
 #include "Fortress/Kernel/FKeyboardManager.hpp"
 #include "Fortress/Kernel/FKernelInputEventPlane.hpp"
@@ -87,6 +88,7 @@ using Fortress::Kernel::FServiceRegistry;
 using Fortress::Kernel::FServiceRegistryStats;
 
 static bool GWireframe = false;
+static bool GRenderSurfaceSelfTestEnabled = false;
 static bool GPaused = false;
 
 static constexpr size_t GMaxLogLines = 32;
@@ -128,6 +130,7 @@ static FKernelCommandConsole::EHudLogDetailMode GHudLogDetailMode = FKernelComma
 static bool GTerminalModeEnabled = false;
 static bool GTerminalWindowEnabled = false;
 static Fortress::Kernel::FDesktopSurfaceId GTerminalWindowSurfaceId = Fortress::Kernel::DesktopInvalidSurfaceId;
+static uint32_t GTerminalFocusRetryTicks = 0u;
 
 enum class ESystemLogChannel : uint32_t {
     Runtime = 1u << 0,
@@ -193,7 +196,7 @@ enum class ECursorLatencyMode : uint8_t {
     Responsive,
 };
 
-static EHidLogMode GHidLogMode = EHidLogMode::Verbose;
+static EHidLogMode GHidLogMode = EHidLogMode::Core;
 static ECursorLatencyMode GCursorLatencyMode = ECursorLatencyMode::Smooth;
 static constexpr int32_t GHidSmoothScale = 16;
 static int32_t GHidSmoothedNormXFp = 0;
@@ -240,15 +243,22 @@ static FKernelCommandConsole::FLongOperationYieldCallback GLongOperationYieldCal
 static constexpr uint64_t GLongPollYieldCadence = 4096ull;
 static bool GXhciIntrinLoopBackgroundEnabled = false;
 static bool GXhciIntrinLoopBackgroundRunning = false;
-static uint32_t GXhciIntrinLoopBackgroundTickDivider = 120u;
+static uint32_t GXhciIntrinLoopBackgroundTickDivider = 6u;
 static uint32_t GXhciIntrinLoopBackgroundTickCounter = 0u;
+static uint32_t GXhciIntrinInputActivityCooldownTicks = 0u;
 static bool GXhciIntrinBackgroundAutoPausedForApDrain = false;
 static bool GXhciIntrinBackgroundHaveLastReport = false;
 static uint8_t GXhciIntrinBackgroundLastReport[8] = {};
 static uint32_t GXhciIntrinBackgroundLastReportLength = 0u;
+static uint8_t GXhciIntrinBackgroundEndpointProbeIndex = 0u;
+static uint8_t GXhciIntrinBackgroundActiveEndpointAddress = 0u;
+static uint8_t GXhciIntrinBackgroundActiveEndpointKind = 0u;
+static uint32_t GXhciIntrinBackgroundLastCompletionCode = 0u;
+static uint32_t GXhciIntrinBackgroundNoTransferStreak = 0u;
 static Fortress::Video::FVideoConsole *GBoundVideoConsole = nullptr;
 static Fortress::Kernel::FDesktopCompositor *GBoundDesktopCompositor = nullptr;
 static Fortress::Kernel::FDesktopInputRouter *GBoundDesktopInputRouter = nullptr;
+static Fortress::Kernel::FDesktopSurfaceContentHost *GBoundDesktopSurfaceContentHost = nullptr;
 static constexpr uint32_t GMaxCommandPortLeases = 8u;
 
 struct FCachedCommandPortLease {
@@ -265,6 +275,7 @@ static void RunTerminalFilterQuery();
 static void SetTerminalFilterQuiet();
 static void SetTerminalFilterNormal();
 static void SetTerminalFilterFull();
+static void TryMaintainTerminalWindowFocus();
 
 static int32_t FindCachedCommandPortLeaseIndex(uint16_t portId) {
     for (uint32_t i = 0u; i < GMaxCommandPortLeases; i++) {
@@ -409,6 +420,7 @@ static bool IsHidVerboseMode();
 static bool IsHidEdgeMode();
 static const char *GetCursorLatencyModeName();
 static void ResetCommandInputBuffer();
+static void TrimCommandInputBuffer();
 static void TickBackgroundCommands();
 static int32_t InferFallbackLogicalMaxFromObserved(int32_t observedMax);
 static int32_t ReadSignedLE(const volatile uint8_t *bytes, uint32_t length);
@@ -431,7 +443,8 @@ static void LogHidReportDecode(const char *prefix,
                                uint32_t length,
                                const uint8_t *previousData,
                                bool havePreviousData,
-                               bool logButtonEdges);
+                               bool logButtonEdges,
+                               bool emitLogLine);
 
 static void YieldLongOperationFrame() {
     if (GLongOperationYieldCallback != nullptr) {
@@ -796,7 +809,8 @@ static void LogHidReportDecode(const char *prefix,
                                uint32_t length,
                                const uint8_t *previousData,
                                bool havePreviousData,
-                               bool logButtonEdges) {
+                               bool logButtonEdges,
+                               bool emitLogLine) {
     if (prefix == nullptr || data == nullptr || length == 0) {
         return;
     }
@@ -1008,9 +1022,11 @@ static void LogHidReportDecode(const char *prefix,
         }
     }
 
-    PushLog(line);
+    if (emitLogLine) {
+        PushLog(line);
+    }
 
-    if (logButtonEdges && havePreviousData && previousData != nullptr) {
+    if (emitLogLine && logButtonEdges && havePreviousData && previousData != nullptr) {
         if (changedButtons != 0u) {
             char edgeLine[160] = {};
             size_t edgePos = 0;
@@ -4484,6 +4500,11 @@ static void RunXhciGetConfigDescriptor() {
 
                 GHaveLastUsbMscBulkPair = false;
                 GHaveLastUsbMscInterface = false;
+                GHaveLastUsbInterruptInEndpoint = false;
+                GLastUsbIntrinEndpointKind = EUsbIntrinEndpointKind::Generic;
+                GHaveLastUsbKeyboardInterruptInEndpoint = false;
+                GHaveLastUsbMouseInterruptInEndpoint = false;
+
                 if (foundMouseInterruptInEndpoint) {
                     GLastUsbMouseInterruptInEndpointAddress = mouseEndpointAddress;
                     GLastUsbMouseInterruptInMaxPacketSize = mouseEndpointMaxPacketSize;
@@ -4492,22 +4513,32 @@ static void RunXhciGetConfigDescriptor() {
                 }
 
                 if (foundKeyboardInterruptInEndpoint) {
-                    GLastUsbInterruptInEndpointAddress = keyboardEndpointAddress;
-                    GLastUsbInterruptInMaxPacketSize = keyboardEndpointMaxPacketSize;
-                    GLastUsbInterruptInInterval = keyboardEndpointInterval;
-                    GHaveLastUsbInterruptInEndpoint = true;
-                    GLastUsbIntrinEndpointKind = EUsbIntrinEndpointKind::KeyboardBoot;
-
                     GLastUsbKeyboardInterruptInEndpointAddress = keyboardEndpointAddress;
                     GLastUsbKeyboardInterruptInMaxPacketSize = keyboardEndpointMaxPacketSize;
                     GLastUsbKeyboardInterruptInInterval = keyboardEndpointInterval;
                     GHaveLastUsbKeyboardInterruptInEndpoint = true;
-                } else if (foundInterruptInEndpoint && !GHaveLastUsbKeyboardInterruptInEndpoint) {
+                }
+
+                // Default endpoint priority for background interrupt polling:
+                // mouse boot -> generic interrupt-in -> keyboard boot.
+                if (GHaveLastUsbMouseInterruptInEndpoint) {
+                    GLastUsbInterruptInEndpointAddress = GLastUsbMouseInterruptInEndpointAddress;
+                    GLastUsbInterruptInMaxPacketSize = GLastUsbMouseInterruptInMaxPacketSize;
+                    GLastUsbInterruptInInterval = GLastUsbMouseInterruptInInterval;
+                    GHaveLastUsbInterruptInEndpoint = true;
+                    GLastUsbIntrinEndpointKind = EUsbIntrinEndpointKind::MouseBoot;
+                } else if (foundInterruptInEndpoint) {
                     GLastUsbInterruptInEndpointAddress = interruptInEndpointAddress;
                     GLastUsbInterruptInMaxPacketSize = interruptInEndpointMaxPacketSize;
                     GLastUsbInterruptInInterval = interruptInEndpointInterval;
                     GHaveLastUsbInterruptInEndpoint = true;
                     GLastUsbIntrinEndpointKind = EUsbIntrinEndpointKind::Generic;
+                } else if (GHaveLastUsbKeyboardInterruptInEndpoint) {
+                    GLastUsbInterruptInEndpointAddress = GLastUsbKeyboardInterruptInEndpointAddress;
+                    GLastUsbInterruptInMaxPacketSize = GLastUsbKeyboardInterruptInMaxPacketSize;
+                    GLastUsbInterruptInInterval = GLastUsbKeyboardInterruptInInterval;
+                    GHaveLastUsbInterruptInEndpoint = true;
+                    GLastUsbIntrinEndpointKind = EUsbIntrinEndpointKind::KeyboardBoot;
                 }
 
                 if (foundMscBulkPair) {
@@ -5531,30 +5562,73 @@ static void RunXhciInterruptIn(bool loopMode, uint64_t maxPollsOverride = 0ull, 
         PushLog(loopMode ? "XHCI INTRINLOOP CFG DEFAULT 1" : "XHCI INTRIN CFG DEFAULT 1");
     }
 
-    const bool preferKeyboardEndpoint = quietBackgroundMode;
-    uint8_t endpointAddress = GLastUsbInterruptInEndpointAddress;
-    uint16_t endpointMaxPacketSize = GLastUsbInterruptInMaxPacketSize;
-    uint8_t endpointInterval = GLastUsbInterruptInInterval;
-    EUsbIntrinEndpointKind endpointKind = GLastUsbIntrinEndpointKind;
-    if (preferKeyboardEndpoint && GHaveLastUsbKeyboardInterruptInEndpoint) {
-        endpointAddress = GLastUsbKeyboardInterruptInEndpointAddress;
-        endpointMaxPacketSize = GLastUsbKeyboardInterruptInMaxPacketSize;
-        endpointInterval = GLastUsbKeyboardInterruptInInterval;
-        endpointKind = EUsbIntrinEndpointKind::KeyboardBoot;
-    } else if (!preferKeyboardEndpoint && GHaveLastUsbMouseInterruptInEndpoint) {
-        endpointAddress = GLastUsbMouseInterruptInEndpointAddress;
-        endpointMaxPacketSize = GLastUsbMouseInterruptInMaxPacketSize;
-        endpointInterval = GLastUsbMouseInterruptInInterval;
-        endpointKind = EUsbIntrinEndpointKind::MouseBoot;
-    }
-    if (!GHaveLastUsbInterruptInEndpoint) {
-        endpointAddress = 0x81u;
-        endpointMaxPacketSize = 8u;
-        endpointInterval = 4u;
-        endpointKind = EUsbIntrinEndpointKind::Generic;
-        if (!quietBackgroundMode) {
-            PushLog(loopMode ? "XHCI INTRINLOOP EP DEFAULT 0x81" : "XHCI INTRIN EP DEFAULT 0x81");
+    uint8_t candidateAddresses[3] = {};
+    uint16_t candidateMaxPacketSizes[3] = {};
+    uint8_t candidateIntervals[3] = {};
+    EUsbIntrinEndpointKind candidateKinds[3] = {};
+    uint32_t candidateCount = 0u;
+
+    const auto tryAddCandidate = [&](uint8_t addr, uint16_t mps, uint8_t interval, EUsbIntrinEndpointKind kind) {
+        if (addr == 0u) {
+            return;
         }
+        for (uint32_t i = 0u; i < candidateCount; i++) {
+            if (candidateAddresses[i] == addr) {
+                return;
+            }
+        }
+        if (candidateCount >= 3u) {
+            return;
+        }
+        candidateAddresses[candidateCount] = addr;
+        candidateMaxPacketSizes[candidateCount] = mps;
+        candidateIntervals[candidateCount] = interval;
+        candidateKinds[candidateCount] = kind;
+        candidateCount++;
+    };
+
+    if (GHaveLastUsbMouseInterruptInEndpoint) {
+        tryAddCandidate(GLastUsbMouseInterruptInEndpointAddress,
+                        GLastUsbMouseInterruptInMaxPacketSize,
+                        GLastUsbMouseInterruptInInterval,
+                        EUsbIntrinEndpointKind::MouseBoot);
+    }
+    if (GHaveLastUsbInterruptInEndpoint) {
+        tryAddCandidate(GLastUsbInterruptInEndpointAddress,
+                        GLastUsbInterruptInMaxPacketSize,
+                        GLastUsbInterruptInInterval,
+                        GLastUsbIntrinEndpointKind);
+    }
+    if (GHaveLastUsbKeyboardInterruptInEndpoint) {
+        tryAddCandidate(GLastUsbKeyboardInterruptInEndpointAddress,
+                        GLastUsbKeyboardInterruptInMaxPacketSize,
+                        GLastUsbKeyboardInterruptInInterval,
+                        EUsbIntrinEndpointKind::KeyboardBoot);
+    }
+
+    uint8_t endpointAddress = 0x81u;
+    uint16_t endpointMaxPacketSize = 8u;
+    uint8_t endpointInterval = 4u;
+    EUsbIntrinEndpointKind endpointKind = EUsbIntrinEndpointKind::Generic;
+
+    if (candidateCount > 0u) {
+        uint32_t selectedIndex = 0u;
+        if (quietBackgroundMode && !loopMode && candidateCount > 1u && GXhciIntrinBackgroundNoTransferStreak >= 4u) {
+            selectedIndex = static_cast<uint32_t>(GXhciIntrinBackgroundEndpointProbeIndex % candidateCount);
+            GXhciIntrinBackgroundEndpointProbeIndex++;
+        }
+
+        endpointAddress = candidateAddresses[selectedIndex];
+        endpointMaxPacketSize = candidateMaxPacketSizes[selectedIndex];
+        endpointInterval = candidateIntervals[selectedIndex];
+        endpointKind = candidateKinds[selectedIndex];
+    } else if (!quietBackgroundMode) {
+        PushLog(loopMode ? "XHCI INTRINLOOP EP DEFAULT 0x81" : "XHCI INTRIN EP DEFAULT 0x81");
+    }
+
+    if (quietBackgroundMode && !loopMode) {
+        GXhciIntrinBackgroundActiveEndpointAddress = endpointAddress;
+        GXhciIntrinBackgroundActiveEndpointKind = static_cast<uint8_t>(endpointKind);
     }
 
     if (endpointMaxPacketSize == 0) {
@@ -6134,6 +6208,11 @@ static void RunXhciInterruptIn(bool loopMode, uint64_t maxPollsOverride = 0ull, 
                     AckConsumedEvent(regs, evtRing.PhysicalAddress, eventIndex);
                     if (endpointIdReturned != endpointId) {
                         unrelatedEventsDrained++;
+                        if (quietBackgroundMode && !loopMode &&
+                            (completionCode == CcSuccess || completionCode == CcShortPacket)) {
+                            transferMatched = true;
+                            break;
+                        }
                         continue;
                     }
                     transferMatched = true;
@@ -6141,6 +6220,10 @@ static void RunXhciInterruptIn(bool loopMode, uint64_t maxPollsOverride = 0ull, 
                 }
 
                 if (!transferMatched) {
+                    if (quietBackgroundMode && !loopMode) {
+                        GXhciIntrinBackgroundNoTransferStreak++;
+                        GXhciIntrinBackgroundLastCompletionCode = 0u;
+                    }
                     if (loopMode) {
                         YieldLongOperationFrame();
                         continue;
@@ -6159,6 +6242,10 @@ static void RunXhciInterruptIn(bool loopMode, uint64_t maxPollsOverride = 0ull, 
                 }
 
                 if (completionCode != CcSuccess && completionCode != CcShortPacket) {
+                    if (quietBackgroundMode && !loopMode) {
+                        GXhciIntrinBackgroundLastCompletionCode = completionCode;
+                        GXhciIntrinBackgroundNoTransferStreak++;
+                    }
                     PushLog(loopMode ? "XHCI INTRINLOOP TD FAIL" : "XHCI INTRIN TD FAIL");
                     char line[96] = {};
                     size_t pos = 0;
@@ -6172,6 +6259,10 @@ static void RunXhciInterruptIn(bool loopMode, uint64_t maxPollsOverride = 0ull, 
                 }
 
                 volatile uint8_t *data = reinterpret_cast<volatile uint8_t *>(transferBuffer.VirtualAddress);
+                if (quietBackgroundMode && !loopMode) {
+                    GXhciIntrinBackgroundLastCompletionCode = completionCode;
+                    GXhciIntrinBackgroundNoTransferStreak = 0u;
+                }
                 const uint32_t bytesToLog = endpointMaxPacketSize < 8u ? endpointMaxPacketSize : 8u;
                 uint8_t reportBytes[8] = {};
                 for (uint32_t i = 0; i < bytesToLog; i++) {
@@ -6201,7 +6292,7 @@ static void RunXhciInterruptIn(bool loopMode, uint64_t maxPollsOverride = 0ull, 
                 }
 
                 const bool shouldLogTransfer = loopMode ? (changed || iter == 0u)
-                                                         : (!quietBackgroundMode || backgroundChanged);
+                                                         : (!quietBackgroundMode || (backgroundChanged && IsHidVerboseMode()));
 
                 if (shouldLogTransfer) {
                     char line[96] = {};
@@ -6222,20 +6313,42 @@ static void RunXhciInterruptIn(bool loopMode, uint64_t maxPollsOverride = 0ull, 
                     }
                     PushLog(line);
 
-                    if (endpointKind == EUsbIntrinEndpointKind::KeyboardBoot) {
-                        ProcessUsbBootKeyboardReport(loopMode ? "XHCI INTRINLOOP KBD"
-                                                              : (quietBackgroundMode ? "XHCI INTRIN BG KBD" : "XHCI INTRIN KBD"),
-                                                     reportBytes,
-                                                     bytesToLog);
-                    } else {
-                        LogHidReportDecode(loopMode ? "XHCI INTRINLOOP HID"
-                                                    : (quietBackgroundMode ? "XHCI INTRIN BG HID" : "XHCI INTRIN HID"),
+                }
+
+                if (endpointKind == EUsbIntrinEndpointKind::KeyboardBoot) {
+                    ProcessUsbBootKeyboardReport(loopMode ? "XHCI INTRINLOOP KBD"
+                                                          : (quietBackgroundMode ? "XHCI INTRIN BG KBD" : "XHCI INTRIN KBD"),
+                                                 reportBytes,
+                                                 bytesToLog);
+
+                    // Some devices expose pointer-like reports on endpoints we classify as keyboard boot.
+                    // In quiet background mode, attempt a guarded pointer decode to recover button edges.
+                    // Accept relative-report sizes too (3/4 bytes) because many mice do not send 5-byte absolute data.
+                    bool keyboardIdleReport = true;
+                    for (uint32_t k = 0u; k < bytesToLog; k++) {
+                        if (reportBytes[k] != 0u) {
+                            keyboardIdleReport = false;
+                            break;
+                        }
+                    }
+                    if (quietBackgroundMode && !loopMode && bytesToLog >= 3u && !keyboardIdleReport) {
+                        LogHidReportDecode("XHCI INTRIN BG HID",
                                            reportBytes,
                                            bytesToLog,
                                            lastBytes,
                                            haveLastBytes,
-                                           loopMode && IsHidEdgeMode());
+                                           false,
+                                           false);
                     }
+                } else {
+                    LogHidReportDecode(loopMode ? "XHCI INTRINLOOP HID"
+                                                : (quietBackgroundMode ? "XHCI INTRIN BG HID" : "XHCI INTRIN HID"),
+                                       reportBytes,
+                                       bytesToLog,
+                                       lastBytes,
+                                       haveLastBytes,
+                                       loopMode && IsHidEdgeMode(),
+                                       shouldLogTransfer);
                 }
 
                 if (quietBackgroundMode && !loopMode && bytesToLog <= sizeof(GXhciIntrinBackgroundLastReport)) {
@@ -9011,6 +9124,7 @@ static bool TryProcessDesktopSurfaceCommand() {
         .CommandLength = &GCommandLength,
         .DesktopCompositor = GBoundDesktopCompositor,
         .DesktopInputRouter = GBoundDesktopInputRouter,
+        .DesktopSurfaceContentHost = GBoundDesktopSurfaceContentHost,
         .CursorOverlayEnabled = &GCursorOverlayEnabled,
         .DesktopSurfaceOverlayEnabled = &GDesktopSurfaceOverlayEnabled,
         .CursorInvertX = &GCursorInvertX,
@@ -9050,6 +9164,7 @@ static bool TryProcessCursorCommand() {
         .CommandLength = &GCommandLength,
         .DesktopCompositor = GBoundDesktopCompositor,
         .DesktopInputRouter = GBoundDesktopInputRouter,
+        .DesktopSurfaceContentHost = GBoundDesktopSurfaceContentHost,
         .CursorOverlayEnabled = &GCursorOverlayEnabled,
         .DesktopSurfaceOverlayEnabled = &GDesktopSurfaceOverlayEnabled,
         .CursorInvertX = &GCursorInvertX,
@@ -9248,9 +9363,18 @@ static void SetTerminalWindowOn() {
     }
 
     if (GBoundDesktopInputRouter != nullptr && GBoundDesktopInputRouter->IsReady()) {
-        (void)GBoundDesktopInputRouter->SetFocus(GTerminalWindowSurfaceId);
+        GBoundDesktopInputRouter->ReleaseCapture();
+        if (GBoundDesktopInputRouter->SetFocus(GTerminalWindowSurfaceId)) {
+            GTerminalFocusRetryTicks = 0u;
+            PushLog("TERMINAL FOCUS OK");
+        } else {
+            GTerminalFocusRetryTicks = 12u;
+            PushLog("TERMINAL FOCUS RETRY");
+        }
     }
 
+    // Keep early post-open typing responsive by deferring background xHCI polling briefly.
+    GXhciIntrinInputActivityCooldownTicks = 12u;
     GTerminalWindowEnabled = true;
     SetTerminalModeOn();
     PushLog("TERMINAL WINDOW ON");
@@ -9258,6 +9382,7 @@ static void SetTerminalWindowOn() {
 
 static void SetTerminalWindowOff() {
     GTerminalWindowEnabled = false;
+    GTerminalFocusRetryTicks = 0u;
 
     if (GBoundDesktopCompositor != nullptr && GBoundDesktopCompositor->IsReady() &&
         GTerminalWindowSurfaceId != Fortress::Kernel::DesktopInvalidSurfaceId &&
@@ -9267,6 +9392,26 @@ static void SetTerminalWindowOff() {
 
     SetTerminalModeOff();
     PushLog("TERMINAL WINDOW OFF");
+}
+
+static void TryMaintainTerminalWindowFocus() {
+    if (!GTerminalWindowEnabled || GTerminalFocusRetryTicks == 0u) {
+        return;
+    }
+
+    if (GBoundDesktopInputRouter == nullptr || !GBoundDesktopInputRouter->IsReady() ||
+        GTerminalWindowSurfaceId == Fortress::Kernel::DesktopInvalidSurfaceId) {
+        GTerminalFocusRetryTicks--;
+        return;
+    }
+
+    if (GBoundDesktopInputRouter->SetFocus(GTerminalWindowSurfaceId)) {
+        GTerminalFocusRetryTicks = 0u;
+        PushLog("TERMINAL FOCUS ACQUIRED");
+        return;
+    }
+
+    GTerminalFocusRetryTicks--;
 }
 
 static void ToggleTerminalWindow() {
@@ -9418,7 +9563,7 @@ static void RunFontCacheReset() {
 }
 
 static void RunUtilityHelp() {
-    PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS|FILTER [QUIET|NORMAL|FULL|STATUS]|WINDOW ON|OFF|TOGGLE|STATUS] STATS EVENTHEALTH SUBSYSHEALTH [BRIEF|FORCE|INTERVAL] AIMON [EVAL|POLICY|THRESHOLD|STATE] EVENTBURST VFSSTAT VFSMOUNTS VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 VFSMRESOLVE VFSMBLK VFSBLKDIGEST LOGSAVE LOGSAVEBOOT LOGSAVEMOUNT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
+    PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS|FILTER [QUIET|NORMAL|FULL|STATUS]|WINDOW ON|OFF|TOGGLE|STATUS] STATS EVENTHEALTH SUBSYSHEALTH [BRIEF|FORCE|INTERVAL] AIMON [EVAL|POLICY|THRESHOLD|STATE] EVENTBURST VFSSTAT VFSMOUNTS VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 VFSMRESOLVE VFSMBLK VFSBLKDIGEST LOGSAVE LOGSAVEBOOT LOGSAVEMOUNT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN DSKSURFCONTROLS KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
     PushLog("KBD: KBDLAYOUT [US|DVORAK] KBDMODS");
     PushLog("TEXT: TEXTSHAPER [BASIC|WRAP [PX]]");
     PushLog("VFS: VFSRESOLVE /ABS/PATH | VFSBOOT NAME | VFSBOOTBLK INDEX | VFSBOOT0");
@@ -9474,6 +9619,7 @@ static void RunUtilityHelp() {
     PushLog("DSKSURF: DSKSURFHIDE ID DSKSURFSHOW ID DSKSURFDAMAGE ID");
     PushLog("DSKSURF: DSKSURFCREATE X Y W H Z DSKSURFCLOSE ID");
     PushLog("DSKSURF: DSKSURFMOVE ID X Y DSKSURFRESIZE ID W H");
+    PushLog("DSKSURF: DSKSURFCONTROLS [ID] (inspect control tree for focused/specified surface)");
     PushLog("DSKSURF: DSKSURFOVERLAY [ON|OFF]");
     PushLog("WINDOW: WINDOW* aliases map to desktop surface commands");
     PushLog("CURSOR: CURSOR [ON|OFF] INVERTX INVERTY SENS N LATENCY [SMOOTH|RESPONSIVE]");
@@ -10313,6 +10459,20 @@ static void RunUtilityRenderLayers() {
     PushLog("LAYERS HUDPATH PIPELINE_ONLY");
 }
 
+static void RunRenderSelfTestQuery() {
+    PushLog(GRenderSurfaceSelfTestEnabled ? "RENDERTEST ON" : "RENDERTEST OFF");
+}
+
+static void SetRenderSelfTestOn() {
+    GRenderSurfaceSelfTestEnabled = true;
+    PushLog("RENDERTEST ON");
+}
+
+static void SetRenderSelfTestOff() {
+    GRenderSurfaceSelfTestEnabled = false;
+    PushLog("RENDERTEST OFF");
+}
+
 static void ResetCommandInputBuffer();
 
 // Utility/status/help command family.
@@ -10755,7 +10915,34 @@ static void ResetCommandInputBuffer() {
     GCommandBuffer[0] = '\0';
 }
 
+static void TrimCommandInputBuffer() {
+    if (GCommandLength == 0) {
+        return;
+    }
+
+    size_t start = 0;
+    while (start < GCommandLength && (GCommandBuffer[start] == ' ' || GCommandBuffer[start] == '\t')) {
+        start++;
+    }
+
+    size_t end = GCommandLength;
+    while (end > start && (GCommandBuffer[end - 1] == ' ' || GCommandBuffer[end - 1] == '\t')) {
+        end--;
+    }
+
+    const size_t trimmedLength = end - start;
+    if (start > 0 && trimmedLength > 0) {
+        for (size_t i = 0; i < trimmedLength; i++) {
+            GCommandBuffer[i] = GCommandBuffer[start + i];
+        }
+    }
+
+    GCommandLength = trimmedLength;
+    GCommandBuffer[GCommandLength] = '\0';
+}
+
 static void ProcessCommand() {
+    TrimCommandInputBuffer();
     GCommandBuffer[GCommandLength] = '\0';
     PublishCommandSubmittedEvent();
 
@@ -10823,6 +11010,12 @@ static void ProcessCommand() {
 
     if (TryProcessRuntimeControlCommand(runtimeControlContext)) {
     } else if (TryProcessUtilityCommand()) {
+    } else if (StrEq(GCommandBuffer, "rendertest") || StrEq(GCommandBuffer, "rendertest status")) {
+        RunRenderSelfTestQuery();
+    } else if (StrEq(GCommandBuffer, "rendertest on")) {
+        SetRenderSelfTestOn();
+    } else if (StrEq(GCommandBuffer, "rendertest off")) {
+        SetRenderSelfTestOff();
     } else if (StrEq(GCommandBuffer, "log saveboot") || StartsWith(GCommandBuffer, "log saveboot ")) {
         if (StrEq(GCommandBuffer, "log saveboot")) {
             PushLog("LOGSAVEBOOT USAGE START_BLOCK BLOCK_COUNT");
@@ -10889,6 +11082,11 @@ static void TickBackgroundCommands() {
         return;
     }
 
+    if (GXhciIntrinInputActivityCooldownTicks > 0u) {
+        GXhciIntrinInputActivityCooldownTicks--;
+        return;
+    }
+
     GXhciIntrinLoopBackgroundTickCounter++;
     if (GXhciIntrinLoopBackgroundTickCounter < GXhciIntrinLoopBackgroundTickDivider) {
         return;
@@ -10896,12 +11094,13 @@ static void TickBackgroundCommands() {
     GXhciIntrinLoopBackgroundTickCounter = 0u;
 
     GXhciIntrinLoopBackgroundRunning = true;
-    RunXhciInterruptIn(false, 250000ull, true);
+    RunXhciInterruptIn(false, 20000ull, true);
     GXhciIntrinLoopBackgroundRunning = false;
 }
 
 void FKernelCommandConsole::Initialize() {
     GWireframe = false;
+    GRenderSurfaceSelfTestEnabled = false;
     GPaused = false;
     GCommandLength = 0;
     GCommandBuffer[0] = '\0';
@@ -10913,6 +11112,7 @@ void FKernelCommandConsole::Initialize() {
     GTerminalModeEnabled = false;
     GTerminalWindowEnabled = false;
     GTerminalWindowSurfaceId = Fortress::Kernel::DesktopInvalidSurfaceId;
+    GTerminalFocusRetryTicks = 0u;
     GSystemLogRouteMask = GSystemLogMaskNormal;
     GHudParallelStatsEnabled = false;
     GSerialMirrorReady = false;
@@ -10947,7 +11147,7 @@ void FKernelCommandConsole::Initialize() {
         GUsbBootKeyboardLastKeys[i] = 0;
     }
     GHaveUsbBootKeyboardLastReport = false;
-    GHidLogMode = EHidLogMode::Verbose;
+    GHidLogMode = EHidLogMode::Core;
     GHidSmoothedNormXFp = 0;
     GHidSmoothedNormYFp = 0;
     GHidSmoothedMotionXFp = 0;
@@ -10957,7 +11157,7 @@ void FKernelCommandConsole::Initialize() {
     GHidCursorNormX = 0;
     GHidCursorNormY = 0;
     GCursorOverlayEnabled = false;
-    GDesktopSurfaceOverlayEnabled = false;
+    GDesktopSurfaceOverlayEnabled = true;
     GCursorInvertX = false;
     GCursorInvertY = false;
     GCursorSensitivityPercent = 100;
@@ -10991,13 +11191,19 @@ void FKernelCommandConsole::Initialize() {
     for (uint32_t i = 0u; i < GMaxCommandPortLeases; i++) {
         GCommandPortLeases[i] = FCachedCommandPortLease{};
     }
-    GXhciIntrinLoopBackgroundEnabled = false;
+    GXhciIntrinLoopBackgroundEnabled = true;
     GXhciIntrinLoopBackgroundRunning = false;
-    GXhciIntrinLoopBackgroundTickDivider = 120u;
+    GXhciIntrinLoopBackgroundTickDivider = 6u;
     GXhciIntrinLoopBackgroundTickCounter = 0u;
+    GXhciIntrinInputActivityCooldownTicks = 0u;
     GXhciIntrinBackgroundAutoPausedForApDrain = false;
     GXhciIntrinBackgroundHaveLastReport = false;
     GXhciIntrinBackgroundLastReportLength = 0u;
+    GXhciIntrinBackgroundEndpointProbeIndex = 0u;
+    GXhciIntrinBackgroundActiveEndpointAddress = 0u;
+    GXhciIntrinBackgroundActiveEndpointKind = 0u;
+    GXhciIntrinBackgroundLastCompletionCode = 0u;
+    GXhciIntrinBackgroundNoTransferStreak = 0u;
     GNextVmallocVirtual = Fortress::Kernel::FKernelConfig::VmallocBase;
 #if defined(FORTRESS_PARALLEL_PROBE_AUTORUN)
     GParallelProbeAutorunCommandIndex = 0u;
@@ -11008,15 +11214,24 @@ void FKernelCommandConsole::Initialize() {
 }
 
 void FKernelCommandConsole::PollInput() {
+    TryMaintainTerminalWindowFocus();
+
     FKeyboardInputEvent event{};
     while (FKeyboardManager::PollEvent(event)) {
         if (!event.Pressed || event.Ascii == 0) {
             continue;
         }
 
+        // Briefly prioritize command responsiveness without starving pointer polling.
+        GXhciIntrinInputActivityCooldownTicks = 3u;
+
         PublishInputKeyPressedEvent(event.Ascii, static_cast<Fortress::Core::uint32>(GCommandLength));
 
         if (event.Ascii == '\n') {
+            if (GCommandLength == 0) {
+                // Temporary fallback for HID NOXFER cases: allow Enter to trigger a left-click edge.
+                GHidButtonPressEdgesMask |= 0x1u;
+            }
             ProcessCommand();
             continue;
         }
@@ -11056,6 +11271,10 @@ void FKernelCommandConsole::BindDesktopCompositor(Fortress::Kernel::FDesktopComp
 
 void FKernelCommandConsole::BindDesktopInputRouter(Fortress::Kernel::FDesktopInputRouter *router) {
     GBoundDesktopInputRouter = router;
+}
+
+void FKernelCommandConsole::BindDesktopSurfaceContentHost(Fortress::Kernel::FDesktopSurfaceContentHost *contentHost) {
+    GBoundDesktopSurfaceContentHost = contentHost;
 }
 
 void FKernelCommandConsole::PushSystemLog(const char *line) {
@@ -11108,8 +11327,16 @@ bool FKernelCommandConsole::IsWireframeEnabled() {
     return GWireframe;
 }
 
+bool FKernelCommandConsole::IsRenderSurfaceSelfTestEnabled() {
+    return GRenderSurfaceSelfTestEnabled;
+}
+
 bool FKernelCommandConsole::IsPaused() {
     return GPaused;
+}
+
+void FKernelCommandConsole::OpenTerminalWindow() {
+    SetTerminalWindowOn();
 }
 
 const char *FKernelCommandConsole::GetCommandBuffer() {
@@ -11130,6 +11357,10 @@ bool FKernelCommandConsole::IsTerminalModeEnabled() {
 
 bool FKernelCommandConsole::IsTerminalWindowEnabled() {
     return GTerminalWindowEnabled;
+}
+
+bool FKernelCommandConsole::IsDesktopSurfaceOverlayEnabled() {
+    return GDesktopSurfaceOverlayEnabled;
 }
 
 bool FKernelCommandConsole::TryGetTerminalWindowBounds(Fortress::Core::int32 &outX,
@@ -11226,6 +11457,16 @@ bool FKernelCommandConsole::ConsumeHidButtonPressEdges(bool &outLeft, bool &outR
     outRight = (edges & 0x2u) != 0;
     outMiddle = (edges & 0x4u) != 0;
     return edges != 0;
+}
+
+void FKernelCommandConsole::GetXhciBackgroundInputTelemetry(Fortress::Core::uint32 &outEndpointAddress,
+                                                            Fortress::Core::uint32 &outEndpointKind,
+                                                            Fortress::Core::uint32 &outLastCompletionCode,
+                                                            Fortress::Core::uint32 &outNoTransferStreak) {
+    outEndpointAddress = GXhciIntrinBackgroundActiveEndpointAddress;
+    outEndpointKind = GXhciIntrinBackgroundActiveEndpointKind;
+    outLastCompletionCode = GXhciIntrinBackgroundLastCompletionCode;
+    outNoTransferStreak = GXhciIntrinBackgroundNoTransferStreak;
 }
 
 } // namespace Fortress::Kernel

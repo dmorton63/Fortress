@@ -449,3 +449,16 @@ Batch 1 focuses on subsystem progress outside USB/xHCI, aligned to Desktop Compo
 8. [x] Update help text to document terminal filter controls.
 9. [x] Reset terminal filter state to default (`normal`) on console initialize.
 10. [x] Keep terminal window open/close flows compatible with new routing behavior.
+
+## Batch 35 (10 items)
+
+1. [x] Add surface content contract (render + input callback interface) for desktop surfaces.
+2. [x] Add per-surface content-host registration and lifecycle wiring in desktop runtime.
+3. [x] Add compositor helper for control-scoped dirty-region invalidation within a surface.
+4. [x] Add minimal control tree model (control ID, bounds, visibility, enabled/focus flags).
+5. [x] Add control-level pointer hit-testing inside the focused desktop surface.
+6. [x] Add control-level keyboard focus traversal (next/prev) scoped to focused surface.
+7. [x] Add baseline control event dispatch path (click, focus, keypress) through input router.
+8. [x] Add initial controls: static label and push-button with deterministic render behavior.
+9. [x] Add diagnostics command to inspect control tree state for the focused/selected surface.
+10. [x] Update help/docs and emit validation logs for control focus, click, and redraw events.

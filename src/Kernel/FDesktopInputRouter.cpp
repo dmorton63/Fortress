@@ -1,5 +1,6 @@
 #include "Fortress/Kernel/FDesktopInputRouter.hpp"
 
+#include "Fortress/Kernel/FDesktopSurfaceContentHost.hpp"
 #include "Fortress/Kernel/FKernelRuntimeIds.hpp"
 
 namespace Fortress::Kernel {
@@ -39,6 +40,7 @@ bool FDesktopInputRouter::Initialize(FDesktopCompositor *compositor) {
     }
 
     Compositor = compositor;
+    ContentHost = nullptr;
     FocusSurfaceId = DesktopInvalidSurfaceId;
     CaptureSurfaceId = DesktopInvalidSurfaceId;
     RoutedKeyCount = 0;
@@ -49,7 +51,10 @@ bool FDesktopInputRouter::Initialize(FDesktopCompositor *compositor) {
     CaptureStaleDropCount = 0;
     LastRoutedKeyAscii = 0;
     PointerSampleCount = 0;
+    PointerPressEdgeCount = 0;
+    PointerHitSurfaceCount = 0;
     PointerFocusClickCount = 0;
+    PointerFocusFailCount = 0;
     for (Fortress::Core::uint32 i = 0; i < MaxTrackedSurfaceStats; i++) {
         TrackedSurfaceStats[i] = FTrackedSurfaceInputStats{};
     }
@@ -67,6 +72,10 @@ void FDesktopInputRouter::SetPolicyConfig(const FPolicyConfig &policyConfig) {
     PolicyConfig = policyConfig;
 }
 
+void FDesktopInputRouter::BindSurfaceContentHost(FDesktopSurfaceContentHost *contentHost) {
+    ContentHost = contentHost;
+}
+
 bool FDesktopInputRouter::SetFocus(FDesktopSurfaceId surfaceId) {
     if (!Ready || surfaceId == DesktopInvalidSurfaceId || !Compositor->IsSurfaceFocusable(surfaceId)) {
         FocusRejectCount++;
@@ -81,6 +90,9 @@ bool FDesktopInputRouter::SetFocus(FDesktopSurfaceId surfaceId) {
 
     FocusSurfaceId = surfaceId;
     FocusChangeCount++;
+    if (ContentHost != nullptr) {
+        (void)ContentHost->HandleSurfaceFocus(surfaceId);
+    }
     return true;
 }
 
@@ -137,10 +149,6 @@ void FDesktopInputRouter::HandleInputEvent(const FKernelEvent &event) {
     const Fortress::Core::uint32 keyAscii = (event.Arg0 & 0xFFu);
     LastRoutedKeyAscii = keyAscii;
 
-    if (keyAscii == 9u) {
-        (void)FocusNext();
-    }
-
     if (!Compositor->IsSurfaceFocusable(FocusSurfaceId)) {
         FDesktopSurfaceId fallbackFocus = DesktopInvalidSurfaceId;
         if (Compositor->GetFocusableSurfaceId(fallbackFocus)) {
@@ -155,6 +163,26 @@ void FDesktopInputRouter::HandleInputEvent(const FKernelEvent &event) {
     if (targetSurface == DesktopInvalidSurfaceId) {
         DroppedKeyCount++;
         return;
+    }
+
+    if (keyAscii == 9u) {
+        if (ContentHost != nullptr && ContentHost->FocusNextControl(targetSurface)) {
+            RoutedKeyCount++;
+            return;
+        }
+        (void)FocusNext();
+        return;
+    }
+
+    if (keyAscii == 11u) {
+        if (ContentHost != nullptr && ContentHost->FocusPreviousControl(targetSurface)) {
+            RoutedKeyCount++;
+            return;
+        }
+    }
+
+    if (ContentHost != nullptr) {
+        (void)ContentHost->HandleSurfaceKeyPress(targetSurface, keyAscii);
     }
 
     RoutedKeyCount++;
@@ -177,6 +205,9 @@ void FDesktopInputRouter::HandlePointerSample(Fortress::Core::int32 x,
     PointerSampleCount++;
     const bool leftPressEdge = leftButtonDown && !PreviousLeftButtonDown;
     PreviousLeftButtonDown = leftButtonDown;
+    if (leftPressEdge) {
+        PointerPressEdgeCount++;
+    }
 
     if (PolicyConfig.ReleaseCaptureOnPointerRelease &&
         !leftButtonDown &&
@@ -189,11 +220,37 @@ void FDesktopInputRouter::HandlePointerSample(Fortress::Core::int32 x,
     }
 
     FDesktopSurfaceId hitSurfaceId = DesktopInvalidSurfaceId;
-    if (!Compositor->GetTopSurfaceAtPoint(x, y, hitSurfaceId)) {
+    const bool haveTopHit = Compositor->GetTopSurfaceAtPoint(x, y, hitSurfaceId);
+    if (!haveTopHit) {
+        if (ContentHost != nullptr && FocusSurfaceId != DesktopInvalidSurfaceId) {
+            const bool fallbackDispatched = ContentHost->HandleSurfaceFocusedControlPress(FocusSurfaceId, x, y);
+            if (fallbackDispatched) {
+                PointerHitSurfaceCount++;
+                PointerFocusClickCount++;
+                const Fortress::Core::int32 trackedIndex = FindOrAllocateTrackedSurfaceIndex(FocusSurfaceId);
+                if (trackedIndex >= 0) {
+                    TrackedSurfaceStats[trackedIndex].Stats.PointerFocusClickCount++;
+                }
+
+                if (PolicyConfig.CaptureOnPointerFocus) {
+                    (void)SetCapture(FocusSurfaceId);
+                }
+            }
+        }
         return;
     }
+    PointerHitSurfaceCount++;
 
-    if (SetFocus(hitSurfaceId)) {
+    if (!SetFocus(hitSurfaceId)) {
+        PointerFocusFailCount++;
+    }
+
+    bool controlDispatched = false;
+    if (ContentHost != nullptr) {
+        controlDispatched = ContentHost->HandleSurfacePointerPress(hitSurfaceId, x, y);
+    }
+
+    if (controlDispatched) {
         PointerFocusClickCount++;
         const Fortress::Core::int32 trackedIndex = FindOrAllocateTrackedSurfaceIndex(hitSurfaceId);
         if (trackedIndex >= 0) {
@@ -218,7 +275,10 @@ void FDesktopInputRouter::GetStats(FDesktopInputRouterStats &outStats) const {
         .CaptureStaleDropCount = CaptureStaleDropCount,
         .LastRoutedKeyAscii = LastRoutedKeyAscii,
         .PointerSampleCount = PointerSampleCount,
+        .PointerPressEdgeCount = PointerPressEdgeCount,
+        .PointerHitSurfaceCount = PointerHitSurfaceCount,
         .PointerFocusClickCount = PointerFocusClickCount,
+        .PointerFocusFailCount = PointerFocusFailCount,
     };
 }
 

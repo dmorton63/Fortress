@@ -121,7 +121,6 @@ void FKernelRuntimeDiagnostics::Tick(FKernelRuntimeContext &runtime) {
     TryLogTimerStats();
     TryLogIrqStats();
     TryLogCoreDispatchStats();
-    TryLogServicePortStats();
 }
 
 void FKernelRuntimeDiagnostics::PublishSubsystemHealthSnapshot(const FKernelSubsystemHealthSnapshot &snapshot) {

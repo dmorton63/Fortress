@@ -1,0 +1,354 @@
+
+=== CITADEL Kernel ===
+Serial initialized, kernel starting...
+Framebuffer terminal mirror enabled
+[INFO ] QKMemHeap: Initializing heap at 0xffffffff801e0000, size 32768 KB
+[INFO ] QKMemHeap: Heap initialized with 32767 KB free
+[INFO ] QKCmd: Registered system volume commands
+
+CITADEL console ready
+BSS (skipped - Limine does it)
+Firmware: x86 BIOS
+ACPI: RSDP phys 0x00000000000f5290
+ACPI: RSDP OK
+ACPI: using RSDT
+ACPI: SDT phys 0x00000000bffe1c2b
+ACPI: table signatures:
+  - FACP
+  - APIC
+  - HPET
+  - WAET
+ACPI: FADT too small for shutdown profile
+ACPI: TPM2 table NOT present
+About to call CPU init
+[INFO ] QArchCPU: Detecting CPU
+[INFO ] QArchCPU: FPU/SSE enabled
+[INFO ] QArchCPU: CPU: QEMU Virtual CPU version 2.5+
+[INFO ] QArchCPU: Family: 15, Model: 107, Stepping: 1
+CPU initialized
+[INFO ] QArchGDT: Initializing GDT
+[INFO ] QArchGDT: GDT initialized with 7 entries
+GDT initialized
+[INFO ] QArchIDT: Initializing IDT
+[INFO ] QArchIDT: IDT loaded
+[INFO ] QArchIDT: IDT initialized with 256 entries
+IDT initialized
+[INFO ] QKInt: Initializing interrupt manager
+[INFO ] QKInt: Interrupt manager initialized
+InterruptManager initialized
+BootSig: mode=production
+BootSig: TPM not ready; using software RSA verification
+BootSig: signature valid
+BootSig: TPM not ready; using software RSA verification
+BootSig: SYSCFG signature valid
+boot.json loaded (BOOT.JSN via ramdisk module)
+sysconfig.json loaded (SYSCFG.JSN via ramdisk module)
+sysconfig profile: development
+BootGate: available RAM MiB = 3003
+EV seq=1 t_ms=0 stage=sysconfig type=select_begin have_production=1 have_golden=1
+EV seq=2 t_ms=0 stage=sysconfig type=select_ok active_tier=production
+SysConfig: active tier = 'production' root='/PROD'
+DesktopSig: enforcement=on
+DesktopSig: TPM not ready; using software RSA verification
+DesktopSig: signature valid
+DesktopSig: TPM not ready; using software RSA verification
+BootSeed: modules count=9
+  [0] id='boot' type='boot' role='(none)' status='(none)' req_hash=0 req_sig=0 required=1 path='/BOOT.JSN'
+  [1] id='sysconfig' type='sysconfig' role='(none)' status='(none)' req_hash=0 req_sig=0 required=1 path='/SYSCFG.JSN'
+  [2] id='fs' type='(none)' role='fs' status='trusted' req_hash=1 req_sig=0 required=1 path='/PROD/MODULES/fs.mod'
+  [3] id='security' type='security' role='(none)' status='(none)' req_hash=0 req_sig=0 required=1 path='/PROD/SECURITY.JSN'
+  [4] id='services' type='services' role='(none)' status='(none)' req_hash=0 req_sig=0 required=1 path='/PROD/SERVICES.JSN'
+  [5] id='drivers' type='drivers' role='(none)' status='(none)' req_hash=0 req_sig=0 required=1 path='/PROD/DRIVERS.JSN'
+  [6] id='desktop' type='config' role='(none)' status='(none)' req_hash=0 req_sig=0 required=1 path='/PROD/DESKTOP.JSN'
+  [7] id='desktop_overrides' type='desktop_overrides' role='(none)' status='(none)' req_hash=0 req_sig=0 required=0 path='/PROD/DESKOVR.JSN'
+  [8] id='apps' type='apps' role='(none)' status='(none)' req_hash=0 req_sig=0 required=1 path='/PROD/APPS.JSN'
+Runtime registries: rebuilt
+Framebuffer response received!
+  Revision: 1
+  Count: 1
+Getting framebuffer pointer...
+Got fb_array
+Got fb struct
+Graphics: framebuffer present
+Initializing QWindowing...
+Bringing up filesystem...
+[INFO ] QFS: Initializing Virtual File System
+[INFO ] QFS: VFS initialized
+VFS initialized
+[INFO ] QFSVOL: Registered volume QFS_RAMDISK0 -> /
+[INFO ] QFSFAT32: Mounting FAT32 filesystem
+[INFO ] QFSFAT32: FAT32 mounted: 4096 bytes/cluster, root at cluster 2
+[INFO ] QFS: Mounted filesystem at /
+[INFO ] QFSVOL: Mounted QFS_RAMDISK0 at /
+Ramdisk mounted at /
+Ramdisk: created /shared
+Root dir listing:
+  HELLO.TXT
+  PROD
+  p
+  ramdisk.img
+  system
+  dump
+  WALL
+  ICONS
+  FONTS
+  DESKTOP.JSN
+  UI
+  DESKOVR.JSN
+  SECURITY.JSN
+  SERVICES.JSN
+  DRIVERS.JSN
+  APPS.JSN
+  GOLDEN
+  DSPRING.JSN
+  DSUMMER.JSN
+  DAUTUMN.JSN
+  DWINTER.JSN
+  STARTUP.CFG
+  BOOT.JSN
+  BOOT.SIG
+  SYSCFG.JSN
+  SYSCFG.SIG
+  shared
+Demo file contents: QAIOS+ FileIO demo
+
+SecureStore: self-test...
+SecureStore: self-test SKIP (non-TPM wrap key not provisioned)
+/HELLO.TXT contents: HELLO FROM QAIOS+!
+THIS TEXT IS LOADED FROM THE RAMDISK.
+
+Startup mode loaded: DESKTOP
+Security Center mode loaded: ENFORCE
+IDE_SHARED loaded: ON
+SHARED_SOURCE loaded: USB
+SHARED_USB_INDEX loaded: AUTO
+SHARED_SOURCE=USB: disabling IDE shared probe for this boot
+Security Center mode applied from STARTUP.CFG
+Filesystem ready
+[INFO ] QKEvent: Initializing Event Manager
+[INFO ] QKEvent: Event Manager initialized
+Event system initialized
+[INFO ] QShutdown: Shutdown request listener registered (id=1)
+Shutdown controller ready
+[INFO ] QShutdown: Registered shutdown subsystem 'serial_capture_save' (handle=1)
+Shutdown: serial save hook registered
+Initializing timer...
+[INFO ] QDrvTimer: Initializing timer at 1000 Hz
+[INFO ] QDrvTimer: Timer initialized
+Timer initialized
+Initializing PCI...
+[INFO ] QArchPCI: Initializing PCI subsystem
+[INFO ] QArchPCI: Found 7 PCI devices
+PCI initialized
+Initializing drivers...
+[INFO ] QKDrv: Initializing driver manager
+[INFO ] QKDrv: Probing USB controllers
+[INFO ] QKDrv: Scanning 7 PCI devices
+[INFO ] QKDrv: Checking PCI device 0
+[INFO ] QKDrv: Device class=06 subclass=00 progIF=00
+[INFO ] QKDrv: Checking PCI device 1
+[INFO ] QKDrv: Device class=06 subclass=01 progIF=00
+[INFO ] QKDrv: Checking PCI device 2
+[INFO ] QKDrv: Device class=01 subclass=01 progIF=80
+[INFO ] QKDrv: Checking PCI device 3
+[INFO ] QKDrv: Device class=06 subclass=80 progIF=00
+[INFO ] QKDrv: Checking PCI device 4
+[INFO ] QKDrv: Device class=03 subclass=00 progIF=00
+[INFO ] QKDrv: Checking PCI device 5
+[INFO ] QKDrv: Device class=02 subclass=00 progIF=00
+[INFO ] QKDrv: Checking PCI device 6
+[INFO ] QKDrv: Device class=0c subclass=03 progIF=30
+[INFO ] xHCI: Found xHCI controller
+[INFO ] xHCI: Using placement new with buffer at 0xffffffff8237fd50
+[INFO ] xHCI: Constructor body entered
+[INFO ] xHCI: Zeroing deviceContexts array
+[INFO ] xHCI: Zeroing devices array
+[INFO ] xHCI: Constructor complete
+[INFO ] xHCI: XHCIControllerImpl created at 0xffffffff8237fd50
+[INFO ] QKDrv: Initializing xHCI controller...
+[INFO ] xHCI: Initializing xHCI controller
+[INFO ] xHCI: BAR0 at 0xfebb0000
+[INFO ] QKMemTrans: Mapping MMIO: phys=0xfebb0000 -> virt=0xffffe00000000000, size=0x10000
+[INFO ] QKMemTrans: MMIO mapped successfully at 0xffffe00000000000
+[INFO ] xHCI: MMIO mapped at 0xffffe00000000000
+[INFO ] xHCI: Setting up capRegs pointer
+[INFO ] xHCI: Reading capLength from 0xffffe00000000000
+[INFO ] xHCI: capLength = 64
+[INFO ] xHCI: xHCI v0.0: 8 ports, 64 slots, ctx=32
+[INFO ] xHCI: XHCIControllerImpl reset complete
+[INFO ] xHCI: DCBAA at 0xbfb79000
+[INFO ] xHCI: Command ring at 0xbfb7a000
+[INFO ] xHCI: Event ring at 0xbfb7b000
+[INFO ] xHCI: xHCI controller running
+[INFO ] xHCI: Probing 8 ports for devices
+[INFO ] xHCI: Enumerating device on port 4
+[INFO ] xHCI: Port 4 speed: 3
+[INFO ] xHCI: Event #1: type=34
+[INFO ] xHCI: Event #2: type=33
+[INFO ] xHCI: Slot 1 enabled
+[INFO ] xHCI: Event #3: type=33
+[INFO ] xHCI: Device addressed on slot 1
+[INFO ] xHCI: Event #4: type=32
+[INFO ] xHCI: Device: VID=0627 PID=0001 Class=00
+[INFO ] xHCI: Event #5: type=32
+[INFO ] xHCI: Found HID interface: subclass=0 protocol=0
+[INFO ] xHCI: Found HID descriptor: reportLen=74
+[INFO ] xHCI: Found interrupt IN endpoint: addr=81 maxPacket=8
+[INFO ] xHCI: Event #6: type=32
+[INFO ] xHCI: HID logical range: X=32767 Y=32767
+[INFO ] xHCI: Event #7: type=32
+[INFO ] xHCI: Event #8: type=33
+[INFO ] xHCI: Endpoint 3 configured for slot 1
+[INFO ] xHCI: USB tablet detected on slot 1
+[INFO ] xHCI: HID buffer: phys=0xbfb86000 virt=0xffff8000bfb86000
+[INFO ] QKDrv: xHCI initialize returned 0
+[INFO ] QKDrv: Using USB tablet as mouse driver
+[INFO ] QKDrv: Setting tablet bounds to 1024x768
+[INFO ] QKDrv: Probing PS/2 devices
+[INFO ] PS2Kbd: Initializing PS/2 keyboard
+[INFO ] PS2Kbd: PS/2 keyboard initialized
+[INFO ] QKDrv: Skipping PS/2 mouse - USB pointer device available
+[INFO ] QKDrv: Probing network controllers
+[INFO ] e1000: Found e1000 NIC: 8086:100e
+[INFO ] e1000: BAR0 at 0xfeb80000
+[INFO ] QKMemTrans: Mapping MMIO: phys=0xfeb80000 -> virt=0xffffe00000010000, size=0x20000
+[INFO ] QKMemTrans: MMIO mapped successfully at 0xffffe00000010000
+[INFO ] e1000: MAC 52:54:00:12:34:56
+[INFO ] e1000: Initialized (STATUS=0x80080783)
+[INFO ] QKDrv: Using e1000 NIC
+[INFO ] QKDrvAHCI: Probing AHCI controllers for system volume
+[WARN ] QKDrvAHCI: No mountable AHCI FAT32 system volume detected
+[INFO ] QKDrvIDE: Probing legacy IDE for system volume
+[INFO ] QKDrvIDE: IDE PCI dev 2: vid=8086 did=7010 cmd=0103->0107 progIF=80 BAR0=0 BAR1=0 BAR2=0 BAR3=0
+[INFO ] QKDrvIDE: IDE PCI ports: pri=1f0/3f6 sec=170/376 (progIF=80)
+[INFO ] QKDrvIDE: IDENTIFY: no DRQ/ERR (base=1f0 ctrl=3f6 master st=41 err=04)
+[INFO ] QKDrvIDE: IDENTIFY ok (base=1f0 ctrl=3f6 slave sectors=1032192)
+[INFO ] QKDrvIDE: Disk present but not a FAT32 system volume (base=1f0 ctrl=3f6 slave kind=16)
+[INFO ] QKDrvIDE: IDENTIFY: no response (base=170 ctrl=376 slave st=00)
+[WARN ] QKDrvIDE: No mountable FAT system volume detected
+[INFO ] QKDrvIDE: Probing legacy IDE for additional data volumes
+[INFO ] QKDrvIDE: IDE PCI dev 2: vid=8086 did=7010 cmd=0107->0107 progIF=80 BAR0=0 BAR1=0 BAR2=0 BAR3=0
+[INFO ] QKDrvIDE: IDE PCI ports: pri=1f0/3f6 sec=170/376 (progIF=80)
+[INFO ] QKDrvIDE: IDENTIFY: no DRQ/ERR (base=1f0 ctrl=3f6 master st=41 err=04)
+[INFO ] QKDrvIDE: IDENTIFY ok (base=1f0 ctrl=3f6 slave sectors=1032192)
+[INFO ] QFSVOL: Registered volume QFS_DISK0 -> /mnt/disk0
+[INFO ] QFSFAT16: Mounting FAT16 filesystem
+[INFO ] QFSFAT16: FAT16 mounted: 8192 bytes/cluster, root entries=512
+[INFO ] QFS: Mounted filesystem at /mnt/disk0
+[INFO ] QFSVOL: Mounted QFS_DISK0 at /mnt/disk0
+[INFO ] QKDrvIDE: Registered volume QFS_DISK0 at /mnt/disk0 (base=1f0 ctrl=3f6 slave, offset=63)
+[INFO ] QKDrvIDE: IDENTIFY: no response (base=170 ctrl=376 slave st=00)
+[INFO ] QKDrv: Active mouse driver: USB Tablet (QDRV_XHCI_TABLET)
+[INFO ] QKDrv: Active keyboard driver: PS2Keyboard (QDRV_PS2_KEYBOARD)
+Drivers initialized
+BOOTMETRIC drivers_init=51ms
+[INFO ] QKStorage: Probing Limine modules for volumes...
+Setting up keyboard...
+Keyboard initialized
+Pre-desktop phase: console input remains disabled until a terminal-only fallback is required
+Pre-desktop phase: SecureStore unlock
+SecureStore: anchor=recovery-bootstrap
+SecureStore: no recovery key available; continuing boot without blocking.
+EV seq=3 t_ms=56 stage=securestore type=recovery_prompt_skipped no-recovery-key
+BootTrust gate: /system volume is not mounted
+Continuing desktop startup without forcing terminal fallback
+EV seq=4 t_ms=56 stage=boottrust type=missing_system_desktop_continue mode=enforce
+Installer: persistent system volume not found.
+Installer: continuing desktop startup without forcing a terminal prompt.
+BOOTMETRIC ensure_sst=1ms
+BootTrust gate SST check: status=Error (dev mode: allowing desktop startup despite SST unavailability)
+Security Center: system trust store not ready (SST init failed)
+Security Center: ensureSst status=Error
+Security Center: securestore tpm=off wrapkey.kdf=no wrapkey.tpm=no sstwrap=no
+Security Center: continuing to desktop (dev mode)
+BootTrust gate: TAS/SC integrity check did not pass
+(dev mode: bypassing integrity gate, allowing desktop startup)
+Security Center: SST integrity check failed - bypassing in dev mode
+Pre-desktop phase: DHCP bring-up
+Attempting DHCPv4 (background)...
+Pre-desktop phase: owner session gate deferred to graphical login
+DHCPv4 timeout (manual config still available)
+BOOTMETRIC dhcp_wait=750ms
+Pre-desktop phase: desktop handoff
+Console ownership: transferring input to desktop runtime
+[INFO ] QDrvSVGA: VMware SVGA II present (io=0xC050 id=0x90000002 caps=0x000000E3 mode=1024x768 bpp=32 bpl=4096 fb_start=0xFD000000 fb_off=0x00000000 vram=0x01000000 fb_size=0x01000000)
+[INFO ] QKMain: Framebuffer pitch: limine=4096 svga=4096 (fb_size=16777216)
+[INFO ] QWFramebuffer: Framebuffer mapped (phys=0xFD000000 virt=0xFFFF8000FD000000 size=0x300000)
+Framebuffer initialized
+About to initialize WindowManager...
+[INFO ] QKMemTrans: Mapping MMIO: phys=0xfe000000 -> virt=0xffffe00000030000, size=0x10000
+[INFO ] QKMemTrans: MMIO mapped successfully at 0xffffe00000030000
+[INFO ] QDrvSVGA: SVGA2D FIFO enabled (phys=0xFE000000 size=0x00010000 min=0x00001000 max=0x00010000)
+[INFO ] QDrvSVGA: setCursorImage 12x16 hotspot=(0,0)
+[INFO ] QWCompositor: Hardware cursor: ON
+WindowManager initialized
+Setting up mouse...
+Screen: 1024x768
+Button at: 904,10-40
+Mouse configured
+[INFO ] QDrvSVGA: Cursor pos write #1: 0,0 (visible=1)
+BOOTMETRIC window_system_init=20ms
+Desktop: starting session
+Creating desktop...
+[INFO ] QDesktop: PNG decoder corpus: total=4 passed=4 failed=0 status=PASS
+[INFO ] QDesktop: CMMS init phase open_create=653ms recreate=0
+[INFO ] QDesktop: CMMS open stats tables=0 meta_page_headers=0 pk_tables=0 pk_pages=0 pk_rows=0 pk_indexed=0
+[INFO ] QDesktop: CMMS init phase system_tables=59ms
+[INFO ] QDesktop: CMMS init phase builtin_theme_import=158ms
+[INFO ] QDesktop: CMMS init phase schema_tables=342ms
+[INFO ] QDesktop: CMMS init phase seed_documents=327ms
+[INFO ] QDesktop: CMMS runtime materialization deferred during desktop startup
+[INFO ] QDesktop: CMMS init phase total=1539ms recreate=0
+[INFO ] QDesktop: CMMS ensure phase validate_themes=10ms
+[INFO ] QDesktop: CMMS boot scaffolding complete; issuing final barrier write
+[INFO ] QDesktop: CMMS ensure total=1552ms
+[INFO ] QDesktop: CUI-ML stage source_load=14ms source=cmms_db
+
+[INFO ] QDesktop: Loading desktop definition from CMMS DB (/PROD/DESKTOP.CML, CUI-ML bytes=6318 io=0ms)
+
+[INFO ] QDesktop: CUIMLSS: parsed 17 style rules
+
+[INFO ] QDesktop: CUI-ML stage style_scan=2ms
+
+[INFO ] QDesktop: CUI-ML stage import_scan=4ms
+
+[INFO ] QDesktop: CUI-ML stage theme_derive=1ms
+
+[INFO ] QDesktop: CUI-ML stage theme_preload=11ms
+
+[INFO ] QDesktop: CUI-ML: bound CMMS Button id='btnCMMS' action='cmms' at x=20 y=180 w=160 h=32
+[INFO ] QDesktop: CUI-ML: bound 3D View Button id='btn3DView' action='view3d' at x=20 y=220 w=160 h=32
+[INFO ] QDesktop: CUI-ML stage control_build=492ms
+
+[INFO ] QDesktop: Applying desktop overrides from /PROD/DESKOVR.JSN
+
+[INFO ] QDesktop: desktop-overrides.json: season=auto -> autumn (month=9 day=17)
+
+[INFO ] QDesktop: Seasonal preset /PROD/DAUTUMN.JSN bytes=2348 io=1ms parse=6ms
+
+[INFO ] QDesktop: Applied seasonal theme 'autumn' from /PROD/DAUTUMN.JSN
+
+[INFO ] QDesktop: CUI-ML stage overrides=432ms
+
+[INFO ] QDesktop: CUI-ML theme font: spec='roboto-regular' family='roboto-regular' px=14
+
+[INFO ] QDesktop: CUI-ML stage finalize=2ms total=2513ms
+
+[INFO ] QDesktop: Desktop initialized from CUI-ML (20 controls)
+
+[INFO ] QDesktop: Desktop mode: CUI-ML
+
+[INFO ] QWPresent: VmwareSVGAPresentBackend::present #1 (dirty=1)
+[INFO ] QDrvSVGA: SVGA_CMD_UPDATE #1 rect=223,169 648x428 next=0x1360 stop=0x1360 (min=0x1000 max=0x10000)
+[INFO ] QDesktop: Desktop show request dt=0ms
+
+Desktop initialized
+BOOTMETRIC desktop_init=2564ms
+[INFO ] QWCompositor: Collapsing dirty work to fullscreen (regions=1 area=786432 screen=786432)
+Initial render complete!
+BOOTMETRIC desktop_first_render=193ms
+Ctrl+Q shutdown listener registered
+Saved boot serial capture to /shared/CITSER.TXT
+Entering main loop...
+[INFO ] xHCI: Event #9: type=32
+[INFO ] xHCI: Event #10: type=32

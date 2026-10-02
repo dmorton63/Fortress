@@ -8,6 +8,8 @@
 
 namespace Fortress::Kernel {
 
+class FDesktopSurfaceContentHost;
+
 struct FDesktopOverlayFrameStats {
     Fortress::Core::uint64 AckCount = 0;
     Fortress::Core::uint64 AckPixels = 0;
@@ -28,7 +30,9 @@ struct FDesktopOverlayFrameStats {
 
 class FDesktopSurfaceOverlay {
   public:
-    void Bind(FDesktopCompositor *compositor, FDesktopInputRouter *inputRouter);
+    void Bind(FDesktopCompositor *compositor,
+              FDesktopInputRouter *inputRouter,
+              FDesktopSurfaceContentHost *contentHost);
     bool IsReady() const;
 
     void Render(const Fortress::Video::FVideoSurfaceView &surface);
@@ -37,6 +41,7 @@ class FDesktopSurfaceOverlay {
   private:
     FDesktopCompositor *Compositor = nullptr;
     FDesktopInputRouter *InputRouter = nullptr;
+    FDesktopSurfaceContentHost *ContentHost = nullptr;
     FDesktopOverlayFrameStats FrameStats{};
 };
 

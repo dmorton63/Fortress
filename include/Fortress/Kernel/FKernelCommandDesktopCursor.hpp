@@ -5,6 +5,7 @@
 
 #include "Fortress/Kernel/FDesktopCompositor.hpp"
 #include "Fortress/Kernel/FDesktopInputRouter.hpp"
+#include "Fortress/Kernel/FDesktopSurfaceContentHost.hpp"
 
 namespace Fortress::Kernel {
 
@@ -14,6 +15,7 @@ struct FKernelDesktopCursorCommandContext {
 
     FDesktopCompositor *DesktopCompositor;
     FDesktopInputRouter *DesktopInputRouter;
+    FDesktopSurfaceContentHost *DesktopSurfaceContentHost;
 
     bool *CursorOverlayEnabled;
     bool *DesktopSurfaceOverlayEnabled;

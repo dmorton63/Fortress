@@ -1,4 +1,5 @@
 #include "Fortress/Kernel/FKernelCommandDesktopCursor.hpp"
+#include "Fortress/Kernel/FKernelCommandConsole.hpp"
 
 namespace Fortress::Kernel {
 
@@ -27,6 +28,16 @@ static bool RequireInputRouter(FKernelDesktopCursorCommandContext &context) {
     }
 
     context.PushLogFn("DESKTOP INPUT ROUTER UNBOUND");
+    ClearCommandInput(context);
+    return false;
+}
+
+static bool RequireContentHost(FKernelDesktopCursorCommandContext &context) {
+    if (context.DesktopSurfaceContentHost != nullptr) {
+        return true;
+    }
+
+    context.PushLogFn("DESKTOP CONTENT HOST UNBOUND");
     ClearCommandInput(context);
     return false;
 }
@@ -62,6 +73,83 @@ bool TryProcessDesktopSurfaceCommand(FKernelDesktopCursorCommandContext &context
         context.AppendStringFn(line, sizeof(line), pos, " Z ");
         context.AppendUIntFn(line, sizeof(line), pos, stats.HighestZOrder);
         context.PushLogFn(line);
+        return true;
+    }
+
+    if (context.MatchAnyExactFn(context.CommandBuffer, "desktopcontrols", "dsksurfcontrols", "windowcontrols") ||
+        context.MatchAnyPrefixFn(context.CommandBuffer, "desktopcontrols ", "dsksurfcontrols ", "windowcontrols ")) {
+        if (!RequireContentHost(context)) {
+            return true;
+        }
+
+        uint64_t parsedSurfaceId = 0u;
+        FDesktopSurfaceId surfaceId = DesktopInvalidSurfaceId;
+        if (context.MatchAnyPrefixFn(context.CommandBuffer, "desktopcontrols ", "dsksurfcontrols ", "windowcontrols ")) {
+            const char *arg = context.AliasArgAfterPrefixFn(
+                context.CommandBuffer, "desktopcontrols ", 16, "dsksurfcontrols ", 16, "windowcontrols ", 15);
+            if (!context.ParseUIntFn(arg, parsedSurfaceId) || parsedSurfaceId == 0u) {
+                context.PushLogFn("DESKTOPCONTROLS ARG INVALID");
+                ClearCommandInput(context);
+                return true;
+            }
+            surfaceId = static_cast<FDesktopSurfaceId>(parsedSurfaceId);
+        } else {
+            if (!RequireInputRouter(context)) {
+                return true;
+            }
+            FDesktopInputRouterStats stats{};
+            context.DesktopInputRouter->GetStats(stats);
+            surfaceId = stats.FocusSurfaceId;
+            if (surfaceId == DesktopInvalidSurfaceId) {
+                context.PushLogFn("DESKTOPCONTROLS NO FOCUS");
+                ClearCommandInput(context);
+                return true;
+            }
+        }
+
+        Fortress::Core::uint32 controlCount = 0u;
+        Fortress::Core::uint32 focusedControlId = 0u;
+        if (!context.DesktopSurfaceContentHost->GetSurfaceControlSummary(surfaceId, controlCount, focusedControlId)) {
+            context.PushLogFn("DESKTOPCONTROLS NONE");
+            return true;
+        }
+
+        char line[196] = {};
+        size_t pos = 0;
+        context.AppendStringFn(line, sizeof(line), pos, "DESKTOP CONTROLS S ");
+        context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(surfaceId));
+        context.AppendStringFn(line, sizeof(line), pos, " N ");
+        context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(controlCount));
+        context.AppendStringFn(line, sizeof(line), pos, " F ");
+        context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(focusedControlId));
+        context.PushLogFn(line);
+
+        for (Fortress::Core::uint32 i = 0u; i < controlCount; i++) {
+            FDesktopControlNode node{};
+            if (!context.DesktopSurfaceContentHost->GetSurfaceControlNode(surfaceId, i, node)) {
+                continue;
+            }
+
+            pos = 0;
+            line[0] = '\0';
+            context.AppendStringFn(line, sizeof(line), pos, "CTRL ");
+            context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(node.ControlId));
+            context.AppendStringFn(line, sizeof(line), pos, " T ");
+            context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(node.Type == EDesktopControlType::Button ? 1u : 0u));
+            context.AppendStringFn(line, sizeof(line), pos, " X ");
+            context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(node.LocalBounds.X));
+            context.AppendStringFn(line, sizeof(line), pos, " Y ");
+            context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(node.LocalBounds.Y));
+            context.AppendStringFn(line, sizeof(line), pos, " W ");
+            context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(node.LocalBounds.Width));
+            context.AppendStringFn(line, sizeof(line), pos, " H ");
+            context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(node.LocalBounds.Height));
+            context.AppendStringFn(line, sizeof(line), pos, " F ");
+            context.AppendUIntFn(line, sizeof(line), pos, node.Focused ? 1u : 0u);
+            context.AppendStringFn(line, sizeof(line), pos, " P ");
+            context.AppendUIntFn(line, sizeof(line), pos, node.Pressed ? 1u : 0u);
+            context.PushLogFn(line);
+        }
         return true;
     }
 
@@ -470,8 +558,29 @@ bool TryProcessDesktopSurfaceCommand(FKernelDesktopCursorCommandContext &context
         context.AppendUIntFn(line, sizeof(line), pos, stats.DroppedKeyCount);
         context.AppendStringFn(line, sizeof(line), pos, " PTR ");
         context.AppendUIntFn(line, sizeof(line), pos, stats.PointerSampleCount);
+        context.AppendStringFn(line, sizeof(line), pos, " PE ");
+        context.AppendUIntFn(line, sizeof(line), pos, stats.PointerPressEdgeCount);
+        context.AppendStringFn(line, sizeof(line), pos, " HIT ");
+        context.AppendUIntFn(line, sizeof(line), pos, stats.PointerHitSurfaceCount);
         context.AppendStringFn(line, sizeof(line), pos, " CLK ");
         context.AppendUIntFn(line, sizeof(line), pos, stats.PointerFocusClickCount);
+        context.AppendStringFn(line, sizeof(line), pos, " FFAIL ");
+        context.AppendUIntFn(line, sizeof(line), pos, stats.PointerFocusFailCount);
+
+        Fortress::Core::uint32 xhciEp = 0u;
+        Fortress::Core::uint32 xhciKind = 0u;
+        Fortress::Core::uint32 xhciCc = 0u;
+        Fortress::Core::uint32 xhciNoXferStreak = 0u;
+        FKernelCommandConsole::GetXhciBackgroundInputTelemetry(xhciEp, xhciKind, xhciCc, xhciNoXferStreak);
+        context.AppendStringFn(line, sizeof(line), pos, " XEP ");
+        context.AppendUIntFn(line, sizeof(line), pos, xhciEp);
+        context.AppendStringFn(line, sizeof(line), pos, " XK ");
+        context.AppendUIntFn(line, sizeof(line), pos, xhciKind);
+        context.AppendStringFn(line, sizeof(line), pos, " XCC ");
+        context.AppendUIntFn(line, sizeof(line), pos, xhciCc);
+        context.AppendStringFn(line, sizeof(line), pos, " XNFX ");
+        context.AppendUIntFn(line, sizeof(line), pos, xhciNoXferStreak);
+
         context.PushLogFn(line);
         return true;
     }
@@ -502,16 +611,29 @@ bool TryProcessDesktopSurfaceCommand(FKernelDesktopCursorCommandContext &context
         return true;
     }
 
-    if (context.MatchAnyExactFn(context.CommandBuffer, "desktopdirty", "dsksurfdirty", "windowdirty") ||
-        context.MatchAnyPrefixFn(context.CommandBuffer, "desktopdirty ", "dsksurfdirty ", "windowdirty ")) {
+    const bool isDirtyExact = context.MatchAnyExactFn(context.CommandBuffer, "desktopdirty", "dsksurfdirty", "windowdirty") ||
+                             context.StrEqFn(context.CommandBuffer, "desksurfdirty");
+    const bool isDirtyPrefix = context.MatchAnyPrefixFn(context.CommandBuffer, "desktopdirty ", "dsksurfdirty ", "windowdirty ") ||
+                              context.StartsWithFn(context.CommandBuffer, "desksurfdirty ");
+    if (isDirtyExact || isDirtyPrefix) {
         if (!RequireCompositor(context)) {
             return true;
         }
 
         uint64_t requestedCount = 3u;
-        if (context.MatchAnyPrefixFn(context.CommandBuffer, "desktopdirty ", "dsksurfdirty ", "windowdirty ")) {
-            const char *arg =
-                context.AliasArgAfterPrefixFn(context.CommandBuffer, "desktopdirty ", 12, "dsksurfdirty ", 12, "windowdirty ", 12);
+        if (isDirtyPrefix) {
+            const char *arg = nullptr;
+            if (context.StartsWithFn(context.CommandBuffer, "desksurfdirty ")) {
+                arg = context.CommandBuffer + 14;
+            } else {
+                arg = context.AliasArgAfterPrefixFn(context.CommandBuffer,
+                                                    "desktopdirty ",
+                                                    13,
+                                                    "dsksurfdirty ",
+                                                    13,
+                                                    "windowdirty ",
+                                                    12);
+            }
             if (context.StrEqFn(arg, "all")) {
                 requestedCount = 16u;
             } else {
@@ -600,22 +722,47 @@ bool TryProcessDesktopSurfaceCommand(FKernelDesktopCursorCommandContext &context
         }
 
         FDesktopSurfaceInputStats surfaceStats{};
-        if (!context.DesktopInputRouter->GetSurfaceInputStats(static_cast<FDesktopSurfaceId>(parsedSurfaceId), surfaceStats)) {
+        char line[128] = {};
+        size_t pos = 0;
+        if (context.DesktopInputRouter->GetSurfaceInputStats(static_cast<FDesktopSurfaceId>(parsedSurfaceId), surfaceStats)) {
+            context.AppendStringFn(line, sizeof(line), pos, "DSKSURF ");
+            context.AppendUIntFn(line, sizeof(line), pos, parsedSurfaceId);
+            context.AppendStringFn(line, sizeof(line), pos, " RX ");
+            context.AppendUIntFn(line, sizeof(line), pos, surfaceStats.RoutedKeyCount);
+            context.AppendStringFn(line, sizeof(line), pos, " CLK ");
+            context.AppendUIntFn(line, sizeof(line), pos, surfaceStats.PointerFocusClickCount);
+            context.AppendStringFn(line, sizeof(line), pos, " KEY ");
+            context.AppendUIntFn(line, sizeof(line), pos, surfaceStats.LastRoutedKeyAscii);
+            context.PushLogFn(line);
+            return true;
+        }
+
+        if (!RequireCompositor(context)) {
+            return true;
+        }
+
+        FDesktopSurfaceSnapshot snapshot{};
+        if (!context.DesktopCompositor->GetSurfaceSnapshot(static_cast<FDesktopSurfaceId>(parsedSurfaceId), snapshot)) {
             context.PushLogFn("DSKSURFINSPECT NO DATA");
             ClearCommandInput(context);
             return true;
         }
 
-        char line[96] = {};
-        size_t pos = 0;
         context.AppendStringFn(line, sizeof(line), pos, "DSKSURF ");
         context.AppendUIntFn(line, sizeof(line), pos, parsedSurfaceId);
-        context.AppendStringFn(line, sizeof(line), pos, " RX ");
-        context.AppendUIntFn(line, sizeof(line), pos, surfaceStats.RoutedKeyCount);
-        context.AppendStringFn(line, sizeof(line), pos, " CLK ");
-        context.AppendUIntFn(line, sizeof(line), pos, surfaceStats.PointerFocusClickCount);
-        context.AppendStringFn(line, sizeof(line), pos, " KEY ");
-        context.AppendUIntFn(line, sizeof(line), pos, surfaceStats.LastRoutedKeyAscii);
+        context.AppendStringFn(line, sizeof(line), pos, " Z ");
+        context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(snapshot.ZOrder));
+        context.AppendStringFn(line, sizeof(line), pos, " V ");
+        context.AppendUIntFn(line, sizeof(line), pos, snapshot.Visible ? 1u : 0u);
+        context.AppendStringFn(line, sizeof(line), pos, " X ");
+        context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(snapshot.Bounds.X));
+        context.AppendStringFn(line, sizeof(line), pos, " Y ");
+        context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(snapshot.Bounds.Y));
+        context.AppendStringFn(line, sizeof(line), pos, " W ");
+        context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(snapshot.Bounds.Width));
+        context.AppendStringFn(line, sizeof(line), pos, " H ");
+        context.AppendUIntFn(line, sizeof(line), pos, static_cast<uint64_t>(snapshot.Bounds.Height));
+        context.AppendStringFn(line, sizeof(line), pos, " RX 0 CLK 0 KEY 0");
         context.PushLogFn(line);
         return true;
     }

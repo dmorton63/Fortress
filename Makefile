@@ -48,6 +48,7 @@ $(error Unsupported RENDERER_BACKEND '$(RENDERER_BACKEND)'; expected 'software' 
 endif
 
 BUILD_DIR := build
+GENERATED_AERO_HEADER := include/Fortress/Kernel/Generated/FAeroTheme.generated.hpp
 ISO_DIR := $(BUILD_DIR)/iso_root
 LIMINE_DIR := limine
 KERNEL := $(BUILD_DIR)/kernel.elf
@@ -79,6 +80,12 @@ $(BUILD_DIR):
 $(BUILD_DIR)/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(GENERATED_AERO_HEADER): aero.json tools/generate_aero_theme_header.py
+	@mkdir -p $(dir $@)
+	python3 tools/generate_aero_theme_header.py aero.json $(GENERATED_AERO_HEADER)
+
+$(BUILD_DIR)/Kernel/FKernelFramePipeline.o: $(GENERATED_AERO_HEADER)
 
 $(BUILD_DIR)/Cpu/%.o: CXXFLAGS += -mgeneral-regs-only
 

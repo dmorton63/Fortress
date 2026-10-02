@@ -11,6 +11,7 @@ struct FFrameRenderOptions {
     Fortress::Core::uint64 FpsValue = 0;
   bool RenderScene = true;
     bool WireframeEnabled = false;
+    bool RenderSurfaceSelfTest = false;
     bool RenderDesktopSurfaces = true;
     bool RenderHud = true;
     bool RenderInputPulse = false;

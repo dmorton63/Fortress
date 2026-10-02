@@ -6,6 +6,7 @@
 #include "Fortress/Kernel/FDesktopInputRouter.hpp"
 #include "Fortress/Kernel/FDesktopShell.hpp"
 #include "Fortress/Kernel/FDesktopShellPolicy.hpp"
+#include "Fortress/Kernel/FDesktopSurfaceContentHost.hpp"
 #include "Fortress/Kernel/FDesktopSurfaceOverlay.hpp"
 #include "Fortress/Kernel/FEventManager.hpp"
 #include "Fortress/Kernel/FKernelBootstrap.hpp"
@@ -36,8 +37,10 @@ class FDesktopRuntime {
     void OnDesktopStatusAttach(FDesktopCompositor &compositor);
     void OnDesktopStatusTick(FDesktopCompositor &compositor, Fortress::Core::uint64 tickCount);
     void CleanupOcclusionProbeSurfaces();
+    void RegisterDefaultSurfaceControls(Fortress::Core::uint32 surfaceId, bool statusSurface);
 
     void RoutePointerSample(const FKernelRuntimeContext &runtime);
+    void DrainCompositorDirtyFallback();
     void TryLogStats();
 
     static FDesktopRuntime *ActiveInstance;
@@ -50,6 +53,7 @@ class FDesktopRuntime {
     FDesktopShell Shell = {};
     FDesktopShellPolicy ShellPolicy = {};
     FDesktopInputRouter InputRouter = {};
+    FDesktopSurfaceContentHost ContentHost = {};
     FDesktopSurfaceOverlay Overlay = {};
 
     Fortress::Core::uint32 DesktopHudSurfaceId = 0u;

@@ -10,6 +10,7 @@ class FVideoConsole;
 namespace Fortress::Kernel {
 class FDesktopCompositor;
 class FDesktopInputRouter;
+class FDesktopSurfaceContentHost;
 }
 
 namespace Fortress::Kernel {
@@ -38,16 +39,20 @@ class FKernelCommandConsole {
     static void BindVideoConsole(Fortress::Video::FVideoConsole *console);
     static void BindDesktopCompositor(Fortress::Kernel::FDesktopCompositor *compositor);
     static void BindDesktopInputRouter(Fortress::Kernel::FDesktopInputRouter *router);
+    static void BindDesktopSurfaceContentHost(Fortress::Kernel::FDesktopSurfaceContentHost *contentHost);
     static void PushSystemLog(const char *line);
 
     static bool IsWireframeEnabled();
+    static bool IsRenderSurfaceSelfTestEnabled();
     static bool IsPaused();
+    static void OpenTerminalWindow();
 
     static const char *GetCommandBuffer();
     static EHudLogViewMode GetHudLogViewMode();
     static EHudLogDetailMode GetHudLogDetailMode();
     static bool IsTerminalModeEnabled();
     static bool IsTerminalWindowEnabled();
+    static bool IsDesktopSurfaceOverlayEnabled();
     static bool TryGetTerminalWindowBounds(Fortress::Core::int32 &outX,
                          Fortress::Core::int32 &outY,
                          Fortress::Core::int32 &outWidth,
@@ -64,6 +69,10 @@ class FKernelCommandConsole {
     static Fortress::Core::uint32 GetCursorSensitivityPercent();
     static void GetHidButtonsDown(bool &outLeft, bool &outRight, bool &outMiddle);
     static bool ConsumeHidButtonPressEdges(bool &outLeft, bool &outRight, bool &outMiddle);
+    static void GetXhciBackgroundInputTelemetry(Fortress::Core::uint32 &outEndpointAddress,
+                          Fortress::Core::uint32 &outEndpointKind,
+                          Fortress::Core::uint32 &outLastCompletionCode,
+                          Fortress::Core::uint32 &outNoTransferStreak);
 };
 
 } // namespace Fortress::Kernel

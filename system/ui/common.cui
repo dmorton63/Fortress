@@ -1,0 +1,83 @@
+<cui-ml-common>
+
+    <!-- ============================
+         GLOBAL REUSABLE COMPONENTS
+         ============================ -->
+
+    <!-- Accent Button -->
+    <Component name="AccentButton">
+        <Button
+            role="accent"
+            font-size: "14"
+            padding="4"
+        />
+    </Component>
+
+    <!-- Destructive Button -->
+    <Component name="DestructiveButton">
+        <Button
+            role="destructive"
+            font-size="14"
+            color="#FFFFFF"
+            background="#8F2E2E"
+            padding="4"
+        />
+    </Component>
+
+    <!-- Card Panel -->
+    <Component name="CardPanel">
+        <Panel
+            background="#E8F5E9"
+            border="#A5D6A7"
+            padding="12"
+        />
+    </Component>
+
+    <!-- Title Label -->
+    <Component name="TitleLabel">
+        <Label
+            font="roboto-regular"
+            font-size="18"
+            color="#1B5E20"
+        />
+    </Component>
+
+    <!-- Body Label -->
+    <Component name="BodyLabel">
+        <Label
+            font="roboto-regular"
+            font-size="14"
+            color="#2E7D32"
+        />
+    </Component>
+
+    <!-- ============================
+         COMMON ICON PATHS
+         ============================ -->
+
+    <Icons>
+        <Icon id="folder" path="/ICONS/svg/folder.svg" />
+        <Icon id="settings" path="/ICONS/svg/settings.svg" />
+        <Icon id="cmms" path="/ICONS/svg/settings.svg" />
+        <Icon id="terminal" path="/ICONS/svg/terminal.svg" />
+        <Icon id="file" path="/ICONS/svg/file.svg" />
+        <Icon id="leaf" path="/ICONS/svg/info.svg" />
+        <Icon id="power" path="/ICONS/SHUTDOWN.PNG" />
+        <Icon id="shutdown" path="/ICONS/SHUTDOWN.PNG" />
+    </Icons>
+
+    <!-- ============================
+         COMMON ROLES
+         ============================ -->
+
+    <Roles>
+        <Role id="accent"
+            font="roboto-regular"
+            background="#4A8F4A" 
+            color="#FFFFFF" />
+
+        <Role id="sidebar" background="#4A8F4A" color="#E8F5E9" />
+        <Role id="destructive" background="#8F2E2E" color="#FFFFFF" />
+    </Roles>
+
+</cui-ml-common>

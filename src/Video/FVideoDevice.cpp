@@ -31,6 +31,18 @@ bool FVideoDevice::Initialize(limine_framebuffer *framebuffer) {
     BlueMaskSize = framebuffer->blue_mask_size;
     BlueMaskShift = framebuffer->blue_mask_shift;
 
+    const bool maskInvalid =
+        (RedMaskSize == 0u && GreenMaskSize == 0u && BlueMaskSize == 0u) ||
+        (RedMaskShift >= 32u) || (GreenMaskShift >= 32u) || (BlueMaskShift >= 32u);
+    if (maskInvalid) {
+        RedMaskSize = 8u;
+        RedMaskShift = 16u;
+        GreenMaskSize = 8u;
+        GreenMaskShift = 8u;
+        BlueMaskSize = 8u;
+        BlueMaskShift = 0u;
+    }
+
     FrontBuffer = static_cast<Fortress::Core::uint32 *>(framebuffer->address);
     BackBuffer = static_cast<Fortress::Core::uint32 *>(
         Fortress::Memory::FMemoryArena::Allocate(PitchPixels * Height * sizeof(Fortress::Core::uint32), alignof(Fortress::Core::uint32)));

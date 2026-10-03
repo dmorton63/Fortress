@@ -101,6 +101,27 @@ bool FRawBlockFileSystemDriver::WriteFile(IBlockDevice &device,
     return true;
 }
 
+bool FRawBlockFileSystemDriver::DeleteFile(IBlockDevice &device, const char *relativePath) {
+    if (!GBound || GBoundReadOnly) {
+        return false;
+    }
+
+    Fortress::Core::uint64 blockIndex = 0u;
+    if (!ParseBlockPath(relativePath, blockIndex) || blockIndex >= GBoundBlockCount) {
+        return false;
+    }
+
+    Fortress::Core::uint8 zeroBlock[4096] = {};
+    if (GBoundBlockSizeBytes > sizeof(zeroBlock)) {
+        return false;
+    }
+
+    for (Fortress::Core::uint32 i = 0u; i < GBoundBlockSizeBytes; i++) {
+        zeroBlock[i] = 0u;
+    }
+    return device.WriteBlocks(blockIndex, 1u, zeroBlock, GBoundBlockSizeBytes);
+}
+
 Fortress::Core::uint32 FRawBlockFileSystemDriver::GetBoundBlockSizeBytes() const {
     return GBound ? GBoundBlockSizeBytes : 0;
 }

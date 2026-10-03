@@ -20,6 +20,10 @@ class FVideoConsole {
     void Print(const FVideoSurfaceView &surface, const char *text);
     void PrintLine(const char *text);
     void PrintLine(const FVideoSurfaceView &surface, const char *text);
+  #if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+    bool SetKeyboardFontProfile(EKeyboardFontProfile profile);
+    const char *GetKeyboardFontProfileName() const;
+  #endif
     void GetFontCacheStats(FFontCacheStats &OutStats) const;
     void ResetFontCache();
 

@@ -249,6 +249,19 @@ bool FVirtualFileSystem::WriteFile(const char *absolutePath,
                                    outWrittenBytes);
 }
 
+bool FVirtualFileSystem::DeleteFile(const char *absolutePath) {
+    FVirtualFileSystemRoute route{};
+    if (!ResolvePath(absolutePath, route) || !route.Found || route.Driver == nullptr || route.Device == nullptr) {
+        return false;
+    }
+
+    if (route.ReadOnly) {
+        return false;
+    }
+
+    return route.Driver->DeleteFile(*route.Device, route.RelativePath);
+}
+
 void FVirtualFileSystem::GetMounts(FVirtualFileSystemMountSnapshot *outMounts,
                                    Fortress::Core::uint32 capacity,
                                    Fortress::Core::uint32 &outCount) {

@@ -31,6 +31,7 @@
 #include "Fortress/Platform/FTimerX86.hpp"
 #include "Fortress/Storage/FRamBlockDevice.hpp"
 #include "Fortress/Storage/FRawBlockFileSystemDriver.hpp"
+#include "Fortress/Storage/FSimpleFileSystemDriver.hpp"
 #include "Fortress/Storage/FVirtualFileSystem.hpp"
 #include "Fortress/Video/FDisplayManager.hpp"
 #include "Fortress/Video/FRenderer3D.hpp"
@@ -69,6 +70,7 @@ using Fortress::Kernel::FKeyboardManager;
 using Fortress::Platform::FTimerX86;
 using Fortress::Storage::FRamBlockDevice;
 using Fortress::Storage::FRawBlockFileSystemDriver;
+using Fortress::Storage::FSimpleFileSystemDriver;
 using Fortress::Storage::FVirtualFileSystem;
 using Fortress::Storage::FVirtualFileSystemRoute;
 using Fortress::Storage::FVirtualFileSystemStats;
@@ -91,6 +93,8 @@ static FRenderer3D *GRenderer3D = nullptr;
 static FKernelCubeScene GCubeScene;
 static FRamBlockDevice GBootVolumeDevice;
 static FRawBlockFileSystemDriver GBootVolumeFileSystem;
+static FRamBlockDevice GDataVolumeDevice;
+static FSimpleFileSystemDriver GDataVolumeFileSystem;
 
 struct FBootstrapTaskContext {
     uint64_t RunCount;
@@ -232,6 +236,50 @@ static void RunStorageSmokeDiagnostic() {
     AppendString(line, sizeof(line), pos, " DRV ");
     AppendString(line, sizeof(line), pos, route.DriverName);
     FKernelCommandConsole::PushSystemLog(line);
+
+    static constexpr char DataTestPayload[] = "FORTRESS SFS OK";
+    Fortress::Core::uint32 dataWrittenBytes = 0u;
+    if (!FVirtualFileSystem::WriteFile("/data/smoke.txt",
+                                       DataTestPayload,
+                                       static_cast<Fortress::Core::uint32>(sizeof(DataTestPayload) - 1u),
+                                       dataWrittenBytes)) {
+        FKernelCommandConsole::PushSystemLog("VFS SFS WRITE FAIL");
+        return;
+    }
+
+    if (dataWrittenBytes != static_cast<Fortress::Core::uint32>(sizeof(DataTestPayload) - 1u)) {
+        FKernelCommandConsole::PushSystemLog("VFS SFS WRITE SIZE FAIL");
+        return;
+    }
+
+    char dataReadback[64] = {};
+    Fortress::Core::uint32 dataReadBytes = 0u;
+    if (!FVirtualFileSystem::ReadFile("/data/smoke.txt", dataReadback, sizeof(dataReadback), dataReadBytes)) {
+        FKernelCommandConsole::PushSystemLog("VFS SFS READ FAIL");
+        return;
+    }
+
+    if (dataReadBytes != static_cast<Fortress::Core::uint32>(sizeof(DataTestPayload) - 1u) ||
+        !BuffersEqual(reinterpret_cast<const Fortress::Core::uint8 *>(DataTestPayload),
+                      reinterpret_cast<const Fortress::Core::uint8 *>(dataReadback),
+                      dataReadBytes)) {
+        FKernelCommandConsole::PushSystemLog("VFS SFS VERIFY FAIL");
+        return;
+    }
+
+    FVirtualFileSystemRoute dataRoute{};
+    if (!FVirtualFileSystem::ResolvePath("/data/smoke.txt", dataRoute) || !dataRoute.Found) {
+        FKernelCommandConsole::PushSystemLog("VFS SFS ROUTE FAIL");
+        return;
+    }
+
+    char dataLine[96] = {};
+    size_t dataPos = 0;
+    AppendString(dataLine, sizeof(dataLine), dataPos, "VFS SFS PASS BYTES ");
+    AppendUInt(dataLine, sizeof(dataLine), dataPos, dataReadBytes);
+    AppendString(dataLine, sizeof(dataLine), dataPos, " DRV ");
+    AppendString(dataLine, sizeof(dataLine), dataPos, dataRoute.DriverName);
+    FKernelCommandConsole::PushSystemLog(dataLine);
 }
 
 static void RunTextShaperSmokeDiagnostic() {
@@ -570,11 +618,19 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
         return false;
     }
 
+    if (!GDataVolumeDevice.Initialize(FRamBlockDevice::SupportedBlockSizeBytes, 2048u, false)) {
+        return false;
+    }
+
     if (!FVirtualFileSystem::Initialize()) {
         return false;
     }
 
     if (!FVirtualFileSystem::Mount("/boot", &GBootVolumeDevice, &GBootVolumeFileSystem, false)) {
+        return false;
+    }
+
+    if (!FVirtualFileSystem::Mount("/data", &GDataVolumeDevice, &GDataVolumeFileSystem, false)) {
         return false;
     }
 

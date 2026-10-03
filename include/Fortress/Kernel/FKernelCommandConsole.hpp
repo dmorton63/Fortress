@@ -46,6 +46,7 @@ class FKernelCommandConsole {
     static bool IsRenderSurfaceSelfTestEnabled();
     static bool IsPaused();
     static void OpenTerminalWindow();
+    static void NotifyHudPresented();
 
     static const char *GetCommandBuffer();
     static EHudLogViewMode GetHudLogViewMode();

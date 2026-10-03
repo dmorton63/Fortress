@@ -787,6 +787,11 @@ static void ExecuteSurfaceSelfTestPass(const FFramePassContext &context) {
 }
 
 static void ExecuteHudPass(const FFramePassContext &context) {
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+    const auto NotifyHudPresented = []() {
+        FKernelCommandConsole::NotifyHudPresented();
+    };
+#endif
     Fortress::Core::int32 panelX = 8;
     Fortress::Core::int32 panelY = 8;
     Fortress::Core::int32 panelWidth =
@@ -825,6 +830,9 @@ static void ExecuteHudPass(const FFramePassContext &context) {
     }
 
     if (panelWidth <= 0 || panelHeight <= 0) {
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+        NotifyHudPresented();
+#endif
         return;
     }
 
@@ -1017,6 +1025,9 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                          170,
                          taskbarY + 16);
         }
+    #if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+        NotifyHudPresented();
+    #endif
         return;
     }
 
@@ -1048,10 +1059,16 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                             Fortress::Video::FColor::RGB(108, 54, 38),
                             panelY + 12 + Fortress::Video::FTextRenderer::GetLineAdvance(2));
         }
+                #if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+                    NotifyHudPresented();
+                #endif
         return;
     }
 
     if (!GFallbackHudFontReady) {
+                #if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+                    NotifyHudPresented();
+                #endif
         return;
     }
 
@@ -1179,6 +1196,9 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                             2);
         }
 
+                #if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+                    NotifyHudPresented();
+                #endif
         return;
     }
 
@@ -1445,6 +1465,11 @@ static void ExecuteHudPass(const FFramePassContext &context) {
                         okButtonHeight,
                         2);
     }
+
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+    NotifyHudPresented();
+#endif
+
 }
 
 static bool ShouldRunCursorOverlayPass(const FFramePassContext &context) {

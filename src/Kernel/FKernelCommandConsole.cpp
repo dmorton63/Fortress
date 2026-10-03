@@ -23,6 +23,7 @@
 #include "Fortress/Kernel/FKeyboardManager.hpp"
 #include "Fortress/Kernel/FKernelInputEventPlane.hpp"
 #include "Fortress/Kernel/FKernelRuntimeIds.hpp"
+#include "Fortress/Kernel/FKernelScheduler.hpp"
 #include "Fortress/Kernel/FKernelSubsystemStateTracker.hpp"
 #include "Fortress/Kernel/FKernelSchedulerEventPlane.hpp"
 #include "Fortress/Kernel/FMessageBus.hpp"
@@ -80,6 +81,8 @@ using Fortress::Kernel::FDesktopInputRouter;
 using Fortress::Kernel::FDesktopInputRouterStats;
 using Fortress::Kernel::FKernelInputEventPlane;
 using Fortress::Kernel::FKernelInputEventStats;
+using Fortress::Kernel::FKernelScheduler;
+using Fortress::Kernel::FKernelSchedulerStats;
 using Fortress::Kernel::FKernelSchedulerEventPlane;
 using Fortress::Kernel::FKernelSchedulerEventStats;
 using Fortress::Kernel::FMessageBus;
@@ -212,6 +215,16 @@ static bool GDesktopSurfaceOverlayEnabled = false;
 static bool GCursorInvertX = false;
 static bool GCursorInvertY = false;
 static uint32_t GCursorSensitivityPercent = 100;
+static bool GKeyLatencyLogEnabled = true;
+static uint64_t GPendingCommandFirstKeyTsc = 0ull;
+static uint64_t GPendingCommandLastKeyTsc = 0ull;
+static uint32_t GPendingCommandKeyCount = 0u;
+static uint64_t GPendingCommandFirstKeyTick = 0ull;
+static uint64_t GPendingCommandLastKeyTick = 0ull;
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+static bool GPendingDisplayLatencySample = false;
+static uint64_t GPendingDisplayLatencyExecuteTick = 0ull;
+#endif
 static uint8_t GHidButtonsDownMask = 0;
 static uint8_t GHidButtonPressEdgesMask = 0;
 static bool GHaveHidLogicalAxisRange = false;
@@ -255,6 +268,10 @@ static uint8_t GXhciIntrinBackgroundActiveEndpointAddress = 0u;
 static uint8_t GXhciIntrinBackgroundActiveEndpointKind = 0u;
 static uint32_t GXhciIntrinBackgroundLastCompletionCode = 0u;
 static uint32_t GXhciIntrinBackgroundNoTransferStreak = 0u;
+static uint64_t GXhciIntrinBackgroundSlowPollCount = 0ull;
+static uint8_t GXhciIntrinBackgroundLastAdaptiveDivider = 0u;
+static uint32_t GXhciIntrinBackgroundPauseTicks = 0u;
+static bool GXhciIntrinBackgroundSuspendedForLatency = false;
 static Fortress::Video::FVideoConsole *GBoundVideoConsole = nullptr;
 static Fortress::Kernel::FDesktopCompositor *GBoundDesktopCompositor = nullptr;
 static Fortress::Kernel::FDesktopInputRouter *GBoundDesktopInputRouter = nullptr;
@@ -464,6 +481,19 @@ static inline uint8_t SerialIn8(uint16_t port) {
 
 static inline void IoOut16(uint16_t port, uint16_t value) {
     __asm__ volatile("outw %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline uint64_t ReadCpuTsc() {
+    uint32_t lo = 0u;
+    uint32_t hi = 0u;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return (static_cast<uint64_t>(hi) << 32u) | static_cast<uint64_t>(lo);
+}
+
+static uint64_t ReadSchedulerTickCount() {
+    FKernelSchedulerStats stats{};
+    FKernelScheduler::GetStats(stats);
+    return stats.TickCount;
 }
 
 static void HaltCpuForever() {
@@ -6699,6 +6729,446 @@ static void RunVfsStat() {
 static void RunVfsResolve(const char *args);
 static void RunLogSave(const char *args);
 
+static bool IsSafeFsPathChar(char c) {
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '/' || c == '_' || c == '-' || c == '.';
+}
+
+static bool BuildDataPath(const char *token, char *outPath, size_t outPathSize) {
+    if (token == nullptr || outPath == nullptr || outPathSize < 8u) {
+        return false;
+    }
+
+    const char *relative = token;
+    if (StartsWith(relative, "/data/")) {
+        relative += 6;
+    } else if (StrEq(relative, "/data")) {
+        return false;
+    } else if (relative[0] == '/') {
+        relative++;
+    }
+
+    if (relative[0] == '\0') {
+        return false;
+    }
+
+    size_t pos = 0u;
+    outPath[0] = '\0';
+    AppendString(outPath, outPathSize, pos, "/data/");
+
+    size_t segLen = 0u;
+    bool segOnlyDots = true;
+    char lastChar = '\0';
+    for (size_t i = 0u; relative[i] != '\0'; i++) {
+        const char c = relative[i];
+        if (!IsSafeFsPathChar(c)) {
+            return false;
+        }
+        if (c == '/') {
+            if (segLen == 0u || segOnlyDots) {
+                return false;
+            }
+            segLen = 0u;
+            segOnlyDots = true;
+        } else {
+            segLen++;
+            if (c != '.') {
+                segOnlyDots = false;
+            }
+        }
+
+        if (pos + 1u >= outPathSize) {
+            return false;
+        }
+        outPath[pos++] = c;
+        outPath[pos] = '\0';
+        lastChar = c;
+    }
+
+    if (segLen == 0u || segOnlyDots || lastChar == '/') {
+        return false;
+    }
+
+    return true;
+}
+
+static size_t StringLengthLocal(const char *value) {
+    if (value == nullptr) {
+        return 0u;
+    }
+    size_t len = 0u;
+    while (value[len] != '\0') {
+        len++;
+    }
+    return len;
+}
+
+static bool FsIndexContainsLine(const char *indexText, size_t indexLen, const char *needle) {
+    if (indexText == nullptr || needle == nullptr) {
+        return false;
+    }
+
+    const size_t needleLen = StringLengthLocal(needle);
+    size_t lineStart = 0u;
+    while (lineStart < indexLen) {
+        size_t lineEnd = lineStart;
+        while (lineEnd < indexLen && indexText[lineEnd] != '\n') {
+            lineEnd++;
+        }
+
+        const size_t lineLen = lineEnd - lineStart;
+        if (lineLen == needleLen) {
+            bool same = true;
+            for (size_t i = 0u; i < needleLen; i++) {
+                if (indexText[lineStart + i] != needle[i]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                return true;
+            }
+        }
+
+        lineStart = lineEnd + 1u;
+    }
+
+    return false;
+}
+
+static bool UpdateFsIndexForPath(const char *absolutePath) {
+    if (absolutePath == nullptr || !StartsWith(absolutePath, "/data/")) {
+        return false;
+    }
+
+    const char *relative = absolutePath + 6;
+    if (StrEq(relative, ".index")) {
+        return true;
+    }
+
+    char indexBuffer[2048] = {};
+    uint32_t readBytes = 0u;
+    const bool haveExisting = FVirtualFileSystem::ReadFile("/data/.index", indexBuffer, sizeof(indexBuffer), readBytes);
+    if (!haveExisting) {
+        readBytes = 0u;
+    }
+
+    if (FsIndexContainsLine(indexBuffer, readBytes, relative)) {
+        return true;
+    }
+
+    const size_t relLen = StringLengthLocal(relative);
+    size_t writePos = static_cast<size_t>(readBytes);
+    if (writePos > 0u && indexBuffer[writePos - 1u] != '\n') {
+        if (writePos + 1u >= sizeof(indexBuffer)) {
+            return false;
+        }
+        indexBuffer[writePos++] = '\n';
+    }
+
+    if (writePos + relLen + 1u >= sizeof(indexBuffer)) {
+        return false;
+    }
+
+    for (size_t i = 0u; i < relLen; i++) {
+        indexBuffer[writePos++] = relative[i];
+    }
+    indexBuffer[writePos++] = '\n';
+
+    uint32_t writtenBytes = 0u;
+    return FVirtualFileSystem::WriteFile("/data/.index",
+                                         indexBuffer,
+                                         static_cast<uint32_t>(writePos),
+                                         writtenBytes) &&
+           writtenBytes == static_cast<uint32_t>(writePos);
+}
+
+static bool RemoveFsIndexPath(const char *absolutePath) {
+    if (absolutePath == nullptr || !StartsWith(absolutePath, "/data/")) {
+        return false;
+    }
+
+    const char *relative = absolutePath + 6;
+    if (StrEq(relative, ".index")) {
+        return false;
+    }
+
+    char indexBuffer[2048] = {};
+    uint32_t readBytes = 0u;
+    if (!FVirtualFileSystem::ReadFile("/data/.index", indexBuffer, sizeof(indexBuffer), readBytes)) {
+        return false;
+    }
+
+    const size_t needleLen = StringLengthLocal(relative);
+    char newIndex[2048] = {};
+    size_t writePos = 0u;
+    bool removed = false;
+
+    size_t lineStart = 0u;
+    while (lineStart < readBytes) {
+        size_t lineEnd = lineStart;
+        while (lineEnd < readBytes && indexBuffer[lineEnd] != '\n') {
+            lineEnd++;
+        }
+
+        const size_t lineLen = lineEnd - lineStart;
+        bool isTarget = false;
+        if (lineLen == needleLen) {
+            isTarget = true;
+            for (size_t i = 0u; i < needleLen; i++) {
+                if (indexBuffer[lineStart + i] != relative[i]) {
+                    isTarget = false;
+                    break;
+                }
+            }
+        }
+
+        if (!isTarget && lineLen > 0u) {
+            if (writePos + lineLen + 1u >= sizeof(newIndex)) {
+                return false;
+            }
+            for (size_t i = 0u; i < lineLen; i++) {
+                newIndex[writePos++] = indexBuffer[lineStart + i];
+            }
+            newIndex[writePos++] = '\n';
+        } else if (isTarget) {
+            removed = true;
+        }
+
+        lineStart = lineEnd + 1u;
+    }
+
+    if (!removed) {
+        return true;
+    }
+
+    uint32_t writtenBytes = 0u;
+    return FVirtualFileSystem::WriteFile("/data/.index",
+                                         newIndex,
+                                         static_cast<uint32_t>(writePos),
+                                         writtenBytes) &&
+           writtenBytes == static_cast<uint32_t>(writePos);
+}
+
+static void RunFsWrite(const char *args) {
+    if (args == nullptr || args[0] == '\0') {
+        PushLog("FS WRITE USAGE FS WRITE PATH TEXT");
+        return;
+    }
+
+    const char *cursor = args;
+    char pathToken[96] = {};
+    if (!ReadToken(cursor, pathToken, sizeof(pathToken))) {
+        PushLog("FS WRITE USAGE FS WRITE PATH TEXT");
+        return;
+    }
+
+    const char *payload = SkipSpaces(cursor);
+    if (payload == nullptr) {
+        payload = "";
+    }
+
+    char absolutePath[128] = {};
+    if (!BuildDataPath(pathToken, absolutePath, sizeof(absolutePath))) {
+        PushLog("FS WRITE PATH INVALID");
+        return;
+    }
+
+    const size_t payloadLen = StringLengthLocal(payload);
+    uint32_t writtenBytes = 0u;
+    if (!FVirtualFileSystem::WriteFile(absolutePath,
+                                       payload,
+                                       static_cast<uint32_t>(payloadLen),
+                                       writtenBytes) ||
+        writtenBytes != payloadLen) {
+        PushLog("FS WRITE FAIL");
+        return;
+    }
+
+    if (!UpdateFsIndexForPath(absolutePath)) {
+        PushLog("FS WRITE INDEX WARN");
+    }
+
+    char line[160] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "FS WRITE OK ");
+    AppendString(line, sizeof(line), pos, absolutePath);
+    AppendString(line, sizeof(line), pos, " BYTES ");
+    AppendUInt(line, sizeof(line), pos, writtenBytes);
+    PushLog(line);
+}
+
+static void RunFsRead(const char *args) {
+    if (args == nullptr || args[0] == '\0') {
+        PushLog("FS READ USAGE FS READ PATH");
+        return;
+    }
+
+    const char *cursor = args;
+    char pathToken[96] = {};
+    char extraToken[8] = {};
+    if (!ReadToken(cursor, pathToken, sizeof(pathToken)) || ReadToken(cursor, extraToken, sizeof(extraToken))) {
+        PushLog("FS READ USAGE FS READ PATH");
+        return;
+    }
+
+    char absolutePath[128] = {};
+    if (!BuildDataPath(pathToken, absolutePath, sizeof(absolutePath))) {
+        PushLog("FS READ PATH INVALID");
+        return;
+    }
+
+    char readBuffer[256] = {};
+    uint32_t readBytes = 0u;
+    if (!FVirtualFileSystem::ReadFile(absolutePath, readBuffer, sizeof(readBuffer), readBytes)) {
+        PushLog("FS READ FAIL");
+        return;
+    }
+
+    char line[192] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "FS READ ");
+    AppendString(line, sizeof(line), pos, absolutePath);
+    AppendString(line, sizeof(line), pos, " BYTES ");
+    AppendUInt(line, sizeof(line), pos, readBytes);
+    AppendString(line, sizeof(line), pos, " DATA ");
+
+    const uint32_t previewBytes = readBytes > 48u ? 48u : readBytes;
+    for (uint32_t i = 0u; i < previewBytes; i++) {
+        const char c = readBuffer[i];
+        AppendChar(line, sizeof(line), pos, (c >= 32 && c <= 126) ? c : '.');
+    }
+    if (readBytes > previewBytes) {
+        AppendString(line, sizeof(line), pos, "...");
+    }
+    PushLog(line);
+}
+
+static void RunFsList(const char *args) {
+    const char *prefixArg = "";
+    char prefixToken[96] = {};
+    if (args != nullptr) {
+        const char *cursor = args;
+        if (ReadToken(cursor, prefixToken, sizeof(prefixToken))) {
+            char extraToken[8] = {};
+            if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                PushLog("FS LS USAGE FS LS [PREFIX]");
+                return;
+            }
+            prefixArg = prefixToken;
+        }
+    }
+
+    char relativePrefix[96] = {};
+    if (prefixArg[0] != '\0') {
+        if (StartsWith(prefixArg, "/data/")) {
+            prefixArg += 6;
+        } else if (prefixArg[0] == '/') {
+            prefixArg += 1;
+        }
+
+        for (size_t i = 0u; prefixArg[i] != '\0' && i + 1u < sizeof(relativePrefix); i++) {
+            relativePrefix[i] = prefixArg[i];
+            relativePrefix[i + 1u] = '\0';
+        }
+    }
+
+    char indexBuffer[2048] = {};
+    uint32_t readBytes = 0u;
+    if (!FVirtualFileSystem::ReadFile("/data/.index", indexBuffer, sizeof(indexBuffer), readBytes)) {
+        PushLog("FS LS EMPTY");
+        return;
+    }
+
+    const size_t prefixLen = StringLengthLocal(relativePrefix);
+    size_t lineStart = 0u;
+    uint32_t listed = 0u;
+    while (lineStart < readBytes) {
+        size_t lineEnd = lineStart;
+        while (lineEnd < readBytes && indexBuffer[lineEnd] != '\n') {
+            lineEnd++;
+        }
+
+        const size_t lineLen = lineEnd - lineStart;
+        if (lineLen > 0u) {
+            bool prefixMatch = true;
+            if (prefixLen > 0u) {
+                if (lineLen < prefixLen) {
+                    prefixMatch = false;
+                } else {
+                    for (size_t i = 0u; i < prefixLen; i++) {
+                        if (indexBuffer[lineStart + i] != relativePrefix[i]) {
+                            prefixMatch = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (prefixMatch) {
+                char line[160] = {};
+                size_t pos = 0u;
+                AppendString(line, sizeof(line), pos, "FS FILE ");
+                for (size_t i = 0u; i < lineLen; i++) {
+                    AppendChar(line, sizeof(line), pos, indexBuffer[lineStart + i]);
+                }
+                PushLog(line);
+                listed++;
+                if (listed >= 16u) {
+                    PushLog("FS LS TRUNCATED");
+                    break;
+                }
+            }
+        }
+
+        lineStart = lineEnd + 1u;
+    }
+
+    char summary[96] = {};
+    size_t pos = 0u;
+    AppendString(summary, sizeof(summary), pos, "FS LS COUNT ");
+    AppendUInt(summary, sizeof(summary), pos, listed);
+    PushLog(summary);
+}
+
+static void RunFsRemove(const char *args) {
+    if (args == nullptr || args[0] == '\0') {
+        PushLog("FS RM USAGE FS RM PATH");
+        return;
+    }
+
+    const char *cursor = args;
+    char pathToken[96] = {};
+    char extraToken[8] = {};
+    if (!ReadToken(cursor, pathToken, sizeof(pathToken)) || ReadToken(cursor, extraToken, sizeof(extraToken))) {
+        PushLog("FS RM USAGE FS RM PATH");
+        return;
+    }
+
+    char absolutePath[128] = {};
+    if (!BuildDataPath(pathToken, absolutePath, sizeof(absolutePath))) {
+        PushLog("FS RM PATH INVALID");
+        return;
+    }
+
+    if (!FVirtualFileSystem::DeleteFile(absolutePath)) {
+        PushLog("FS RM FAIL");
+        return;
+    }
+
+    if (!RemoveFsIndexPath(absolutePath)) {
+        PushLog("FS RM INDEX WARN");
+    }
+
+    char line[160] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "FS RM OK ");
+    AppendString(line, sizeof(line), pos, absolutePath);
+    PushLog(line);
+}
+
 static bool BuildAbsolutePathFromMountToken(const char *mountToken,
                                             const char *leafToken,
                                             char *outPath,
@@ -9562,9 +10032,49 @@ static void RunFontCacheReset() {
     PushLog("FONT CACHE RESET");
 }
 
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+static void RunKeyboardFontQuery() {
+    char line[96] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "KBDFONT ");
+    AppendString(line, sizeof(line), pos, Fortress::Video::FFontManager::GetGlobalKeyboardFontProfileName());
+    PushLog(line);
+}
+
+static void RunKeyboardFontSelect(const char *profileToken) {
+    if (profileToken == nullptr) {
+        PushLog("KBDFONT USAGE KBDFONT [CLASSIC|DENSE|STATUS|PREVIEW]");
+        return;
+    }
+
+    if (StrEq(profileToken, "status")) {
+        RunKeyboardFontQuery();
+    } else if (StrEq(profileToken, "classic") || StrEq(profileToken, "clasic")) {
+        Fortress::Video::FFontManager::SetGlobalKeyboardFontProfile(Fortress::Video::EKeyboardFontProfile::Classic);
+        if (GBoundVideoConsole != nullptr) {
+            GBoundVideoConsole->SetKeyboardFontProfile(Fortress::Video::EKeyboardFontProfile::Classic);
+        }
+        PushLog("KBDFONT CLASSIC");
+    } else if (StrEq(profileToken, "dense") || StrEq(profileToken, "bold")) {
+        Fortress::Video::FFontManager::SetGlobalKeyboardFontProfile(Fortress::Video::EKeyboardFontProfile::Dense);
+        if (GBoundVideoConsole != nullptr) {
+            GBoundVideoConsole->SetKeyboardFontProfile(Fortress::Video::EKeyboardFontProfile::Dense);
+        }
+        PushLog("KBDFONT DENSE");
+    } else if (StrEq(profileToken, "preview") || StrEq(profileToken, "demo")) {
+        PushLog("KBDFONT PREVIEW: THE QUICK BROWN FOX 0123456789 []{}() <> /\\");
+    } else {
+        PushLog("KBDFONT PROFILE UNSUPPORTED");
+    }
+}
+#endif
+
 static void RunUtilityHelp() {
     PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS|FILTER [QUIET|NORMAL|FULL|STATUS]|WINDOW ON|OFF|TOGGLE|STATUS] STATS EVENTHEALTH SUBSYSHEALTH [BRIEF|FORCE|INTERVAL] AIMON [EVAL|POLICY|THRESHOLD|STATE] EVENTBURST VFSSTAT VFSMOUNTS VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 VFSMRESOLVE VFSMBLK VFSBLKDIGEST LOGSAVE LOGSAVEBOOT LOGSAVEMOUNT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN DSKSURFCONTROLS KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
     PushLog("KBD: KBDLAYOUT [US|DVORAK] KBDMODS");
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+    PushLog("KBD: KBDFONT [CLASSIC|DENSE|STATUS|PREVIEW]");
+#endif
     PushLog("TEXT: TEXTSHAPER [BASIC|WRAP [PX]]");
     PushLog("VFS: VFSRESOLVE /ABS/PATH | VFSBOOT NAME | VFSBOOTBLK INDEX | VFSBOOT0");
     PushLog("VFS: VFSMOUNTS | VFSMRESOLVE MOUNT LEAF | VFSMBLK MOUNT INDEX | VFSBLKDIGEST MOUNT INDEX");
@@ -9637,6 +10147,8 @@ static void RunUtilityHelp() {
     PushLog("HUD: SHOWLOG BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS|FILTER [QUIET|NORMAL|FULL|STATUS]|WINDOW ON|OFF|TOGGLE|STATUS] LAYERS");
     PushLog("VFS: VFSSTAT VFSMOUNTS VFSRESOLVE /ABS/PATH");
     PushLog("VFS: LOGSAVE /MOUNT START_BLOCK BLOCK_COUNT (writes boot+runtime logs to /MOUNT/blk/N)");
+    PushLog("FS: FS WRITE PATH TEXT | FS READ PATH | FS LS [PREFIX] | FS RM PATH (mounted on /data)");
+    PushLog("LAT: KEYLAT [ON|OFF|STATUS] (keypress-to-command latency logs)");
     PushLog("PMM: PALLOC [N] PFREE PRESERVE LOW");
     PushLog("VMM: VMMAP VA PA [N] [rw|rwnx|rx|dev]");
     PushLog("VMM: VMALLOC N [rw|rwnx|rx|dev]");
@@ -10913,6 +11425,11 @@ static void RunParallelProbe() {
 static void ResetCommandInputBuffer() {
     GCommandLength = 0;
     GCommandBuffer[0] = '\0';
+    GPendingCommandFirstKeyTsc = 0ull;
+    GPendingCommandLastKeyTsc = 0ull;
+    GPendingCommandKeyCount = 0u;
+    GPendingCommandFirstKeyTick = 0ull;
+    GPendingCommandLastKeyTick = 0ull;
 }
 
 static void TrimCommandInputBuffer() {
@@ -10944,6 +11461,38 @@ static void TrimCommandInputBuffer() {
 static void ProcessCommand() {
     TrimCommandInputBuffer();
     GCommandBuffer[GCommandLength] = '\0';
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+    const bool hadCommandText = GCommandLength > 0u;
+#endif
+
+    if (GKeyLatencyLogEnabled && GPendingCommandFirstKeyTsc != 0ull) {
+        const uint64_t executeTsc = ReadCpuTsc();
+        const uint64_t executeTick = ReadSchedulerTickCount();
+        const uint64_t totalCycles = executeTsc - GPendingCommandFirstKeyTsc;
+        const uint64_t tailCycles = executeTsc - GPendingCommandLastKeyTsc;
+        const uint64_t totalTicks = executeTick - GPendingCommandFirstKeyTick;
+        const uint64_t tailTicks = executeTick - GPendingCommandLastKeyTick;
+        char line[160] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "KEYLAT CYC TOTAL ");
+        AppendUInt(line, sizeof(line), pos, totalCycles);
+        AppendString(line, sizeof(line), pos, " TAIL ");
+        AppendUInt(line, sizeof(line), pos, tailCycles);
+        AppendString(line, sizeof(line), pos, " KEYS ");
+        AppendUInt(line, sizeof(line), pos, GPendingCommandKeyCount);
+        AppendString(line, sizeof(line), pos, " LEN ");
+        AppendUInt(line, sizeof(line), pos, static_cast<uint64_t>(GCommandLength));
+        PushLog(line);
+
+        pos = 0u;
+        line[0] = '\0';
+        AppendString(line, sizeof(line), pos, "KEYLAT TICK TOTAL ");
+        AppendUInt(line, sizeof(line), pos, totalTicks);
+        AppendString(line, sizeof(line), pos, " TAIL ");
+        AppendUInt(line, sizeof(line), pos, tailTicks);
+        PushLog(line);
+    }
+
     PublishCommandSubmittedEvent();
 
     FreezeBootLogOnFirstCommand();
@@ -11040,6 +11589,52 @@ static void ProcessCommand() {
         } else {
             RunLogSave(GCommandBuffer + 8);
         }
+    } else if (StrEq(GCommandBuffer, "fs rm") || StartsWith(GCommandBuffer, "fs rm ")) {
+        if (StrEq(GCommandBuffer, "fs rm")) {
+            PushLog("FS RM USAGE FS RM PATH");
+        } else {
+            RunFsRemove(GCommandBuffer + 6);
+        }
+    } else if (StrEq(GCommandBuffer, "fs write") || StartsWith(GCommandBuffer, "fs write ")) {
+        if (StrEq(GCommandBuffer, "fs write")) {
+            PushLog("FS WRITE USAGE FS WRITE PATH TEXT");
+        } else {
+            RunFsWrite(GCommandBuffer + 9);
+        }
+    } else if (StrEq(GCommandBuffer, "fs read") || StartsWith(GCommandBuffer, "fs read ")) {
+        if (StrEq(GCommandBuffer, "fs read")) {
+            PushLog("FS READ USAGE FS READ PATH");
+        } else {
+            RunFsRead(GCommandBuffer + 8);
+        }
+    } else if (StrEq(GCommandBuffer, "fs ls") || StartsWith(GCommandBuffer, "fs ls ")) {
+        if (StrEq(GCommandBuffer, "fs ls")) {
+            RunFsList(nullptr);
+        } else {
+            RunFsList(GCommandBuffer + 6);
+        }
+    } else if (StrEq(GCommandBuffer, "keylat") || StrEq(GCommandBuffer, "keylat status")) {
+        PushLog(GKeyLatencyLogEnabled ? "KEYLAT ON" : "KEYLAT OFF");
+    } else if (StrEq(GCommandBuffer, "keylat on")) {
+        GKeyLatencyLogEnabled = true;
+        PushLog("KEYLAT ON");
+    } else if (StrEq(GCommandBuffer, "keylat off")) {
+        GKeyLatencyLogEnabled = false;
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+        GPendingDisplayLatencySample = false;
+        GPendingDisplayLatencyExecuteTick = 0ull;
+#endif
+        PushLog("KEYLAT OFF");
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+    } else if (StrEq(GCommandBuffer, "kbdfont") || StrEq(GCommandBuffer, "kbdfont status")) {
+        RunKeyboardFontQuery();
+    } else if (StrEq(GCommandBuffer, "kbdfont classic") || StrEq(GCommandBuffer, "kbdfont clasic")) {
+        RunKeyboardFontSelect("classic");
+    } else if (StrEq(GCommandBuffer, "kbdfont dense") || StrEq(GCommandBuffer, "kbdfont bold")) {
+        RunKeyboardFontSelect("dense");
+    } else if (StrEq(GCommandBuffer, "kbdfont preview") || StrEq(GCommandBuffer, "kbdfont demo")) {
+        RunKeyboardFontSelect("preview");
+#endif
 
     // UI/input families.
     } else if (TryProcessCursorCommand()) {
@@ -11055,11 +11650,22 @@ static void ProcessCommand() {
         PushLog("UNKNOWN COMMAND");
     }
 
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+    if (GKeyLatencyLogEnabled && hadCommandText) {
+        GPendingDisplayLatencyExecuteTick = ReadSchedulerTickCount();
+        GPendingDisplayLatencySample = true;
+    }
+#endif
+
     ResetCommandInputBuffer();
 }
 
 static void TickBackgroundCommands() {
     if (!GXhciIntrinLoopBackgroundEnabled || GXhciIntrinLoopBackgroundRunning) {
+        return;
+    }
+
+    if (GXhciIntrinBackgroundSuspendedForLatency) {
         return;
     }
 
@@ -11082,20 +11688,71 @@ static void TickBackgroundCommands() {
         return;
     }
 
+    if (GXhciIntrinBackgroundPauseTicks > 0u) {
+        GXhciIntrinBackgroundPauseTicks--;
+        return;
+    }
+
     if (GXhciIntrinInputActivityCooldownTicks > 0u) {
         GXhciIntrinInputActivityCooldownTicks--;
         return;
     }
 
+    uint32_t adaptiveDivider = GXhciIntrinLoopBackgroundTickDivider;
+    if (GTerminalModeEnabled || GTerminalWindowEnabled || GCommandLength > 0u) {
+        if (adaptiveDivider < 120u) {
+            adaptiveDivider = 120u;
+        }
+    }
+
+    if (static_cast<uint8_t>(adaptiveDivider) != GXhciIntrinBackgroundLastAdaptiveDivider) {
+        GXhciIntrinBackgroundLastAdaptiveDivider = static_cast<uint8_t>(adaptiveDivider);
+        char line[96] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "XHCI BG DIV ");
+        AppendUInt(line, sizeof(line), pos, adaptiveDivider);
+        AppendString(line, sizeof(line), pos, " TERM ");
+        AppendUInt(line, sizeof(line), pos, (GTerminalModeEnabled || GTerminalWindowEnabled) ? 1u : 0u);
+        PushLog(line);
+    }
+
     GXhciIntrinLoopBackgroundTickCounter++;
-    if (GXhciIntrinLoopBackgroundTickCounter < GXhciIntrinLoopBackgroundTickDivider) {
+    if (GXhciIntrinLoopBackgroundTickCounter < adaptiveDivider) {
         return;
     }
     GXhciIntrinLoopBackgroundTickCounter = 0u;
 
     GXhciIntrinLoopBackgroundRunning = true;
-    RunXhciInterruptIn(false, 20000ull, true);
+    const uint64_t bgStartTsc = ReadCpuTsc();
+    RunXhciInterruptIn(false, 200ull, true);
+    const uint64_t bgEndTsc = ReadCpuTsc();
     GXhciIntrinLoopBackgroundRunning = false;
+
+    const uint64_t bgCycles = bgEndTsc - bgStartTsc;
+    if (bgCycles > 120000000ull) {
+        GXhciIntrinBackgroundSlowPollCount++;
+        // Back off aggressive background probing after a slow pass to protect interactive latency.
+        GXhciIntrinBackgroundPauseTicks = 180u;
+        if (GXhciIntrinInputActivityCooldownTicks < 60u) {
+            GXhciIntrinInputActivityCooldownTicks = 60u;
+        }
+        if (GXhciIntrinBackgroundSlowPollCount <= 4ull || (GXhciIntrinBackgroundSlowPollCount % 16ull) == 0ull) {
+            char line[128] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "XHCI BG SLOW CYC ");
+            AppendUInt(line, sizeof(line), pos, bgCycles);
+            AppendString(line, sizeof(line), pos, " N ");
+            AppendUInt(line, sizeof(line), pos, GXhciIntrinBackgroundSlowPollCount);
+            AppendString(line, sizeof(line), pos, " PAUSE ");
+            AppendUInt(line, sizeof(line), pos, GXhciIntrinBackgroundPauseTicks);
+            PushLog(line);
+        }
+
+        if (bgCycles > 1000000000ull || GXhciIntrinBackgroundSlowPollCount >= 3ull) {
+            GXhciIntrinBackgroundSuspendedForLatency = true;
+            PushLog("XHCI BG AUTO-SUSPEND LATENCY");
+        }
+    }
 }
 
 void FKernelCommandConsole::Initialize() {
@@ -11107,9 +11764,9 @@ void FKernelCommandConsole::Initialize() {
     GLogCount = 0;
     GBootLogCount = 0;
     GBootLogFrozen = false;
-    GHudLogViewMode = FKernelCommandConsole::EHudLogViewMode::Hidden;
+    GHudLogViewMode = FKernelCommandConsole::EHudLogViewMode::ShowLog;
     GHudLogDetailMode = FKernelCommandConsole::EHudLogDetailMode::Tail;
-    GTerminalModeEnabled = false;
+    GTerminalModeEnabled = true;
     GTerminalWindowEnabled = false;
     GTerminalWindowSurfaceId = Fortress::Kernel::DesktopInvalidSurfaceId;
     GTerminalFocusRetryTicks = 0u;
@@ -11161,6 +11818,16 @@ void FKernelCommandConsole::Initialize() {
     GCursorInvertX = false;
     GCursorInvertY = false;
     GCursorSensitivityPercent = 100;
+    GKeyLatencyLogEnabled = true;
+    GPendingCommandFirstKeyTsc = 0ull;
+    GPendingCommandLastKeyTsc = 0ull;
+    GPendingCommandKeyCount = 0u;
+    GPendingCommandFirstKeyTick = 0ull;
+    GPendingCommandLastKeyTick = 0ull;
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+    GPendingDisplayLatencySample = false;
+    GPendingDisplayLatencyExecuteTick = 0ull;
+#endif
     GCursorLatencyMode = ECursorLatencyMode::Smooth;
     GHidButtonsDownMask = 0;
     GHidButtonPressEdgesMask = 0;
@@ -11193,9 +11860,10 @@ void FKernelCommandConsole::Initialize() {
     }
     GXhciIntrinLoopBackgroundEnabled = true;
     GXhciIntrinLoopBackgroundRunning = false;
-    GXhciIntrinLoopBackgroundTickDivider = 6u;
+    GXhciIntrinLoopBackgroundTickDivider = 48u;
     GXhciIntrinLoopBackgroundTickCounter = 0u;
-    GXhciIntrinInputActivityCooldownTicks = 0u;
+    // Give the shell a boot grace period before background USB interrupt probing begins.
+    GXhciIntrinInputActivityCooldownTicks = 360u;
     GXhciIntrinBackgroundAutoPausedForApDrain = false;
     GXhciIntrinBackgroundHaveLastReport = false;
     GXhciIntrinBackgroundLastReportLength = 0u;
@@ -11204,12 +11872,26 @@ void FKernelCommandConsole::Initialize() {
     GXhciIntrinBackgroundActiveEndpointKind = 0u;
     GXhciIntrinBackgroundLastCompletionCode = 0u;
     GXhciIntrinBackgroundNoTransferStreak = 0u;
+    GXhciIntrinBackgroundSlowPollCount = 0ull;
+    GXhciIntrinBackgroundLastAdaptiveDivider = 0u;
+    GXhciIntrinBackgroundPauseTicks = 0u;
+    GXhciIntrinBackgroundSuspendedForLatency = false;
     GNextVmallocVirtual = Fortress::Kernel::FKernelConfig::VmallocBase;
 #if defined(FORTRESS_PARALLEL_PROBE_AUTORUN)
     GParallelProbeAutorunCommandIndex = 0u;
     GParallelProbeAutorunCooldownTicks = GParallelProbeAutorunInitialDelayTicks;
 #endif
     GParallelProbeApDrainNoExecStreak = 0u;
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+    PushLog("EXP DISPLAY_LATENCY ON");
+#else
+    PushLog("EXP DISPLAY_LATENCY OFF");
+#endif
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+    PushLog("EXP KBD_FONT_PROFILE ON");
+#else
+    PushLog("EXP KBD_FONT_PROFILE OFF");
+#endif
     PushLog("TYPE HELP FOR COMMANDS");
 }
 
@@ -11222,12 +11904,34 @@ void FKernelCommandConsole::PollInput() {
             continue;
         }
 
-        // Briefly prioritize command responsiveness without starving pointer polling.
-        GXhciIntrinInputActivityCooldownTicks = 3u;
+        // Prioritize command responsiveness while user is actively typing.
+        GXhciIntrinInputActivityCooldownTicks = 24u;
+        if (GXhciIntrinBackgroundPauseTicks < 90u) {
+            GXhciIntrinBackgroundPauseTicks = 90u;
+        }
 
         PublishInputKeyPressedEvent(event.Ascii, static_cast<Fortress::Core::uint32>(GCommandLength));
 
+        if (event.Ascii != '\n') {
+            const uint64_t nowTsc = ReadCpuTsc();
+            const uint64_t nowTick = ReadSchedulerTickCount();
+            if (GPendingCommandFirstKeyTsc == 0ull) {
+                GPendingCommandFirstKeyTsc = nowTsc;
+                GPendingCommandFirstKeyTick = nowTick;
+                GPendingCommandKeyCount = 0u;
+            }
+            GPendingCommandLastKeyTsc = nowTsc;
+            GPendingCommandLastKeyTick = nowTick;
+            GPendingCommandKeyCount++;
+        }
+
         if (event.Ascii == '\n') {
+            if (GXhciIntrinInputActivityCooldownTicks < 72u) {
+                GXhciIntrinInputActivityCooldownTicks = 72u;
+            }
+            if (GXhciIntrinBackgroundPauseTicks < 120u) {
+                GXhciIntrinBackgroundPauseTicks = 120u;
+            }
             if (GCommandLength == 0) {
                 // Temporary fallback for HID NOXFER cases: allow Enter to trigger a left-click edge.
                 GHidButtonPressEdgesMask |= 0x1u;
@@ -11338,6 +12042,28 @@ bool FKernelCommandConsole::IsPaused() {
 void FKernelCommandConsole::OpenTerminalWindow() {
     SetTerminalWindowOn();
 }
+
+#if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
+void FKernelCommandConsole::NotifyHudPresented() {
+    if (!GKeyLatencyLogEnabled || !GPendingDisplayLatencySample || GPendingDisplayLatencyExecuteTick == 0ull) {
+        return;
+    }
+
+    const uint64_t presentTick = ReadSchedulerTickCount();
+    const uint64_t displayTicks = presentTick - GPendingDisplayLatencyExecuteTick;
+    GPendingDisplayLatencySample = false;
+    GPendingDisplayLatencyExecuteTick = 0ull;
+
+    char line[96] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "DISPLAT TICK ");
+    AppendUInt(line, sizeof(line), pos, displayTicks);
+    PushLog(line);
+}
+#else
+void FKernelCommandConsole::NotifyHudPresented() {
+}
+#endif
 
 const char *FKernelCommandConsole::GetCommandBuffer() {
     return GCommandBuffer;

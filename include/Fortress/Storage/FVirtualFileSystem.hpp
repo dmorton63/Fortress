@@ -44,6 +44,7 @@ class FVirtualFileSystem {
                           const void *inBuffer,
                           Fortress::Core::uint32 inBufferBytes,
                           Fortress::Core::uint32 &outWrittenBytes);
+    static bool DeleteFile(const char *absolutePath);
     static void GetMounts(FVirtualFileSystemMountSnapshot *outMounts,
                           Fortress::Core::uint32 capacity,
                           Fortress::Core::uint32 &outCount);

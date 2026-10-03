@@ -2,6 +2,10 @@
 
 namespace Fortress::Video {
 
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+static EKeyboardFontProfile GGlobalKeyboardFontProfile = EKeyboardFontProfile::Classic;
+#endif
+
 static const Fortress::Core::uint8 *GetGlyphRows(char Character) {
     static const Fortress::Core::uint8 GSpace[7] = {0, 0, 0, 0, 0, 0, 0};
     static const Fortress::Core::uint8 GUnknown[7] = {0b11111, 0b00001, 0b00110, 0b00100, 0b00000, 0b00100, 0b00100};
@@ -97,26 +101,9 @@ static const Fortress::Core::uint8 *GetGlyphRows(char Character) {
     }
 }
 
-bool FFontManager::Initialize() {
-    ResetCache();
-    return true;
-}
-
-bool FFontManager::TryGetGlyphRaster(char Character, FFontGlyphRaster &OutGlyph) const {
-    for (Fortress::Core::uint32 Index = 0; Index < CacheCapacity; Index++) {
-        const FGlyphCacheEntry &entry = GCacheEntries[Index];
-        if (!entry.Valid || entry.Character != Character) {
-            continue;
-        }
-
-        OutGlyph = entry.Glyph;
-        GCacheHitCount++;
-        return true;
-    }
-
+static bool BuildClassicGlyph(char Character, FFontGlyphRaster &OutGlyph) {
     const Fortress::Core::uint8 *Rows = GetGlyphRows(Character);
     if (Rows == nullptr) {
-        GCacheMissCount++;
         return false;
     }
 
@@ -125,6 +112,88 @@ bool FFontManager::TryGetGlyphRaster(char Character, FFontGlyphRaster &OutGlyph)
     OutGlyph.Height = 7u;
     for (Fortress::Core::uint32 Index = 0; Index < OutGlyph.Height; Index++) {
         OutGlyph.Rows[Index] = Rows[Index];
+    }
+
+    return true;
+}
+
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+static const char *GetProfileName(EKeyboardFontProfile profile) {
+    switch (profile) {
+    case EKeyboardFontProfile::Dense:
+        return "DENSE";
+    case EKeyboardFontProfile::Classic:
+    default:
+        return "CLASSIC";
+    }
+}
+
+static bool BuildDenseGlyph(char Character, FFontGlyphRaster &OutGlyph) {
+    FFontGlyphRaster BaseGlyph{};
+    if (!BuildClassicGlyph(Character, BaseGlyph)) {
+        return false;
+    }
+
+    OutGlyph = BaseGlyph;
+    OutGlyph.Width = 6u;
+    for (Fortress::Core::uint32 RowIndex = 0u; RowIndex < OutGlyph.Height; RowIndex++) {
+        const Fortress::Core::uint8 BaseRow = static_cast<Fortress::Core::uint8>(BaseGlyph.Rows[RowIndex] & 0x1Fu);
+        Fortress::Core::uint8 Expanded = static_cast<Fortress::Core::uint8>((BaseRow << 1u) | (BaseRow >> 4u));
+        Expanded = static_cast<Fortress::Core::uint8>((Expanded | (Expanded >> 1u)) & 0x3Fu);
+        OutGlyph.Rows[RowIndex] = Expanded;
+    }
+
+    return true;
+}
+
+static bool BuildProfileGlyph(EKeyboardFontProfile profile, char Character, FFontGlyphRaster &OutGlyph) {
+    switch (profile) {
+    case EKeyboardFontProfile::Dense:
+        return BuildDenseGlyph(Character, OutGlyph);
+    case EKeyboardFontProfile::Classic:
+    default:
+        return BuildClassicGlyph(Character, OutGlyph);
+    }
+}
+#endif
+
+bool FFontManager::Initialize() {
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+    GProfile = GGlobalKeyboardFontProfile;
+#endif
+    ResetCache();
+    return true;
+}
+
+bool FFontManager::TryGetGlyphRaster(char Character, FFontGlyphRaster &OutGlyph) const {
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+    if (GProfile != GGlobalKeyboardFontProfile) {
+        GProfile = GGlobalKeyboardFontProfile;
+        const_cast<FFontManager *>(this)->ResetCache();
+    }
+#endif
+    for (Fortress::Core::uint32 Index = 0; Index < CacheCapacity; Index++) {
+        const FGlyphCacheEntry &entry = GCacheEntries[Index];
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+        if (!entry.Valid || entry.Character != Character || entry.Profile != GProfile) {
+#else
+        if (!entry.Valid || entry.Character != Character) {
+#endif
+            continue;
+        }
+
+        OutGlyph = entry.Glyph;
+        GCacheHitCount++;
+        return true;
+    }
+
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+    if (!BuildProfileGlyph(GProfile, Character, OutGlyph)) {
+#else
+    if (!BuildClassicGlyph(Character, OutGlyph)) {
+#endif
+        GCacheMissCount++;
+        return false;
     }
 
     GCacheMissCount++;
@@ -148,6 +217,9 @@ bool FFontManager::TryGetGlyphRaster(char Character, FFontGlyphRaster &OutGlyph)
     GCacheEntries[insertIndex] = FGlyphCacheEntry{
         .Valid = true,
         .Character = Character,
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+        .Profile = GProfile,
+#endif
         .Glyph = OutGlyph,
     };
 
@@ -157,6 +229,35 @@ bool FFontManager::TryGetGlyphRaster(char Character, FFontGlyphRaster &OutGlyph)
 
     return true;
 }
+
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+bool FFontManager::SetKeyboardFontProfile(EKeyboardFontProfile profile) {
+    if (GGlobalKeyboardFontProfile == profile && GProfile == profile) {
+        return false;
+    }
+
+    GGlobalKeyboardFontProfile = profile;
+    GProfile = profile;
+    ResetCache();
+    return true;
+}
+
+const char *FFontManager::GetKeyboardFontProfileName() const {
+    return GetProfileName(GProfile);
+}
+
+void FFontManager::SetGlobalKeyboardFontProfile(EKeyboardFontProfile profile) {
+    GGlobalKeyboardFontProfile = profile;
+}
+
+EKeyboardFontProfile FFontManager::GetGlobalKeyboardFontProfile() {
+    return GGlobalKeyboardFontProfile;
+}
+
+const char *FFontManager::GetGlobalKeyboardFontProfileName() {
+    return GetProfileName(GGlobalKeyboardFontProfile);
+}
+#endif
 
 void FFontManager::GetCacheStats(FFontCacheStats &OutStats) const {
     OutStats = FFontCacheStats{

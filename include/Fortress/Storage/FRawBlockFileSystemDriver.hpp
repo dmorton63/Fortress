@@ -20,6 +20,7 @@ class FRawBlockFileSystemDriver final : public IFileSystemDriver {
                    const void *inBuffer,
                    Fortress::Core::uint32 inBufferBytes,
                    Fortress::Core::uint32 &outWrittenBytes) override;
+    bool DeleteFile(IBlockDevice &device, const char *relativePath) override;
 
     Fortress::Core::uint32 GetBoundBlockSizeBytes() const;
     Fortress::Core::uint64 GetBoundBlockCount() const;

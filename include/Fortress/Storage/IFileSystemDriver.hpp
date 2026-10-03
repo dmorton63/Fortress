@@ -21,6 +21,7 @@ class IFileSystemDriver {
                            const void *inBuffer,
                            Fortress::Core::uint32 inBufferBytes,
                            Fortress::Core::uint32 &outWrittenBytes) = 0;
+    virtual bool DeleteFile(IBlockDevice &device, const char *relativePath) = 0;
 
   protected:
     ~IFileSystemDriver() = default;

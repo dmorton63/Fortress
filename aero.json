@@ -1,124 +1,192 @@
 {
   "schema": "fortress.aero.theme",
-  "schemaVersion": 3,
-  "generatedAt": "2026-10-02T07:10:00.000Z",
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-02T15:39:45.880Z",
   "theme": {
-    "name": "Aero Blue",
+    "name": "Aero Red",
     "author": "Fortress Team"
   },
   "desktop": {
-    "backgroundTop": "#4c9bff",
-    "backgroundBottom": "#0e2b66",
-    "panelSurface": "#1c3f7f",
-    "panelText": "#f4f8ff",
-    "selectionActive": "#2d7be8",
-    "selectionInactive": "#5f7fae"
-  },
-  "chrome": {
-    "titleActive": {
-      "top": "#6fb0ff",
-      "bottom": "#2a5fae",
-      "text": "#f7fbff"
-    },
-    "titleInactive": {
-      "top": "#8aa2bf",
-      "bottom": "#5b6f88",
-      "text": "#d8e2ef"
-    },
-    "borderLight": "#cfe2ff",
-    "borderDark": "#20406f",
-    "windowShadow": "#000000",
-    "windowShadowOpacityPercent": 26
+    "backgroundTop": "#ff4d4d",
+    "backgroundBottom": "#670e0e",
+    "panelSurface": "#7d1c1c",
+    "panelText": "#ffffff"
   },
   "controls": {
+    "defaultState": "normal",
     "states": {
       "normal": {
-        "bodyTop": "#61a6ff",
-        "bodyBottom": "#1e5eb7",
-        "text": "#f7fbff",
-        "border": "#b8d4ff"
+        "glassLayers": {
+          "bodyGradient": {
+            "top": "#ff6161",
+            "bottom": "#b81e1e"
+          },
+          "innerTopGlow": {
+            "color": "#ffffff",
+            "opacityPercent": 56,
+            "coveragePercent": 34
+          },
+          "gloss": {
+            "color": "#ffffff",
+            "opacityPercent": 34,
+            "coveragePercent": 52
+          },
+          "bevelHighlight": {
+            "color": "#ffffff",
+            "opacityPercent": 74,
+            "thicknessPx": 1
+          },
+          "bevelShadow": {
+            "color": "#6e0d0d",
+            "opacityPercent": 80,
+            "thicknessPx": 1
+          },
+          "innerShadow": {
+            "enabled": true,
+            "color": "#651010",
+            "opacityPercent": 58,
+            "sizePx": 7
+          },
+          "backgroundTint": {
+            "enabled": true,
+            "color": "#ffbdbd",
+            "opacityPercent": 18,
+            "coveragePercent": 62
+          }
+        },
+        "text": "#000000",
+        "focusRing": "#f7ce46",
+        "disabled": false
       },
       "hover": {
-        "bodyTop": "#7ab5ff",
-        "bodyBottom": "#2f74d1",
-        "text": "#ffffff",
-        "border": "#d2e4ff"
+        "glassLayers": {
+          "bodyGradient": {
+            "top": "#ff7474",
+            "bottom": "#be3030"
+          },
+          "innerTopGlow": {
+            "color": "#ffffff",
+            "opacityPercent": 64,
+            "coveragePercent": 34
+          },
+          "gloss": {
+            "color": "#ffffff",
+            "opacityPercent": 41,
+            "coveragePercent": 52
+          },
+          "bevelHighlight": {
+            "color": "#ffffff",
+            "opacityPercent": 80,
+            "thicknessPx": 1
+          },
+          "bevelShadow": {
+            "color": "#6e0d0d",
+            "opacityPercent": 74,
+            "thicknessPx": 1
+          },
+          "innerShadow": {
+            "enabled": true,
+            "color": "#651010",
+            "opacityPercent": 58,
+            "sizePx": 7
+          },
+          "backgroundTint": {
+            "enabled": true,
+            "color": "#ffbdbd",
+            "opacityPercent": 22,
+            "coveragePercent": 62
+          }
+        },
+        "text": "#0a0a0a",
+        "focusRing": "#f7ce46",
+        "disabled": false
       },
-      "pressed": {
-        "bodyTop": "#3b82de",
-        "bodyBottom": "#1f4f9b",
-        "text": "#eef5ff",
-        "border": "#9ebfe8"
+      "active": {
+        "glassLayers": {
+          "bodyGradient": {
+            "top": "#de5454",
+            "bottom": "#9b1919"
+          },
+          "innerTopGlow": {
+            "color": "#ffffff",
+            "opacityPercent": 40,
+            "coveragePercent": 34
+          },
+          "gloss": {
+            "color": "#ffffff",
+            "opacityPercent": 22,
+            "coveragePercent": 52
+          },
+          "bevelHighlight": {
+            "color": "#ffffff",
+            "opacityPercent": 59,
+            "thicknessPx": 1
+          },
+          "bevelShadow": {
+            "color": "#6e0d0d",
+            "opacityPercent": 90,
+            "thicknessPx": 1
+          },
+          "innerShadow": {
+            "enabled": true,
+            "color": "#651010",
+            "opacityPercent": 72,
+            "sizePx": 8
+          },
+          "backgroundTint": {
+            "enabled": true,
+            "color": "#ffbdbd",
+            "opacityPercent": 14,
+            "coveragePercent": 62
+          }
+        },
+        "text": "#000000",
+        "focusRing": "#f7ce46",
+        "disabled": false
       },
       "disabled": {
-        "bodyTop": "#7f95b2",
-        "bodyBottom": "#5f7391",
-        "text": "#9fb4d6",
-        "border": "#8ea4c2"
-      },
-      "defaultFocused": {
-        "bodyTop": "#6eaefe",
-        "bodyBottom": "#2a6cc5",
-        "text": "#ffffff",
-        "border": "#f7ce46"
+        "glassLayers": {
+          "bodyGradient": {
+            "top": "#eaadb3",
+            "bottom": "#b97d86"
+          },
+          "innerTopGlow": {
+            "color": "#ffffff",
+            "opacityPercent": 28,
+            "coveragePercent": 34
+          },
+          "gloss": {
+            "color": "#ffffff",
+            "opacityPercent": 15,
+            "coveragePercent": 52
+          },
+          "bevelHighlight": {
+            "color": "#ffffff",
+            "opacityPercent": 41,
+            "thicknessPx": 1
+          },
+          "bevelShadow": {
+            "color": "#6e0d0d",
+            "opacityPercent": 40,
+            "thicknessPx": 1
+          },
+          "innerShadow": {
+            "enabled": true,
+            "color": "#651010",
+            "opacityPercent": 24,
+            "sizePx": 7
+          },
+          "backgroundTint": {
+            "enabled": true,
+            "color": "#ffdbdb",
+            "opacityPercent": 6,
+            "coveragePercent": 62
+          }
+        },
+        "text": "#5b6067",
+        "focusRing": "#f7ce46",
+        "disabled": true
       }
-    },
-    "glassLayers": {
-      "innerTopGlow": {
-        "color": "#ffffff",
-        "opacityPercent": 56,
-        "coveragePercent": 34
-      },
-      "gloss": {
-        "color": "#ffffff",
-        "opacityPercent": 34,
-        "coveragePercent": 52
-      },
-      "specularSweep": {
-        "color": "#ffffff",
-        "opacityPercent": 42,
-        "coveragePercent": 44
-      },
-      "bevelHighlight": {
-        "color": "#ffffff",
-        "opacityPercent": 74,
-        "thicknessPx": 1
-      },
-      "bevelShadow": {
-        "color": "#0d2f6d",
-        "opacityPercent": 80,
-        "thicknessPx": 1
-      },
-      "innerShadow": {
-        "enabled": true,
-        "color": "#102f66",
-        "opacityPercent": 58,
-        "sizePx": 7
-      },
-      "backgroundTint": {
-        "enabled": true,
-        "color": "#bcd8ff",
-        "opacityPercent": 18,
-        "coveragePercent": 62
-      }
-    },
-    "focusRing": "#f7ce46"
-  },
-  "surfaces": {
-    "taskbar": {
-      "top": "#2f5f9e",
-      "bottom": "#153765",
-      "text": "#f1f7ff"
-    },
-    "menu": {
-      "surface": "#2a4d7f",
-      "border": "#9fc2ee",
-      "text": "#f3f8ff"
-    },
-    "tooltip": {
-      "surface": "#23456f",
-      "border": "#9bbce7",
-      "text": "#f4f8ff"
     }
   }
 }

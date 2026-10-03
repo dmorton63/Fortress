@@ -63,6 +63,16 @@ void FVideoConsole::PrintLine(const FVideoSurfaceView &surface, const char *text
     CursorY += LineAdvance;
 }
 
+#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
+bool FVideoConsole::SetKeyboardFontProfile(EKeyboardFontProfile profile) {
+    return FontManager.SetKeyboardFontProfile(profile);
+}
+
+const char *FVideoConsole::GetKeyboardFontProfileName() const {
+    return FontManager.GetKeyboardFontProfileName();
+}
+#endif
+
 void FVideoConsole::GetFontCacheStats(FFontCacheStats &OutStats) const {
     FontManager.GetCacheStats(OutStats);
 }

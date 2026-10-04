@@ -36,6 +36,20 @@ static void DrawFilledRect(const Fortress::Video::FVideoSurfaceView &surface,
     }
 }
 
+static void DrawFilledRectAlpha(const Fortress::Video::FVideoSurfaceView &surface,
+                                Fortress::Core::int32 x,
+                                Fortress::Core::int32 y,
+                                Fortress::Core::int32 width,
+                                Fortress::Core::int32 height,
+                                Fortress::Video::FColor color) {
+    if (!surface.IsValid() || width <= 0 || height <= 0 ||
+        surface.Desc.PixelFormat != Fortress::Video::EPixelFormat::Masked32) {
+        return;
+    }
+
+    Fortress::Video::FVideoSurfaceOps::FillRectAlpha32(surface, x, y, width, height, color);
+}
+
 static void DrawRectFrame(const Fortress::Video::FVideoSurfaceView &surface,
                           const FDesktopRect &rect,
                           Fortress::Video::FColor color) {
@@ -504,22 +518,57 @@ void FDesktopSurfaceContentHost::RenderSurfaceContent(const Fortress::Video::FVi
                            globalRect.Y,
                            globalRect.Width,
                            globalRect.Height,
-                           Fortress::Video::FColor::RGB(22, 32, 46));
+                           Fortress::Video::FColor::RGB(40, 48, 62));
+            DrawFilledRectAlpha(surface,
+                                globalRect.X + 1,
+                                globalRect.Y + 1,
+                                globalRect.Width - 2,
+                                globalRect.Height / 3,
+                                Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 18u});
             DrawRectFrame(surface, globalRect, Fortress::Video::FColor::RGB(95, 130, 180));
         } else {
             const Fortress::Video::FColor fillColor = control.Pressed
-                                                          ? Fortress::Video::FColor::RGB(70, 120, 86)
-                                                          : Fortress::Video::FColor::RGB(34, 64, 42);
+                                                          ? Fortress::Video::FColor::RGB(58, 82, 104)
+                                                          : Fortress::Video::FColor::RGB(70, 92, 116);
             DrawFilledRect(surface,
                            globalRect.X,
                            globalRect.Y,
                            globalRect.Width,
                            globalRect.Height,
                            fillColor);
+
+            const Fortress::Video::FColor overlayColor = control.Pressed
+                                                              ? Fortress::Video::FColor{.R = 0u, .G = 0u, .B = 0u, .A = 34u}
+                                                              : Fortress::Video::FColor{.R = 255u, .G = 255u, .B = 255u, .A = 24u};
+            DrawFilledRectAlpha(surface,
+                                globalRect.X + 1,
+                                globalRect.Y + 1,
+                                globalRect.Width - 2,
+                                globalRect.Height / 2,
+                                overlayColor);
+
+            if (control.Focused && surfaceFocused) {
+                DrawFilledRectAlpha(surface,
+                                    globalRect.X - 2,
+                                    globalRect.Y - 2,
+                                    globalRect.Width + 4,
+                                    globalRect.Height + 4,
+                                    Fortress::Video::FColor{.R = 78u, .G = 160u, .B = 255u, .A = 56u});
+            }
+
             const Fortress::Video::FColor frameColor = (control.Focused && surfaceFocused)
-                                                           ? Fortress::Video::FColor::RGB(255, 232, 130)
-                                                           : Fortress::Video::FColor::RGB(120, 188, 140);
+                                                           ? Fortress::Video::FColor::RGB(172, 218, 255)
+                                                           : Fortress::Video::FColor::RGB(120, 156, 194);
             DrawRectFrame(surface, globalRect, frameColor);
+
+            if (globalRect.Height > 4) {
+                DrawFilledRectAlpha(surface,
+                                    globalRect.X + 1,
+                                    globalRect.Y + globalRect.Height - 2,
+                                    globalRect.Width - 2,
+                                    1,
+                                    Fortress::Video::FColor{.R = 0u, .G = 0u, .B = 0u, .A = 54u});
+            }
 
             if (control.ControlId == GDesktopTerminalLauncherButtonId && globalRect.Width >= 44 && globalRect.Height >= 14) {
                 // Draw a small CMD-style glyph to make launcher intent obvious.

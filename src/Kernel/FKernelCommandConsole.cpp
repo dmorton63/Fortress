@@ -11764,9 +11764,9 @@ void FKernelCommandConsole::Initialize() {
     GLogCount = 0;
     GBootLogCount = 0;
     GBootLogFrozen = false;
-    GHudLogViewMode = FKernelCommandConsole::EHudLogViewMode::ShowLog;
+    GHudLogViewMode = FKernelCommandConsole::EHudLogViewMode::Hidden;
     GHudLogDetailMode = FKernelCommandConsole::EHudLogDetailMode::Tail;
-    GTerminalModeEnabled = true;
+    GTerminalModeEnabled = false;
     GTerminalWindowEnabled = false;
     GTerminalWindowSurfaceId = Fortress::Kernel::DesktopInvalidSurfaceId;
     GTerminalFocusRetryTicks = 0u;

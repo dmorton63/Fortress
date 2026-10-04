@@ -1,16 +1,16 @@
 {
   "schema": "fortress.aero.theme",
   "schemaVersion": 2,
-  "generatedAt": "2026-10-02T15:39:45.880Z",
+  "generatedAt": "2026-10-03T20:42:28.678Z",
   "theme": {
-    "name": "Aero Red",
+    "name": "Aero Blue",
     "author": "Fortress Team"
   },
   "desktop": {
-    "backgroundTop": "#ff4d4d",
-    "backgroundBottom": "#670e0e",
-    "panelSurface": "#7d1c1c",
-    "panelText": "#ffffff"
+    "backgroundTop": "#4c9bff",
+    "backgroundBottom": "#0e2b66",
+    "panelSurface": "#1c3f7f",
+    "panelText": "#f4f8ff"
   },
   "controls": {
     "defaultState": "normal",
@@ -18,8 +18,8 @@
       "normal": {
         "glassLayers": {
           "bodyGradient": {
-            "top": "#ff6161",
-            "bottom": "#b81e1e"
+            "top": "#61a6ff",
+            "bottom": "#1e5eb7"
           },
           "innerTopGlow": {
             "color": "#ffffff",
@@ -37,32 +37,32 @@
             "thicknessPx": 1
           },
           "bevelShadow": {
-            "color": "#6e0d0d",
+            "color": "#0d2f6d",
             "opacityPercent": 80,
             "thicknessPx": 1
           },
           "innerShadow": {
             "enabled": true,
-            "color": "#651010",
+            "color": "#102f66",
             "opacityPercent": 58,
             "sizePx": 7
           },
           "backgroundTint": {
             "enabled": true,
-            "color": "#ffbdbd",
+            "color": "#bcd8ff",
             "opacityPercent": 18,
             "coveragePercent": 62
           }
         },
-        "text": "#000000",
+        "text": "#f7fbff",
         "focusRing": "#f7ce46",
         "disabled": false
       },
       "hover": {
         "glassLayers": {
           "bodyGradient": {
-            "top": "#ff7474",
-            "bottom": "#be3030"
+            "top": "#74b1ff",
+            "bottom": "#306bbd"
           },
           "innerTopGlow": {
             "color": "#ffffff",
@@ -80,32 +80,32 @@
             "thicknessPx": 1
           },
           "bevelShadow": {
-            "color": "#6e0d0d",
+            "color": "#0d2f6d",
             "opacityPercent": 74,
             "thicknessPx": 1
           },
           "innerShadow": {
             "enabled": true,
-            "color": "#651010",
+            "color": "#102f66",
             "opacityPercent": 58,
             "sizePx": 7
           },
           "backgroundTint": {
             "enabled": true,
-            "color": "#ffbdbd",
+            "color": "#bcd8ff",
             "opacityPercent": 22,
             "coveragePercent": 62
           }
         },
-        "text": "#0a0a0a",
+        "text": "#f7fbff",
         "focusRing": "#f7ce46",
         "disabled": false
       },
       "active": {
         "glassLayers": {
           "bodyGradient": {
-            "top": "#de5454",
-            "bottom": "#9b1919"
+            "top": "#5490de",
+            "bottom": "#194f9a"
           },
           "innerTopGlow": {
             "color": "#ffffff",
@@ -123,32 +123,32 @@
             "thicknessPx": 1
           },
           "bevelShadow": {
-            "color": "#6e0d0d",
+            "color": "#0d2f6d",
             "opacityPercent": 90,
             "thicknessPx": 1
           },
           "innerShadow": {
             "enabled": true,
-            "color": "#651010",
+            "color": "#102f66",
             "opacityPercent": 72,
             "sizePx": 8
           },
           "backgroundTint": {
             "enabled": true,
-            "color": "#ffbdbd",
+            "color": "#bcd8ff",
             "opacityPercent": 14,
             "coveragePercent": 62
           }
         },
-        "text": "#000000",
+        "text": "#f0f3f7",
         "focusRing": "#f7ce46",
         "disabled": false
       },
       "disabled": {
         "glassLayers": {
           "bodyGradient": {
-            "top": "#eaadb3",
-            "bottom": "#b97d86"
+            "top": "#a8caf6",
+            "bottom": "#7599c9"
           },
           "innerTopGlow": {
             "color": "#ffffff",
@@ -166,24 +166,24 @@
             "thicknessPx": 1
           },
           "bevelShadow": {
-            "color": "#6e0d0d",
+            "color": "#0d2f6d",
             "opacityPercent": 40,
             "thicknessPx": 1
           },
           "innerShadow": {
             "enabled": true,
-            "color": "#651010",
+            "color": "#102f66",
             "opacityPercent": 24,
             "sizePx": 7
           },
           "backgroundTint": {
             "enabled": true,
-            "color": "#ffdbdb",
+            "color": "#daeaff",
             "opacityPercent": 6,
             "coveragePercent": 62
           }
         },
-        "text": "#5b6067",
+        "text": "#9fb4d6",
         "focusRing": "#f7ce46",
         "disabled": true
       }

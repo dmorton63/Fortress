@@ -14,15 +14,15 @@ static constexpr Fortress::Video::FColor Color(unsigned r, unsigned g, unsigned 
     };
 }
 
-static constexpr Fortress::Video::FColor kWindowBackground = Color(103u, 14u, 14u, 255u);
-static constexpr Fortress::Video::FColor kTitleBarGradientStart = Color(255u, 77u, 77u, 255u);
-static constexpr Fortress::Video::FColor kTitleBarGradientEnd = Color(125u, 28u, 28u, 255u);
+static constexpr Fortress::Video::FColor kWindowBackground = Color(14u, 43u, 102u, 255u);
+static constexpr Fortress::Video::FColor kTitleBarGradientStart = Color(76u, 155u, 255u, 255u);
+static constexpr Fortress::Video::FColor kTitleBarGradientEnd = Color(28u, 63u, 127u, 255u);
 static constexpr Fortress::Video::FColor kButtonNormal = Color(255u, 255u, 255u, 51u);
 static constexpr Fortress::Video::FColor kButtonHover = Color(255u, 255u, 255u, 69u);
 static constexpr Fortress::Video::FColor kButtonPressed = Color(255u, 255u, 255u, 102u);
 static constexpr Fortress::Video::FColor kButtonGlow = Color(78u, 160u, 255u, 160u);
-static constexpr Fortress::Video::FColor kTextPrimary = Color(0u, 0u, 0u, 255u);
-static constexpr Fortress::Video::FColor kTextSecondary = Color(255u, 255u, 255u, 255u);
+static constexpr Fortress::Video::FColor kTextPrimary = Color(247u, 251u, 255u, 255u);
+static constexpr Fortress::Video::FColor kTextSecondary = Color(244u, 248u, 255u, 255u);
 static constexpr Fortress::Video::FColor kBorder = Color(46u, 59u, 80u, 255u);
 static constexpr Fortress::Video::FColor kShadow = Color(0u, 0u, 0u, 128u);
 static constexpr Fortress::Video::FColor kAccentPrimary = Color(78u, 160u, 255u, 255u);

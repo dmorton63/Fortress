@@ -12,6 +12,7 @@ FDesktopRuntime *FDesktopRuntime::ActiveInstance = nullptr;
 namespace {
 
 static constexpr Fortress::Core::uint32 GDesktopTerminalLauncherButtonId = 2002u;
+static constexpr bool GDesktopScaffoldSurfacesEnabled = false;
 
 static Fortress::Core::int32 ClampInt32(Fortress::Core::int32 value,
                                         Fortress::Core::int32 minValue,
@@ -112,49 +113,53 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
     Overlay.Bind(&Compositor, &InputRouter, &ContentHost);
     ActiveInstance = this;
 
-    const FDesktopShellComponent hudComponent{
-        .Name = "HudSurface",
-        .OnAttach = &FDesktopRuntime::DesktopHudAttach,
-        .OnTick = &FDesktopRuntime::DesktopHudTick,
-    };
-    if (!Shell.RegisterComponent(hudComponent)) {
-        FKernelCommandConsole::PushSystemLog("DESKTOP INIT FAIL: COMPONENT");
-        return false;
-    }
+    if (GDesktopScaffoldSurfacesEnabled) {
+        const FDesktopShellComponent hudComponent{
+            .Name = "HudSurface",
+            .OnAttach = &FDesktopRuntime::DesktopHudAttach,
+            .OnTick = &FDesktopRuntime::DesktopHudTick,
+        };
+        if (!Shell.RegisterComponent(hudComponent)) {
+            FKernelCommandConsole::PushSystemLog("DESKTOP INIT FAIL: COMPONENT");
+            return false;
+        }
 
-    const FDesktopShellComponent statusComponent{
-        .Name = "StatusSurface",
-        .OnAttach = &FDesktopRuntime::DesktopStatusAttach,
-        .OnTick = &FDesktopRuntime::DesktopStatusTick,
-    };
-    if (!Shell.RegisterComponent(statusComponent)) {
-        FKernelCommandConsole::PushSystemLog("DESKTOP INIT FAIL: COMPONENT2");
-        return false;
+        const FDesktopShellComponent statusComponent{
+            .Name = "StatusSurface",
+            .OnAttach = &FDesktopRuntime::DesktopStatusAttach,
+            .OnTick = &FDesktopRuntime::DesktopStatusTick,
+        };
+        if (!Shell.RegisterComponent(statusComponent)) {
+            FKernelCommandConsole::PushSystemLog("DESKTOP INIT FAIL: COMPONENT2");
+            return false;
+        }
     }
 
     FKernelCommandConsole::BindDesktopCompositor(&Compositor);
     FKernelCommandConsole::BindDesktopInputRouter(&InputRouter);
     FKernelCommandConsole::BindDesktopSurfaceContentHost(&ContentHost);
 
-    if (DesktopHudSurfaceId == 0u) {
-        Fortress::Kernel::FDesktopSurfaceId surfaceId = 0u;
-        if (Compositor.CreateSurface(DesktopInvalidSurfaceId,
-                                     FDesktopRect{.X = 8, .Y = 8, .Width = 360, .Height = 220},
-                                     10u,
-                                     surfaceId)) {
-            DesktopHudSurfaceId = surfaceId;
-            RegisterDefaultSurfaceControls(DesktopHudSurfaceId, false);
+    if (GDesktopScaffoldSurfacesEnabled) {
+        if (DesktopHudSurfaceId == 0u) {
+            Fortress::Kernel::FDesktopSurfaceId surfaceId = 0u;
+            if (Compositor.CreateSurface(DesktopInvalidSurfaceId,
+                                         FDesktopRect{.X = 8, .Y = 8, .Width = 360, .Height = 220},
+                                         10u,
+                                         surfaceId)) {
+                DesktopHudSurfaceId = surfaceId;
+                RegisterDefaultSurfaceControls(DesktopHudSurfaceId, false);
+            }
         }
-    }
 
-    if (DesktopStatusSurfaceId == 0u) {
-        Fortress::Kernel::FDesktopSurfaceId surfaceId = 0u;
-        if (Compositor.CreateSurface(DesktopInvalidSurfaceId,
-                                     FDesktopRect{.X = 420, .Y = 18, .Width = 220, .Height = 120},
-                                     20u,
-                                     surfaceId)) {
-            DesktopStatusSurfaceId = surfaceId;
-            RegisterDefaultSurfaceControls(DesktopStatusSurfaceId, true);
+        if (DesktopStatusSurfaceId == 0u) {
+            Fortress::Kernel::FDesktopSurfaceId surfaceId = 0u;
+            if (Compositor.CreateSurface(DesktopInvalidSurfaceId,
+                                         FDesktopRect{.X = 420, .Y = 18, .Width = 220, .Height = 120},
+                                         20u,
+                                         surfaceId)) {
+                DesktopStatusSurfaceId = surfaceId;
+                RegisterDefaultSurfaceControls(DesktopStatusSurfaceId, true);
+            }
         }
     }
 
@@ -171,11 +176,14 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
         }
     }
 
-    const bool desktopStatusSmokeOk =
-        Compositor.SetSurfaceVisible(DesktopStatusSurfaceId, false) &&
-        Compositor.SetSurfaceVisible(DesktopStatusSurfaceId, true) &&
-        Compositor.MarkSurfaceDamaged(DesktopStatusSurfaceId,
-                                      FDesktopRect{.X = 420, .Y = 18, .Width = 220, .Height = 120});
+    bool desktopStatusSmokeOk = true;
+    if (GDesktopScaffoldSurfacesEnabled && DesktopStatusSurfaceId != 0u) {
+        desktopStatusSmokeOk =
+            Compositor.SetSurfaceVisible(DesktopStatusSurfaceId, false) &&
+            Compositor.SetSurfaceVisible(DesktopStatusSurfaceId, true) &&
+            Compositor.MarkSurfaceDamaged(DesktopStatusSurfaceId,
+                                          FDesktopRect{.X = 420, .Y = 18, .Width = 220, .Height = 120});
+    }
     if (!desktopStatusSmokeOk) {
         FKernelCommandConsole::PushSystemLog("DESKTOP SMOKE WARN: STATUS");
     }
@@ -220,7 +228,9 @@ bool FDesktopRuntime::Initialize(FKernelRuntimeContext &runtime) {
     }
 
     // Ensure one known visible surface exercises fallback repaint in the first profiled frame.
-    Compositor.ClearSurfaceDirty(DesktopHudSurfaceId);
+    if (GDesktopScaffoldSurfacesEnabled && DesktopHudSurfaceId != 0u) {
+        Compositor.ClearSurfaceDirty(DesktopHudSurfaceId);
+    }
     OcclusionProbeCleanupPending = occlusionProbeOk;
 
     FKernelCommandConsole::PushSystemLog("DESKTOP SMOKE PASS");
@@ -299,6 +309,10 @@ void FDesktopRuntime::DesktopStatusTick(FDesktopCompositor &compositor, Fortress
 }
 
 void FDesktopRuntime::OnDesktopHudAttach(FDesktopCompositor &compositor) {
+    if (!GDesktopScaffoldSurfacesEnabled) {
+        return;
+    }
+
     if (DesktopHudSurfaceId != 0u) {
         return;
     }
@@ -314,6 +328,10 @@ void FDesktopRuntime::OnDesktopHudAttach(FDesktopCompositor &compositor) {
 }
 
 void FDesktopRuntime::OnDesktopHudTick(FDesktopCompositor &compositor, Fortress::Core::uint64 tickCount) {
+    if (!GDesktopScaffoldSurfacesEnabled) {
+        return;
+    }
+
     if (DesktopHudSurfaceId == 0u) {
         return;
     }
@@ -325,6 +343,10 @@ void FDesktopRuntime::OnDesktopHudTick(FDesktopCompositor &compositor, Fortress:
 }
 
 void FDesktopRuntime::OnDesktopStatusAttach(FDesktopCompositor &compositor) {
+    if (!GDesktopScaffoldSurfacesEnabled) {
+        return;
+    }
+
     if (DesktopStatusSurfaceId != 0u) {
         return;
     }
@@ -360,6 +382,10 @@ void FDesktopRuntime::RegisterDefaultSurfaceControls(Fortress::Core::uint32 surf
 }
 
 void FDesktopRuntime::OnDesktopStatusTick(FDesktopCompositor &compositor, Fortress::Core::uint64 tickCount) {
+    if (!GDesktopScaffoldSurfacesEnabled) {
+        return;
+    }
+
     if (DesktopStatusSurfaceId == 0u) {
         return;
     }

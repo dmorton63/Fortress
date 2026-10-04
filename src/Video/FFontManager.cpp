@@ -158,20 +158,11 @@ static bool BuildProfileGlyph(EKeyboardFontProfile profile, char Character, FFon
 #endif
 
 bool FFontManager::Initialize() {
-#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
-    GProfile = GGlobalKeyboardFontProfile;
-#endif
     ResetCache();
     return true;
 }
 
 bool FFontManager::TryGetGlyphRaster(char Character, FFontGlyphRaster &OutGlyph) const {
-#if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
-    if (GProfile != GGlobalKeyboardFontProfile) {
-        GProfile = GGlobalKeyboardFontProfile;
-        const_cast<FFontManager *>(this)->ResetCache();
-    }
-#endif
     for (Fortress::Core::uint32 Index = 0; Index < CacheCapacity; Index++) {
         const FGlyphCacheEntry &entry = GCacheEntries[Index];
 #if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)

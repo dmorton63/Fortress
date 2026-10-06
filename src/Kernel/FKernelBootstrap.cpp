@@ -168,6 +168,47 @@ static void AppendUInt(char *dst, size_t dstSize, size_t &offset, uint64_t value
     }
 }
 
+static inline void BootSerialOut8(uint16_t port, uint8_t value) {
+    __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline uint8_t BootSerialIn8(uint16_t port) {
+    uint8_t value = 0u;
+    __asm__ volatile("inb %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
+static void BootSerialInit() {
+    // COM1 @ 115200 8N1
+    BootSerialOut8(0x3F8 + 1, 0x00);
+    BootSerialOut8(0x3F8 + 3, 0x80);
+    BootSerialOut8(0x3F8 + 0, 0x01);
+    BootSerialOut8(0x3F8 + 1, 0x00);
+    BootSerialOut8(0x3F8 + 3, 0x03);
+    BootSerialOut8(0x3F8 + 2, 0xC7);
+    BootSerialOut8(0x3F8 + 4, 0x0B);
+}
+
+static void BootSerialLine(const char *line) {
+    if (line == nullptr) {
+        return;
+    }
+
+    for (size_t i = 0u; line[i] != '\0'; i++) {
+        uint32_t guard = 0u;
+        while ((BootSerialIn8(0x3F8 + 5) & 0x20u) == 0u) {
+            guard++;
+            if (guard > 100000u) {
+                return;
+            }
+        }
+        BootSerialOut8(0x3F8, static_cast<uint8_t>(line[i]));
+    }
+
+    BootSerialOut8(0x3F8, static_cast<uint8_t>('\r'));
+    BootSerialOut8(0x3F8, static_cast<uint8_t>('\n'));
+}
+
 static bool BuffersEqual(const Fortress::Core::uint8 *a,
                          const Fortress::Core::uint8 *b,
                          Fortress::Core::uint32 sizeBytes) {
@@ -324,6 +365,32 @@ static const char *GetPixelFormatName(Fortress::Video::EPixelFormat format) {
     }
 }
 
+static void BootSerialLogModeLine(const char *prefix, const Fortress::Video::FDisplayMode &mode) {
+    char line[128] = {};
+    size_t pos = 0;
+    AppendString(line, sizeof(line), pos, prefix);
+    AppendUInt(line, sizeof(line), pos, mode.Width);
+    AppendChar(line, sizeof(line), pos, 'x');
+    AppendUInt(line, sizeof(line), pos, mode.Height);
+    AppendString(line, sizeof(line), pos, " S ");
+    AppendUInt(line, sizeof(line), pos, mode.StrideBytes);
+    AppendString(line, sizeof(line), pos, " PF ");
+    AppendString(line, sizeof(line), pos, GetPixelFormatName(mode.PixelFormat));
+    BootSerialLine(line);
+}
+
+static void BootSerialCheckModeSnapshot(const char *stage, const Fortress::Video::FDisplayMode &mode) {
+    if (mode.Width == 0u || mode.Height == 0u || mode.StrideBytes == 0u ||
+        mode.PixelFormat == Fortress::Video::EPixelFormat::Unknown) {
+        char line[96] = {};
+        size_t pos = 0;
+        AppendString(line, sizeof(line), pos, "BOOTSTAGE MODE SNAPSHOT CORRUPT ");
+        AppendString(line, sizeof(line), pos, stage);
+        BootSerialLine(line);
+        BootSerialLogModeLine("BOOTSTAGE MODE SNAPSHOT NOW ", mode);
+    }
+}
+
 void FKernelBootstrap::HaltForever() {
     for (;;) {
         __asm__ volatile("hlt");
@@ -353,119 +420,192 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
                                   const limine_hhdm_response *hhdmResponse,
                                   const limine_smp_response *mpResponse,
                                   FKernelRuntimeContext &outContext) {
+    BootSerialInit();
+    BootSerialLine("BOOTSTAGE ENTER");
+
     if (framebufferResponse == nullptr || framebufferResponse->framebuffer_count < 1) {
+        BootSerialLine("BOOTSTAGE FAIL FRAMEBUFFER RESPONSE");
         return false;
     }
 
     if (memmapResponse == nullptr || memmapResponse->entry_count == 0) {
+        BootSerialLine("BOOTSTAGE FAIL MEMMAP RESPONSE");
         return false;
     }
 
     if (hhdmResponse == nullptr) {
+        BootSerialLine("BOOTSTAGE FAIL HHDM RESPONSE");
         return false;
     }
 
     limine_framebuffer *framebuffer = framebufferResponse->framebuffers[0];
     if (framebuffer == nullptr || framebuffer->address == nullptr || framebuffer->bpp != 32) {
+        BootSerialLine("BOOTSTAGE FAIL FRAMEBUFFER MODE");
         return false;
     }
+
+    char framebufferLine[128] = {};
+    size_t framebufferLinePos = 0;
+    AppendString(framebufferLine, sizeof(framebufferLine), framebufferLinePos, "BOOTSTAGE FB RAW ");
+    AppendUInt(framebufferLine, sizeof(framebufferLine), framebufferLinePos, framebuffer->width);
+    AppendChar(framebufferLine, sizeof(framebufferLine), framebufferLinePos, 'x');
+    AppendUInt(framebufferLine, sizeof(framebufferLine), framebufferLinePos, framebuffer->height);
+    AppendString(framebufferLine, sizeof(framebufferLine), framebufferLinePos, " P ");
+    AppendUInt(framebufferLine, sizeof(framebufferLine), framebufferLinePos, framebuffer->pitch);
+    AppendString(framebufferLine, sizeof(framebufferLine), framebufferLinePos, " BPP ");
+    AppendUInt(framebufferLine, sizeof(framebufferLine), framebufferLinePos, framebuffer->bpp);
+    BootSerialLine(framebufferLine);
+
+    BootSerialLine("BOOTSTAGE HW RESP OK");
 
     FPanicScreen::Initialize(framebuffer);
     FInterruptsX64::Initialize(FPanicScreen::OnException);
 
     if (!FMemoryArena::Initialize(GKernelArenaBuffer, sizeof(GKernelArenaBuffer))) {
+        BootSerialLine("BOOTSTAGE FAIL ARENA");
         return false;
     }
 
     if (!FPhysicalMemoryManager::Initialize(memmapResponse)) {
+        BootSerialLine("BOOTSTAGE FAIL PMM");
         return false;
     }
 
     (void)FPhysicalMemoryManager::ReserveRange(0, FKernelConfig::ReserveLowBytes);
 
     if (!FVirtualMemoryManager::Initialize(hhdmResponse->offset)) {
+        BootSerialLine("BOOTSTAGE FAIL VMM");
         return false;
     }
 
     if (!FKernelHeap::Initialize(FKernelConfig::KernelHeapBase,
                                  FKernelConfig::KernelHeapInitialPages,
                                  FVirtualMemoryManager::FlagsKernelRWNX)) {
+        BootSerialLine("BOOTSTAGE FAIL HEAP");
         return false;
     }
 
     if (!FPinnedMappingManager::Initialize(FKernelConfig::PinnedMapBase, FKernelConfig::PinnedMapPages)) {
+        BootSerialLine("BOOTSTAGE FAIL PINNED");
         return false;
     }
 
     if (!FDmaMemoryManager::Initialize(FKernelConfig::DmaMapBase, FKernelConfig::DmaMapPages)) {
+        BootSerialLine("BOOTSTAGE FAIL DMA");
         return false;
     }
+
+    BootSerialLine("BOOTSTAGE MEM OK");
 
     if (!GVideoDevice.Initialize(framebuffer)) {
+        BootSerialLine("BOOTSTAGE FAIL VIDEO DEVICE");
         return false;
     }
 
+    {
+        char videoDeviceLine[128] = {};
+        size_t videoDeviceLinePos = 0;
+        AppendString(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, "BOOTSTAGE VIDEODEV ");
+        AppendUInt(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, GVideoDevice.GetWidth());
+        AppendChar(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, 'x');
+        AppendUInt(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, GVideoDevice.GetHeight());
+        AppendString(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, " P ");
+        AppendUInt(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, GVideoDevice.GetPitchPixels());
+        BootSerialLine(videoDeviceLine);
+    }
+
+    BootSerialLogModeLine("BOOTSTAGE VIDEODEV MODE ", GVideoDevice.GetCurrentMode());
+
     if (!GDisplayManager.Initialize(&GVideoDevice)) {
+        BootSerialLine("BOOTSTAGE FAIL DISPLAY MANAGER");
         return false;
     }
+
+    BootSerialLogModeLine("BOOTSTAGE DM MODE ", GDisplayManager.GetMode());
 
     const ERendererBackend selectedBackend = FRendererFactory::SelectDefaultBackend();
     if (!FRendererFactory::CreateAndInitializeRenderer(selectedBackend,
                                                        &GVideoDevice,
                                                        GSoftwareRenderer3D,
                                                        GRenderer3D)) {
+        BootSerialLine("BOOTSTAGE FAIL RENDERER");
         return false;
     }
+
+    BootSerialLogModeLine("BOOTSTAGE DM MODE POST-RENDERER ", GDisplayManager.GetMode());
 
     if (!GConsole.Initialize(&GVideoDevice, 2)) {
+        BootSerialLine("BOOTSTAGE FAIL CONSOLE");
         return false;
     }
 
-    const Fortress::Video::FDisplayMode displayMode = GDisplayManager.GetMode();
+    BootSerialLogModeLine("BOOTSTAGE DM MODE POST-CONSOLE ", GDisplayManager.GetMode());
+
+    const Fortress::Video::FDisplayMode &displayMode = GDisplayManager.GetMode();
+    BootSerialCheckModeSnapshot("POST-SNAPSHOT", displayMode);
     if (!GCubeScene.Initialize(GRenderer3D, displayMode.Width, displayMode.Height)) {
-        return false;
+        BootSerialLine("BOOTSTAGE WARN SCENE DEGRADED");
     }
+
+    BootSerialLine("BOOTSTAGE VIDEO OK");
 
     if (!FTimerX86::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL TIMER");
         return false;
     }
 
     if (!FKeyboardManager::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL KBD");
         return false;
     }
 
     if (!FCpuCoreManager::Initialize(mpResponse)) {
+        BootSerialLine("BOOTSTAGE FAIL CPU CORE");
         return false;
     }
 
     if (!FKernelCoreDispatch::Initialize(FCpuCoreManager::GetOnlineCoreCount(),
                                          FCpuCoreManager::GetBootstrapCoreId())) {
+        BootSerialLine("BOOTSTAGE FAIL CORE DISPATCH");
         return false;
     }
 
-    if (!FKernelApWorker::InstallEntrypoint()) {
-        if (FCpuCoreManager::GetOnlineCoreCount() > 1u) {
+    if (GEnableParallelWorkersAtBoot) {
+        if (!FKernelApWorker::InstallEntrypoint()) {
+            if (FCpuCoreManager::GetOnlineCoreCount() > 1u) {
+                return false;
+            }
+        }
+
+        if (!FKernelApWorker::Enable(true)) {
+            BootSerialLine("BOOTSTAGE FAIL AP ENABLE");
             return false;
         }
-    }
-
-    if (!FKernelApWorker::Enable(GEnableParallelWorkersAtBoot)) {
-        return false;
+    } else {
+        (void)FKernelApWorker::Enable(false);
+        BootSerialLine("BOOTSTAGE AP DISABLED");
     }
 
     if (!FKernelScheduler::Initialize(FCpuCoreManager::GetBootstrapCoreId(), FCpuCoreManager::GetOnlineCoreCount())) {
+        BootSerialLine("BOOTSTAGE FAIL SCHED");
         return false;
     }
 
+    BootSerialLine("BOOTSTAGE CPU OK");
+    BootSerialCheckModeSnapshot("POST-CPU", displayMode);
+
     if (!FMessageBus::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL BUS");
         return false;
     }
 
     if (!FEventManager::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL EVENT");
         return false;
     }
 
     if (!FKernelNetworkTelemetry::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL NET TELEMETRY");
         return false;
     }
 
@@ -473,14 +613,19 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     FKernelNetworkTelemetry::SetLinkState(false);
 
     if (!FKernelAIExecutionMonitor::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL AI MON");
         return false;
     }
 
     FKernelAIExecutionMonitor::SetBuiltInPolicyMode(EKernelAIBuiltInPolicyMode::NoOp);
 
     if (!FServiceRegistry::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL SERVICE REG");
         return false;
     }
+
+    BootSerialLine("BOOTSTAGE CORE SERVICES OK");
+    BootSerialCheckModeSnapshot("POST-CORESERV", displayMode);
 
     if (!FServiceRegistry::RegisterService(FServiceRegistrationInfo{
             .ServiceId = FKernelRuntimeIds::ServiceScheduler,
@@ -539,16 +684,22 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     }
 
     if (!FServiceRegistryDatabaseAdapter::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL SRDB INIT");
         return false;
     }
 
     if (!FServiceRegistryDatabaseAdapter::RefreshFromServiceRegistry()) {
+        BootSerialLine("BOOTSTAGE FAIL SRDB REFRESH");
         return false;
     }
 
     if (!FPortManager::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL PORT INIT");
         return false;
     }
+
+    BootSerialLine("BOOTSTAGE PORT OK");
+    BootSerialCheckModeSnapshot("POST-PORT", displayMode);
 
     if (!FPortManager::RegisterPort(FKernelRuntimeIds::PortDisplaySurface, "DisplaySurface")) {
         return false;
@@ -597,6 +748,7 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
                                              FKernelRuntimeIds::ServiceCommandConsole);
 
     if (!FKernelIrqControlPlane::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL IRQ PLANE");
         return false;
     }
 
@@ -604,6 +756,7 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
                                                 FKernelRuntimeIds::ServiceScheduler,
                                                 "PIT_TIMER",
                                                 false)) {
+        BootSerialLine("BOOTSTAGE FAIL IRQ 32");
         return false;
     }
 
@@ -611,8 +764,12 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
                                                 FKernelRuntimeIds::ServiceKeyboardInput,
                                                 "PS2_KEYBOARD",
                                                 false)) {
+        BootSerialLine("BOOTSTAGE FAIL IRQ 33");
         return false;
     }
+
+    BootSerialLine("BOOTSTAGE IRQ OK");
+    BootSerialCheckModeSnapshot("POST-IRQ", displayMode);
 
     if (!GBootVolumeDevice.Initialize(FRamBlockDevice::SupportedBlockSizeBytes, 2048u, false)) {
         return false;
@@ -623,16 +780,22 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     }
 
     if (!FVirtualFileSystem::Initialize()) {
+        BootSerialLine("BOOTSTAGE FAIL VFS INIT");
         return false;
     }
 
     if (!FVirtualFileSystem::Mount("/boot", &GBootVolumeDevice, &GBootVolumeFileSystem, false)) {
+        BootSerialLine("BOOTSTAGE FAIL MOUNT BOOT");
         return false;
     }
 
     if (!FVirtualFileSystem::Mount("/data", &GDataVolumeDevice, &GDataVolumeFileSystem, false)) {
+        BootSerialLine("BOOTSTAGE FAIL MOUNT DATA");
         return false;
     }
+
+    BootSerialLine("BOOTSTAGE VFS OK");
+    BootSerialCheckModeSnapshot("POST-VFS", displayMode);
 
     FKernelTaskHandle idleTaskHandle{};
     const FKernelTaskCreateInfo idleTask{
@@ -657,11 +820,17 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
         .StartReady = true,
     };
     if (!FKernelScheduler::CreateTask(heartbeatTask, heartbeatTaskHandle)) {
+        BootSerialLine("BOOTSTAGE FAIL TASKS");
         return false;
     }
 
+    BootSerialLine("BOOTSTAGE TASKS OK");
+    BootSerialCheckModeSnapshot("POST-TASKS", displayMode);
+
     FKernelCommandConsole::Initialize();
     FKernelCommandConsole::BindVideoConsole(&GConsole);
+    BootSerialLine("BOOTSTAGE CONSOLE OK");
+    BootSerialCheckModeSnapshot("POST-CONSOLE", displayMode);
 
     char backendLine[64] = {};
     size_t backendLinePos = 0;

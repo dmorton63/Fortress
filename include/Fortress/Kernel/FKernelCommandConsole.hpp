@@ -34,6 +34,7 @@ class FKernelCommandConsole {
     };
 
     static void Initialize();
+    static void AutoMapHostSharesAtBoot();
     static void PollInput();
     static void SetLongOperationYieldCallback(FLongOperationYieldCallback callback);
     static void BindVideoConsole(Fortress::Video::FVideoConsole *console);

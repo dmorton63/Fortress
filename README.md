@@ -38,6 +38,36 @@ Placeholder backend selection path (expected to initialize-fail at boot until im
 make RENDERER_BACKEND=null
 ```
 
+## QEMU Host Shares
+
+You can pass host folders into QEMU run targets with Make variables:
+
+```bash
+make run HOST_SYSTEM_DIR=/abs/path/to/System HOST_SHARED_DIR=/abs/path/to/shared
+```
+
+Convenience workflow using workspace-local folders (no root access required):
+
+```bash
+make run-shares
+```
+
+This creates and uses:
+
+- `./System` (mapped as `host_system`, read-only)
+- `./shared` (mapped as `host_shared`, read-write)
+
+For serial logging with the same share mapping:
+
+```bash
+make run-log-shares
+```
+
+- `HOST_SYSTEM_DIR` is exposed with mount tag `host_system` and read-only mode.
+- `HOST_SHARED_DIR` is exposed with mount tag `host_shared` and read-write mode.
+
+These flags currently add QEMU `-virtfs` arguments; guest-side access still depends on kernel driver support.
+
 ## Build Bootable ISO
 
 ```bash

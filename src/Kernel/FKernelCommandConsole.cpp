@@ -36,6 +36,7 @@
 #include "Fortress/Memory/FKernelHeap.hpp"
 #include "Fortress/Memory/FPhysicalMemoryManager.hpp"
 #include "Fortress/Memory/FVirtualMemoryManager.hpp"
+#include "Fortress/Platform/FPciConfigX86.hpp"
 #include "Fortress/Platform/FXhciMmioRegisters.hpp"
 #include "Fortress/Platform/FXhciPciDiscovery.hpp"
 #include "Fortress/Runtime/FRuntime.hpp"
@@ -54,6 +55,7 @@ using Fortress::Memory::FPinnedMapping;
 using Fortress::Memory::FPinnedMappingManager;
 using Fortress::Memory::FPhysicalMemoryManager;
 using Fortress::Memory::FVirtualMemoryManager;
+using Fortress::Platform::FPciConfigX86;
 using Fortress::Kernel::FKeyboardInputEvent;
 using Fortress::Kernel::FKeyboardManager;
 using Fortress::Platform::FXhciMmioRegisters;
@@ -277,6 +279,42 @@ static Fortress::Kernel::FDesktopCompositor *GBoundDesktopCompositor = nullptr;
 static Fortress::Kernel::FDesktopInputRouter *GBoundDesktopInputRouter = nullptr;
 static Fortress::Kernel::FDesktopSurfaceContentHost *GBoundDesktopSurfaceContentHost = nullptr;
 static constexpr uint32_t GMaxCommandPortLeases = 8u;
+static constexpr uint32_t GMaxShareProbeHits = 8u;
+
+struct FShareProbeHit {
+    bool InUse = false;
+    uint16_t Bus = 0u;
+    uint8_t Device = 0u;
+    uint8_t Function = 0u;
+    uint16_t DeviceId = 0u;
+    uint16_t VirtioDeviceType = 0u;
+    bool LegacyTransport = true;
+    FDmaBuffer LegacyQueueBuffer{};
+    uint16_t LegacyQueueEntries = 0u;
+    uint32_t LegacyQueueBytes = 0u;
+    uint32_t LegacyQueueRingBytes = 0u;
+    uint32_t LegacyQueueScratchOffset = 0u;
+    uint32_t LegacyQueuePfn = 0u;
+    uint16_t LegacyQueueAvailIndex = 0u;
+    uint16_t LegacyQueueLastUsedIndex = 0u;
+    uint16_t LegacyQueueLastTag = 0u;
+    uint32_t LegacyQueueLastRequestBytes = 0u;
+    uint32_t LegacyQueueLastResponseBytes = 0u;
+    bool LegacyQueueRequestOutstanding = false;
+    bool LegacyQueueProgrammed = false;
+    bool LegacyVersionNegotiated = false;
+    uint32_t LegacyVersionMsize = 0u;
+    char LegacyVersionName[16] = {};
+    bool LegacySessionAttached = false;
+    uint32_t LegacySessionRootFid = 1u;
+    uint32_t LegacySessionWalkFid = 2u;
+};
+
+static bool GShareProbeHasScan = false;
+static uint32_t GShareProbeLastVirtioCount = 0u;
+static uint32_t GShareProbeLastShareCapableCount = 0u;
+static uint32_t GShareProbeStoredHitCount = 0u;
+static FShareProbeHit GShareProbeHits[GMaxShareProbeHits] = {};
 
 struct FCachedCommandPortLease {
     bool InUse = false;
@@ -442,6 +480,8 @@ static void TickBackgroundCommands();
 static int32_t InferFallbackLogicalMaxFromObserved(int32_t observedMax);
 static int32_t ReadSignedLE(const volatile uint8_t *bytes, uint32_t length);
 static uint32_t ReadUnsignedLE(const volatile uint8_t *bytes, uint32_t length);
+static void RunHostShareQueuePoll(const char *args);
+static void RunShareProbe();
 static int32_t NormalizeHidAbsoluteAxis(uint16_t rawValue, int32_t logicalMin, int32_t logicalMax);
 static void TryUpdateAutoHidAxisLogicalRange(uint16_t absX, uint16_t absY);
 static bool ParseHidAxisLogicalRange(const volatile uint8_t *descriptor,
@@ -479,8 +519,34 @@ static inline uint8_t SerialIn8(uint16_t port) {
     return value;
 }
 
+static inline void IoOut8(uint16_t port, uint8_t value) {
+    __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
 static inline void IoOut16(uint16_t port, uint16_t value) {
     __asm__ volatile("outw %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline void IoOut32(uint16_t port, uint32_t value) {
+    __asm__ volatile("outl %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline uint8_t IoIn8(uint16_t port) {
+    uint8_t value;
+    __asm__ volatile("inb %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
+static inline uint16_t IoIn16(uint16_t port) {
+    uint16_t value;
+    __asm__ volatile("inw %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
+static inline uint32_t IoIn32(uint16_t port) {
+    uint32_t value;
+    __asm__ volatile("inl %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
 }
 
 static inline uint64_t ReadCpuTsc() {
@@ -504,10 +570,15 @@ static void HaltCpuForever() {
 }
 
 static void RequestPlatformShutdown() {
+#if defined(FORTRESS_NO_REBOOT)
+    FKernelCommandConsole::PushSystemLog("SHUTDOWN PORT WRITE BLOCKED (NO_REBOOT)");
+    return;
+#else
     // QEMU/ACPI power management register.
     IoOut16(0x604u, 0x2000u);
     // Bochs/QEMU-compatible fallback poweroff port.
     IoOut16(0xB004u, 0x2000u);
+#endif
 }
 
 static void InitializeSerialMirror() {
@@ -649,6 +720,18 @@ static bool ParseUInt(const char *value, uint64_t &out) {
 
     out = result;
     return true;
+}
+
+static uint32_t StringLength32(const char *value) {
+    if (value == nullptr) {
+        return 0u;
+    }
+
+    uint32_t length = 0u;
+    while (value[length] != '\0') {
+        length++;
+    }
+    return length;
 }
 
 static bool ParseU64Auto(const char *value, uint64_t &out) {
@@ -10072,6 +10155,17 @@ static void RunKeyboardFontSelect(const char *profileToken) {
 static void RunUtilityHelp() {
     PushLog("CMDS: HELP SHUTDOWN|POWEROFF|HALT|OK SHOWLOG [TAIL|FULL|ERRORS|WARN|ALLISSUES] BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS|FILTER [QUIET|NORMAL|FULL|STATUS]|WINDOW ON|OFF|TOGGLE|STATUS] STATS EVENTHEALTH SUBSYSHEALTH [BRIEF|FORCE|INTERVAL] AIMON [EVAL|POLICY|THRESHOLD|STATE] EVENTBURST VFSSTAT VFSMOUNTS VFSRESOLVE VFSBOOT VFSBOOTBLK VFSBOOT0 VFSMRESOLVE VFSMBLK VFSBLKDIGEST LOGSAVE LOGSAVEBOOT LOGSAVEMOUNT SRDBSTAT SRDBFIND PORTSTAT PORTLIST PORTAUDIT [LAST|DENIED] PORTCHECK PORTOPEN PORTCLOSE PORTLEASE DSKZLIST DSKCHILDREN DSKSURFCONTROLS KBDLAYOUT KBDMODS TEXTSHAPER FONTCACHE DESKTOPSTAT DESKTOPRAISE DESKTOPFOCUS DESKTOPCAPTURE DESKTOPINPUT DESKTOPLIST DESKTOPDIRTY [N|ALL] DESKTOPINSPECT DESKTOPHIDE DESKTOPSHOW DESKTOPDAMAGE DESKTOPCREATE DESKTOPCLOSE DESKTOPMOVE DESKTOPRESIZE WINDOWSTAT WINDOWRAISE WINDOWFOCUS WINDOWCAPTURE WINDOWINPUT WINDOWLIST WINDOWDIRTY [N|ALL] WINDOWINSPECT WINDOWHIDE WINDOWSHOW WINDOWDAMAGE WINDOWCREATE WINDOWCLOSE WINDOWMOVE WINDOWRESIZE WIRE PAUSE RESUME PARALLEL PARALLELTEST CURSOR DSKSURFOVERLAY WINDOWOVERLAY");
     PushLog("KBD: KBDLAYOUT [US|DVORAK] KBDMODS");
+    PushLog("HW: SHAREPROBE | VIRTIOSCAN");
+    PushLog("HW: HOSTSHARE STATUS | SHARESTATUS");
+    PushLog("HW: HOSTSHARE PCI");
+    PushLog("HW: HOSTSHARE INIT [INDEX]");
+    PushLog("HW: HOSTSHARE ATTACH [INDEX] [ANAME] | HOSTSHARE WALK [INDEX] NAME");
+    PushLog("HW: HOSTSHARE CAT [INDEX] PATH");
+    PushLog("HW: HOSTSHARE LS [INDEX] [PATH]");
+    PushLog("HW: HOSTSHARE QSETUP [INDEX] | HOSTSHARE QKICK [INDEX] | HOSTSHARE QPOLL [INDEX]");
+    PushLog("HW: HOSTSHARE QROUNDTRIP [INDEX]");
+    PushLog("HW: HOSTSHARE QCLEAR [INDEX] | HOSTSHARE QSTATUS");
+    PushLog("HW: HOSTSHARE AUTOMAP");
 #if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
     PushLog("KBD: KBDFONT [CLASSIC|DENSE|STATUS|PREVIEW]");
 #endif
@@ -10975,6 +11069,2339 @@ static void RunRenderSelfTestQuery() {
     PushLog(GRenderSurfaceSelfTestEnabled ? "RENDERTEST ON" : "RENDERTEST OFF");
 }
 
+static const char *GetVirtioDeviceKindName(uint16_t virtioDeviceType) {
+    switch (virtioDeviceType) {
+    case 1u:
+        return "NET";
+    case 2u:
+        return "BLOCK";
+    case 9u:
+        return "9P";
+    case 26u:
+        return "FS";
+    default:
+        return "OTHER";
+    }
+}
+
+static void ResetHostShareProbeState(bool releaseBuffers) {
+    if (releaseBuffers) {
+        for (uint32_t i = 0u; i < GMaxShareProbeHits; i++) {
+            if (GShareProbeHits[i].LegacyQueueBuffer.Valid) {
+                (void)FDmaMemoryManager::FreeBuffer(GShareProbeHits[i].LegacyQueueBuffer);
+            }
+        }
+    }
+
+    GShareProbeHasScan = false;
+    GShareProbeLastVirtioCount = 0u;
+    GShareProbeLastShareCapableCount = 0u;
+    GShareProbeStoredHitCount = 0u;
+    for (uint32_t i = 0u; i < GMaxShareProbeHits; i++) {
+        GShareProbeHits[i] = FShareProbeHit{};
+    }
+}
+
+static bool ResolveHostShareHitIndex(const char *args, uint64_t &outIndex) {
+    outIndex = 0u;
+    if (args == nullptr || args[0] == '\0') {
+        return true;
+    }
+
+    const char *cursor = args;
+    char indexToken[20] = {};
+    if (!ReadToken(cursor, indexToken, sizeof(indexToken)) || !ParseUInt(indexToken, outIndex)) {
+        return false;
+    }
+
+    char extraToken[8] = {};
+    if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+        return false;
+    }
+
+    return true;
+}
+
+static void RunHostShareLegacyInit(const char *args) {
+    static constexpr uint8_t PciOffsetBar0 = 0x10u;
+    static constexpr uint8_t VirtioIoOffsetDeviceFeatures = 0x00u;
+    static constexpr uint8_t VirtioIoOffsetQueueSize = 0x0Cu;
+    static constexpr uint8_t VirtioIoOffsetQueueSelect = 0x0Eu;
+    static constexpr uint8_t VirtioIoOffsetDeviceStatus = 0x12u;
+    static constexpr uint8_t VirtioIoOffsetIsrStatus = 0x13u;
+
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE INIT UNSCANNED");
+        PushLog("HOSTSHARE INIT RUN SHAREPROBE");
+        return;
+    }
+
+    if (GShareProbeStoredHitCount == 0u) {
+        PushLog("HOSTSHARE INIT NONE");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    if (args != nullptr && args[0] != '\0') {
+        const char *cursor = args;
+        char indexToken[20] = {};
+        if (!ReadToken(cursor, indexToken, sizeof(indexToken)) || !ParseUInt(indexToken, requestedIndex)) {
+            PushLog("HOSTSHARE INIT USAGE HOSTSHARE INIT [INDEX]");
+            return;
+        }
+
+        char extraToken[8] = {};
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("HOSTSHARE INIT TOO MANY ARGS");
+            return;
+        }
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE INIT INDEX OUT OF RANGE");
+        return;
+    }
+
+    const FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacyTransport) {
+        PushLog("HOSTSHARE INIT LEGACY ONLY");
+        return;
+    }
+
+    const uint8_t bus = static_cast<uint8_t>(hit.Bus);
+    const uint8_t device = hit.Device;
+    const uint8_t function = hit.Function;
+    const uint32_t bar0 = FPciConfigX86::Read32(bus, device, function, PciOffsetBar0);
+    if ((bar0 & 0x1u) == 0u) {
+        PushLog("HOSTSHARE INIT BAR0 NOT_IO");
+        return;
+    }
+
+    const uint16_t ioBase = static_cast<uint16_t>(bar0 & 0xFFFCu);
+    const uint16_t queueSelectPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetQueueSelect);
+    const uint16_t queueSizePort = static_cast<uint16_t>(ioBase + VirtioIoOffsetQueueSize);
+    const uint16_t statusPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetDeviceStatus);
+    const uint16_t isrPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetIsrStatus);
+    const uint16_t featuresPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetDeviceFeatures);
+
+    const uint8_t statusBefore = IoIn8(statusPort);
+    const uint8_t isrBefore = IoIn8(isrPort);
+    const uint32_t features = IoIn32(featuresPort);
+
+    IoOut16(queueSelectPort, 0u);
+    const uint16_t queue0Size = IoIn16(queueSizePort);
+
+    // Minimal legacy handshake: reset, ACK, then DRIVER.
+    IoOut8(statusPort, 0u);
+    const uint8_t statusAfterReset = IoIn8(statusPort);
+    IoOut8(statusPort, 0x01u);
+    IoOut8(statusPort, 0x03u);
+    const uint8_t statusAfterDriver = IoIn8(statusPort);
+
+    const uint8_t isrAfter = IoIn8(isrPort);
+
+    char line0[192] = {};
+    size_t pos0 = 0u;
+    AppendString(line0, sizeof(line0), pos0, "HOSTSHARE INIT ");
+    AppendUInt(line0, sizeof(line0), pos0, requestedIndex);
+    AppendString(line0, sizeof(line0), pos0, " BDF ");
+    AppendUInt(line0, sizeof(line0), pos0, bus);
+    AppendChar(line0, sizeof(line0), pos0, ':');
+    AppendUInt(line0, sizeof(line0), pos0, device);
+    AppendChar(line0, sizeof(line0), pos0, '.');
+    AppendUInt(line0, sizeof(line0), pos0, function);
+    AppendString(line0, sizeof(line0), pos0, " IO ");
+    AppendHex(line0, sizeof(line0), pos0, ioBase);
+    PushLog(line0);
+
+    char line1[192] = {};
+    size_t pos1 = 0u;
+    AppendString(line1, sizeof(line1), pos1, "HOSTSHARE INIT FEAT ");
+    AppendHex(line1, sizeof(line1), pos1, features);
+    AppendString(line1, sizeof(line1), pos1, " Q0 ");
+    AppendUInt(line1, sizeof(line1), pos1, queue0Size);
+    PushLog(line1);
+
+    char line2[192] = {};
+    size_t pos2 = 0u;
+    AppendString(line2, sizeof(line2), pos2, "HOSTSHARE INIT ST ");
+    AppendHex(line2, sizeof(line2), pos2, statusBefore);
+    AppendString(line2, sizeof(line2), pos2, " R ");
+    AppendHex(line2, sizeof(line2), pos2, statusAfterReset);
+    AppendString(line2, sizeof(line2), pos2, " D ");
+    AppendHex(line2, sizeof(line2), pos2, statusAfterDriver);
+    AppendString(line2, sizeof(line2), pos2, " ISR ");
+    AppendHex(line2, sizeof(line2), pos2, isrBefore);
+    AppendString(line2, sizeof(line2), pos2, "->");
+    AppendHex(line2, sizeof(line2), pos2, isrAfter);
+    PushLog(line2);
+}
+
+static uint32_t ComputeLegacyVirtQueueBytes(uint16_t queueEntries) {
+    const uint32_t descBytes = static_cast<uint32_t>(16u * static_cast<uint32_t>(queueEntries));
+    const uint32_t availBytes = static_cast<uint32_t>(6u + 2u * static_cast<uint32_t>(queueEntries));
+    const uint32_t usedBytes = static_cast<uint32_t>(6u + 8u * static_cast<uint32_t>(queueEntries));
+    const uint32_t preUsed = descBytes + availBytes;
+    const uint32_t alignedPreUsed = (preUsed + 4095u) & ~4095u;
+    return alignedPreUsed + usedBytes;
+}
+
+struct FHostShareLegacyVirtqLayout {
+    uint32_t DescOffset;
+    uint32_t AvailOffset;
+    uint32_t UsedOffset;
+    uint32_t RingBytes;
+};
+
+struct FHostShareLegacyVirtqDescriptor {
+    uint64_t Address;
+    uint32_t Length;
+    uint16_t Flags;
+    uint16_t Next;
+} __attribute__((packed));
+
+struct FHostShareLegacyVirtqUsedElem {
+    uint32_t Id;
+    uint32_t Length;
+} __attribute__((packed));
+
+static FHostShareLegacyVirtqLayout BuildHostShareLegacyVirtqLayout(uint16_t queueEntries) {
+    const uint32_t descBytes = static_cast<uint32_t>(16u * static_cast<uint32_t>(queueEntries));
+    const uint32_t availBytes = static_cast<uint32_t>(6u + 2u * static_cast<uint32_t>(queueEntries));
+    const uint32_t preUsed = descBytes + availBytes;
+    const uint32_t usedOffset = (preUsed + 4095u) & ~4095u;
+    return FHostShareLegacyVirtqLayout{
+        .DescOffset = 0u,
+        .AvailOffset = descBytes,
+        .UsedOffset = usedOffset,
+        .RingBytes = ComputeLegacyVirtQueueBytes(queueEntries),
+    };
+}
+
+static uint16_t ReadLe16(const volatile uint8_t *ptr) {
+    return static_cast<uint16_t>(ptr[0]) |
+           static_cast<uint16_t>(static_cast<uint16_t>(ptr[1]) << 8u);
+}
+
+static uint32_t ReadLe32(const volatile uint8_t *ptr) {
+    return static_cast<uint32_t>(ptr[0]) |
+           (static_cast<uint32_t>(ptr[1]) << 8u) |
+           (static_cast<uint32_t>(ptr[2]) << 16u) |
+           (static_cast<uint32_t>(ptr[3]) << 24u);
+}
+
+static void WriteLe16(volatile uint8_t *ptr, uint16_t value) {
+    ptr[0] = static_cast<uint8_t>(value & 0xFFu);
+    ptr[1] = static_cast<uint8_t>((value >> 8u) & 0xFFu);
+}
+
+static void WriteLe32(volatile uint8_t *ptr, uint32_t value) {
+    ptr[0] = static_cast<uint8_t>(value & 0xFFu);
+    ptr[1] = static_cast<uint8_t>((value >> 8u) & 0xFFu);
+    ptr[2] = static_cast<uint8_t>((value >> 16u) & 0xFFu);
+    ptr[3] = static_cast<uint8_t>((value >> 24u) & 0xFFu);
+}
+
+static uint64_t ReadLe64(const volatile uint8_t *ptr) {
+    return static_cast<uint64_t>(ptr[0]) |
+           (static_cast<uint64_t>(ptr[1]) << 8u) |
+           (static_cast<uint64_t>(ptr[2]) << 16u) |
+           (static_cast<uint64_t>(ptr[3]) << 24u) |
+           (static_cast<uint64_t>(ptr[4]) << 32u) |
+           (static_cast<uint64_t>(ptr[5]) << 40u) |
+           (static_cast<uint64_t>(ptr[6]) << 48u) |
+           (static_cast<uint64_t>(ptr[7]) << 56u);
+}
+
+static uint32_t CopyAsciiTokenFromLeString(const volatile uint8_t *src,
+                                           uint32_t availableBytes,
+                                           char *out,
+                                           uint32_t outCapacity) {
+    if (src == nullptr || out == nullptr || outCapacity == 0u || availableBytes < 2u) {
+        return 0u;
+    }
+
+    const uint16_t textLength = ReadLe16(src);
+    const uint32_t boundedLength = (textLength > (availableBytes - 2u)) ? (availableBytes - 2u) : textLength;
+
+    uint32_t copied = 0u;
+    const uint32_t copyLimit = (outCapacity > 0u) ? (outCapacity - 1u) : 0u;
+    while (copied < boundedLength && copied < copyLimit) {
+        const uint8_t c = src[2u + copied];
+        out[copied] = (c >= 32u && c <= 126u) ? static_cast<char>(c) : '.';
+        copied++;
+    }
+    out[copied] = '\0';
+    return copied;
+}
+
+static bool TryReadHostShareQueueCompletion(FShareProbeHit &hit,
+                                            uint16_t &outUsedIndex,
+                                            uint32_t &outUsedId,
+                                            uint32_t &outUsedLength,
+                                            volatile uint8_t *&outResponse) {
+    if (!hit.LegacyQueueProgrammed || !hit.LegacyQueueBuffer.Valid || hit.LegacyQueueEntries == 0u) {
+        return false;
+    }
+
+    const FHostShareLegacyVirtqLayout layout = BuildHostShareLegacyVirtqLayout(hit.LegacyQueueEntries);
+    volatile uint8_t *queueBase = reinterpret_cast<volatile uint8_t *>(hit.LegacyQueueBuffer.VirtualAddress);
+    volatile uint8_t *used = queueBase + layout.UsedOffset;
+
+    const uint16_t usedIndex = ReadLe16(used + 2u);
+    if (usedIndex == hit.LegacyQueueLastUsedIndex) {
+        return false;
+    }
+
+    const uint16_t usedSlot = static_cast<uint16_t>(hit.LegacyQueueLastUsedIndex % hit.LegacyQueueEntries);
+    const uint32_t usedElemOffset = 4u + static_cast<uint32_t>(usedSlot) * 8u;
+
+    outUsedIndex = usedIndex;
+    outUsedId = ReadLe32(used + usedElemOffset);
+    outUsedLength = ReadLe32(used + usedElemOffset + 4u);
+    outResponse = queueBase + hit.LegacyQueueScratchOffset + 256u;
+    return true;
+}
+
+static bool TrySubmitHostShareQueueRequestAndWait(FShareProbeHit &hit,
+                                                  const uint8_t *requestBytes,
+                                                  uint32_t requestLength,
+                                                  uint64_t maxPolls,
+                                                  uint16_t &outUsedIndex,
+                                                  uint32_t &outUsedId,
+                                                  uint32_t &outUsedLength,
+                                                  uint32_t &outResponseSize,
+                                                  uint8_t &outResponseType,
+                                                  uint16_t &outResponseTag,
+                                                  volatile uint8_t *&outResponse,
+                                                  bool &outTimedOut) {
+    outTimedOut = false;
+    outUsedIndex = 0u;
+    outUsedId = 0u;
+    outUsedLength = 0u;
+    outResponseSize = 0u;
+    outResponseType = 0u;
+    outResponseTag = 0u;
+    outResponse = nullptr;
+
+    if (!hit.LegacyQueueProgrammed || !hit.LegacyQueueBuffer.Valid || hit.LegacyQueueEntries < 2u ||
+        requestBytes == nullptr || requestLength < 7u) {
+        return false;
+    }
+
+    if (hit.LegacyQueueRequestOutstanding) {
+        uint16_t pendingUsedIndex = 0u;
+        uint32_t pendingUsedId = 0u;
+        uint32_t pendingUsedLength = 0u;
+        volatile uint8_t *pendingResponse = nullptr;
+        if (!TryReadHostShareQueueCompletion(hit,
+                                             pendingUsedIndex,
+                                             pendingUsedId,
+                                             pendingUsedLength,
+                                             pendingResponse)) {
+            return false;
+        }
+        hit.LegacyQueueLastUsedIndex = pendingUsedIndex;
+        hit.LegacyQueueRequestOutstanding = false;
+    }
+
+    const FHostShareLegacyVirtqLayout layout = BuildHostShareLegacyVirtqLayout(hit.LegacyQueueEntries);
+    volatile uint8_t *queueBase = reinterpret_cast<volatile uint8_t *>(hit.LegacyQueueBuffer.VirtualAddress);
+    auto *desc = reinterpret_cast<volatile FHostShareLegacyVirtqDescriptor *>(queueBase + layout.DescOffset);
+    volatile uint8_t *avail = queueBase + layout.AvailOffset;
+    volatile uint8_t *used = queueBase + layout.UsedOffset;
+
+    const uint32_t requestOffset = hit.LegacyQueueScratchOffset;
+    const uint32_t responseOffset = requestOffset + 256u;
+    if (responseOffset + 512u > hit.LegacyQueueBytes) {
+        return false;
+    }
+
+    const uint32_t responseBufferBytes = hit.LegacyQueueBytes - responseOffset;
+    if (responseBufferBytes == 0u) {
+        return false;
+    }
+
+    volatile uint8_t *request = queueBase + requestOffset;
+    volatile uint8_t *response = queueBase + responseOffset;
+    for (uint32_t i = 0u; i < requestLength; i++) {
+        request[i] = requestBytes[i];
+    }
+
+    const uint16_t tag = static_cast<uint16_t>(hit.LegacyQueueLastTag + 1u);
+    WriteLe16(request + 5u, tag);
+
+    for (uint32_t i = 0u; i < responseBufferBytes; i++) {
+        response[i] = 0u;
+    }
+
+    const uint64_t requestPhys = hit.LegacyQueueBuffer.PhysicalAddress + requestOffset;
+    const uint64_t responsePhys = hit.LegacyQueueBuffer.PhysicalAddress + responseOffset;
+
+    desc[0].Address = requestPhys;
+    desc[0].Length = requestLength;
+    desc[0].Flags = 0x0001u;
+    desc[0].Next = 1u;
+
+    desc[1].Address = responsePhys;
+    desc[1].Length = responseBufferBytes;
+    desc[1].Flags = 0x0002u;
+    desc[1].Next = 0u;
+
+    const uint16_t usedIndexBefore = ReadLe16(used + 2u);
+    const uint16_t availIndex = ReadLe16(avail + 2u);
+    const uint32_t ringEntryOffset = 4u +
+                                     (2u * (static_cast<uint32_t>(availIndex) %
+                                             static_cast<uint32_t>(hit.LegacyQueueEntries)));
+    WriteLe16(avail + ringEntryOffset, 0u);
+    WriteLe16(avail + 2u, static_cast<uint16_t>(availIndex + 1u));
+
+    static constexpr uint8_t PciOffsetBar0 = 0x10u;
+    static constexpr uint8_t VirtioIoOffsetQueueNotify = 0x10u;
+    static constexpr uint8_t VirtioIoOffsetDeviceStatus = 0x12u;
+
+    const uint8_t bus = static_cast<uint8_t>(hit.Bus);
+    const uint8_t device = hit.Device;
+    const uint8_t function = hit.Function;
+    const uint32_t bar0 = FPciConfigX86::Read32(bus, device, function, PciOffsetBar0);
+    if ((bar0 & 0x1u) == 0u) {
+        return false;
+    }
+
+    const uint16_t ioBase = static_cast<uint16_t>(bar0 & 0xFFFCu);
+    const uint16_t queueNotifyPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetQueueNotify);
+    const uint16_t statusPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetDeviceStatus);
+
+    IoOut8(statusPort, 0x07u);
+    __asm__ volatile("" ::: "memory");
+    IoOut16(queueNotifyPort, 0u);
+
+    hit.LegacyQueueAvailIndex = static_cast<uint16_t>(availIndex + 1u);
+    hit.LegacyQueueLastUsedIndex = usedIndexBefore;
+    hit.LegacyQueueLastTag = tag;
+    hit.LegacyQueueLastRequestBytes = requestLength;
+    hit.LegacyQueueLastResponseBytes = responseBufferBytes;
+    hit.LegacyQueueRequestOutstanding = true;
+
+    bool completed = false;
+    for (uint64_t i = 0u; i < maxPolls; i++) {
+        if (TryReadHostShareQueueCompletion(hit,
+                                            outUsedIndex,
+                                            outUsedId,
+                                            outUsedLength,
+                                            outResponse)) {
+            completed = true;
+            break;
+        }
+        YieldLongOperationPoll(i + 1u);
+    }
+
+    if (!completed) {
+        // Recover queue state so a timed-out request does not permanently block later submits.
+        hit.LegacyQueueLastUsedIndex = ReadLe16(used + 2u);
+        hit.LegacyQueueRequestOutstanding = false;
+        outTimedOut = true;
+        return true;
+    }
+
+    outResponseSize = ReadLe32(outResponse + 0u);
+    outResponseType = outResponse[4];
+    outResponseTag = ReadLe16(outResponse + 5u);
+
+    hit.LegacyQueueLastUsedIndex = outUsedIndex;
+    hit.LegacyQueueRequestOutstanding = false;
+    return true;
+}
+
+static bool TryHostShareNegotiateVersion(FShareProbeHit &hit,
+                                         uint64_t requestedIndex,
+                                         bool emitLogs,
+                                         bool &outTimedOut) {
+    outTimedOut = false;
+
+    if (!hit.LegacyQueueProgrammed || !hit.LegacyQueueBuffer.Valid) {
+        return false;
+    }
+
+    static const char *kVersionCandidates[] = {
+        "9P2000.L",
+        "9P2000.u",
+        "9P2000",
+    };
+
+    bool negotiated = false;
+    uint32_t negotiatedMsize = 0u;
+    char negotiatedVersion[16] = {};
+
+    for (uint32_t i = 0u; i < (sizeof(kVersionCandidates) / sizeof(kVersionCandidates[0])); i++) {
+        const char *candidate = kVersionCandidates[i];
+        const uint16_t versionLength = static_cast<uint16_t>(StringLength32(candidate));
+
+        uint8_t request[64] = {};
+        const uint32_t requestLength = static_cast<uint32_t>(13u + versionLength);
+        WriteLe32(request + 0u, requestLength);
+        request[4] = 100u; // Tversion
+        WriteLe16(request + 5u, 0u); // tag patched by submit helper
+        WriteLe32(request + 7u, 65536u);
+        WriteLe16(request + 11u, versionLength);
+        for (uint16_t c = 0u; c < versionLength; c++) {
+            request[13u + c] = static_cast<uint8_t>(candidate[c]);
+        }
+
+        uint16_t usedIndex = 0u;
+        uint32_t usedId = 0u;
+        uint32_t usedLength = 0u;
+        uint32_t responseSize = 0u;
+        uint8_t responseType = 0u;
+        uint16_t responseTag = 0u;
+        volatile uint8_t *response = nullptr;
+        bool timedOut = false;
+
+        if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                                   request,
+                                                   requestLength,
+                                                   200000ull,
+                                                   usedIndex,
+                                                   usedId,
+                                                   usedLength,
+                                                   responseSize,
+                                                   responseType,
+                                                   responseTag,
+                                                   response,
+                                                   timedOut)) {
+            return false;
+        }
+
+        if (timedOut) {
+            outTimedOut = true;
+            return false;
+        }
+
+        if (responseType == 101u && responseSize >= 13u) {
+            negotiatedMsize = ReadLe32(response + 7u);
+            (void)CopyAsciiTokenFromLeString(response + 11u,
+                                             (responseSize > 11u) ? (responseSize - 11u) : 0u,
+                                             negotiatedVersion,
+                                             static_cast<uint32_t>(sizeof(negotiatedVersion)));
+            negotiated = true;
+            break;
+        }
+
+        if (emitLogs && responseType == 107u && responseSize >= 9u) {
+            char ename[96] = {};
+            (void)CopyAsciiTokenFromLeString(response + 7u,
+                                             (responseSize > 7u) ? (responseSize - 7u) : 0u,
+                                             ename,
+                                             static_cast<uint32_t>(sizeof(ename)));
+            char line[192] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE VERSION CANDIDATE RERROR ");
+            AppendString(line, sizeof(line), pos, candidate);
+            AppendString(line, sizeof(line), pos, " ");
+            AppendString(line, sizeof(line), pos, ename[0] != '\0' ? ename : "<EMPTY>");
+            PushLog(line);
+        }
+    }
+
+    if (!negotiated) {
+        return false;
+    }
+
+    hit.LegacyVersionNegotiated = true;
+    hit.LegacyVersionMsize = negotiatedMsize;
+    for (uint32_t i = 0u; i < sizeof(hit.LegacyVersionName); i++) {
+        hit.LegacyVersionName[i] = negotiatedVersion[i];
+        if (negotiatedVersion[i] == '\0') {
+            break;
+        }
+    }
+
+    if (emitLogs) {
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE VERSION OK IDX ");
+        AppendUInt(line, sizeof(line), pos, requestedIndex);
+        AppendString(line, sizeof(line), pos, " MSIZE ");
+        AppendUInt(line, sizeof(line), pos, negotiatedMsize);
+        AppendString(line, sizeof(line), pos, " VER ");
+        AppendString(line,
+                     sizeof(line),
+                     pos,
+                     hit.LegacyVersionName[0] != '\0' ? hit.LegacyVersionName : "<EMPTY>");
+        PushLog(line);
+    }
+
+    return true;
+}
+
+static void RunHostShareQueueStatus() {
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE QSTATUS UNSCANNED");
+        PushLog("HOSTSHARE QSTATUS RUN SHAREPROBE");
+        return;
+    }
+
+    for (uint32_t i = 0u; i < GShareProbeStoredHitCount; i++) {
+        if (!GShareProbeHits[i].InUse) {
+            continue;
+        }
+
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE QSTATUS ");
+        AppendUInt(line, sizeof(line), pos, i);
+        AppendString(line, sizeof(line), pos, " Q0 ");
+        AppendString(line, sizeof(line), pos, GShareProbeHits[i].LegacyQueueProgrammed ? "READY" : "EMPTY");
+        if (GShareProbeHits[i].LegacyQueueProgrammed) {
+            AppendString(line, sizeof(line), pos, " E ");
+            AppendUInt(line, sizeof(line), pos, GShareProbeHits[i].LegacyQueueEntries);
+            AppendString(line, sizeof(line), pos, " B ");
+            AppendUInt(line, sizeof(line), pos, GShareProbeHits[i].LegacyQueueBytes);
+            AppendString(line, sizeof(line), pos, " PFN ");
+            AppendHex(line, sizeof(line), pos, GShareProbeHits[i].LegacyQueuePfn);
+            AppendString(line, sizeof(line), pos, " OUT ");
+            AppendUInt(line,
+                       sizeof(line),
+                       pos,
+                       GShareProbeHits[i].LegacyQueueRequestOutstanding ? 1u : 0u);
+        }
+        PushLog(line);
+    }
+}
+
+static void RunHostShareQueueClear(const char *args) {
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE QCLEAR UNSCANNED");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    if (!ResolveHostShareHitIndex(args, requestedIndex)) {
+        PushLog("HOSTSHARE QCLEAR USAGE HOSTSHARE QCLEAR [INDEX]");
+        return;
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE QCLEAR INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (hit.LegacyQueueBuffer.Valid) {
+        (void)FDmaMemoryManager::FreeBuffer(hit.LegacyQueueBuffer);
+    }
+    hit.LegacyQueueBuffer = FDmaBuffer{};
+    hit.LegacyQueueEntries = 0u;
+    hit.LegacyQueueBytes = 0u;
+    hit.LegacyQueueRingBytes = 0u;
+    hit.LegacyQueueScratchOffset = 0u;
+    hit.LegacyQueuePfn = 0u;
+    hit.LegacyQueueAvailIndex = 0u;
+    hit.LegacyQueueLastUsedIndex = 0u;
+    hit.LegacyQueueLastTag = 0u;
+    hit.LegacyQueueLastRequestBytes = 0u;
+    hit.LegacyQueueLastResponseBytes = 0u;
+    hit.LegacyQueueRequestOutstanding = false;
+    hit.LegacyQueueProgrammed = false;
+    hit.LegacyVersionNegotiated = false;
+    hit.LegacyVersionMsize = 0u;
+    hit.LegacyVersionName[0] = '\0';
+    hit.LegacySessionAttached = false;
+    PushLog("HOSTSHARE QCLEAR DONE");
+}
+
+static void RunHostShareQueueSetup(const char *args) {
+    static constexpr uint8_t PciOffsetBar0 = 0x10u;
+    static constexpr uint8_t VirtioIoOffsetGuestFeatures = 0x04u;
+    static constexpr uint8_t VirtioIoOffsetQueueAddress = 0x08u;
+    static constexpr uint8_t VirtioIoOffsetQueueSize = 0x0Cu;
+    static constexpr uint8_t VirtioIoOffsetQueueSelect = 0x0Eu;
+    static constexpr uint8_t VirtioIoOffsetDeviceStatus = 0x12u;
+
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE QSETUP UNSCANNED");
+        PushLog("HOSTSHARE QSETUP RUN SHAREPROBE");
+        return;
+    }
+
+    if (GShareProbeStoredHitCount == 0u) {
+        PushLog("HOSTSHARE QSETUP NONE");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    if (!ResolveHostShareHitIndex(args, requestedIndex)) {
+        PushLog("HOSTSHARE QSETUP USAGE HOSTSHARE QSETUP [INDEX]");
+        return;
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE QSETUP INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacyTransport) {
+        PushLog("HOSTSHARE QSETUP LEGACY ONLY");
+        return;
+    }
+
+    const uint8_t bus = static_cast<uint8_t>(hit.Bus);
+    const uint8_t device = hit.Device;
+    const uint8_t function = hit.Function;
+    const uint32_t bar0 = FPciConfigX86::Read32(bus, device, function, PciOffsetBar0);
+    if ((bar0 & 0x1u) == 0u) {
+        PushLog("HOSTSHARE QSETUP BAR0 NOT_IO");
+        return;
+    }
+
+    const uint16_t ioBase = static_cast<uint16_t>(bar0 & 0xFFFCu);
+    const uint16_t queueSelectPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetQueueSelect);
+    const uint16_t queueSizePort = static_cast<uint16_t>(ioBase + VirtioIoOffsetQueueSize);
+    const uint16_t queueAddressPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetQueueAddress);
+    const uint16_t guestFeaturesPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetGuestFeatures);
+    const uint16_t statusPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetDeviceStatus);
+
+    IoOut16(queueSelectPort, 0u);
+    const uint16_t queue0Size = IoIn16(queueSizePort);
+    if (queue0Size == 0u) {
+        PushLog("HOSTSHARE QSETUP QUEUE0 MISSING");
+        return;
+    }
+
+    const FHostShareLegacyVirtqLayout layout = BuildHostShareLegacyVirtqLayout(queue0Size);
+    const uint32_t queueRingBytes = layout.RingBytes;
+    const uint32_t queueScratchOffset = (queueRingBytes + 15u) & ~15u;
+    const uint32_t queueBytes = queueScratchOffset + 4096u;
+
+    if (hit.LegacyQueueBuffer.Valid) {
+        (void)FDmaMemoryManager::FreeBuffer(hit.LegacyQueueBuffer);
+        hit.LegacyQueueBuffer = FDmaBuffer{};
+    }
+
+    FDmaBuffer queueBuffer{};
+    if (!FDmaMemoryManager::AllocateBuffer(queueBytes, 4096u, true, queueBuffer)) {
+        PushLog("HOSTSHARE QSETUP DMA ALLOC FAIL");
+        return;
+    }
+
+    Fortress::Runtime::Memset(reinterpret_cast<void *>(queueBuffer.VirtualAddress),
+                              0,
+                              static_cast<Fortress::Core::usize>(queueBuffer.SizeBytes));
+
+    const uint64_t queuePfn64 = queueBuffer.PhysicalAddress >> 12u;
+    if (queuePfn64 > 0xFFFFFFFFull) {
+        (void)FDmaMemoryManager::FreeBuffer(queueBuffer);
+        PushLog("HOSTSHARE QSETUP PFN RANGE");
+        return;
+    }
+
+    const uint32_t queuePfn = static_cast<uint32_t>(queuePfn64);
+
+    // Minimal legacy queue program: reset state, select queue0, guest features 0, then set queue PFN.
+    IoOut8(statusPort, 0u);
+    IoOut8(statusPort, 0x01u);
+    IoOut8(statusPort, 0x03u);
+    IoOut16(queueSelectPort, 0u);
+    IoOut32(guestFeaturesPort, 0u);
+    IoOut32(queueAddressPort, queuePfn);
+
+    const uint32_t queuePfnReadback = IoIn32(queueAddressPort);
+    const uint8_t statusReadback = IoIn8(statusPort);
+
+    hit.LegacyQueueBuffer = queueBuffer;
+    hit.LegacyQueueEntries = queue0Size;
+    hit.LegacyQueueBytes = queueBytes;
+    hit.LegacyQueueRingBytes = queueRingBytes;
+    hit.LegacyQueueScratchOffset = queueScratchOffset;
+    hit.LegacyQueuePfn = queuePfnReadback;
+    hit.LegacyQueueAvailIndex = 0u;
+    hit.LegacyQueueLastUsedIndex = 0u;
+    hit.LegacyQueueLastTag = 0u;
+    hit.LegacyQueueLastRequestBytes = 0u;
+    hit.LegacyQueueLastResponseBytes = 0u;
+    hit.LegacyQueueRequestOutstanding = false;
+    hit.LegacyQueueProgrammed = (queuePfnReadback != 0u);
+    hit.LegacyVersionNegotiated = false;
+    hit.LegacyVersionMsize = 0u;
+    hit.LegacyVersionName[0] = '\0';
+    hit.LegacySessionAttached = false;
+
+    char line0[192] = {};
+    size_t pos0 = 0u;
+    AppendString(line0, sizeof(line0), pos0, "HOSTSHARE QSETUP ");
+    AppendUInt(line0, sizeof(line0), pos0, requestedIndex);
+    AppendString(line0, sizeof(line0), pos0, " Q0 E ");
+    AppendUInt(line0, sizeof(line0), pos0, queue0Size);
+    AppendString(line0, sizeof(line0), pos0, " RB ");
+    AppendUInt(line0, sizeof(line0), pos0, queueRingBytes);
+    AppendString(line0, sizeof(line0), pos0, " TB ");
+    AppendUInt(line0, sizeof(line0), pos0, queueBytes);
+    PushLog(line0);
+
+    char line1[192] = {};
+    size_t pos1 = 0u;
+    AppendString(line1, sizeof(line1), pos1, "HOSTSHARE QSETUP V ");
+    AppendHex(line1, sizeof(line1), pos1, queueBuffer.VirtualAddress);
+    AppendString(line1, sizeof(line1), pos1, " P ");
+    AppendHex(line1, sizeof(line1), pos1, queueBuffer.PhysicalAddress);
+    AppendString(line1, sizeof(line1), pos1, " PFN ");
+    AppendHex(line1, sizeof(line1), pos1, queuePfnReadback);
+    PushLog(line1);
+
+    char line2[128] = {};
+    size_t pos2 = 0u;
+    AppendString(line2, sizeof(line2), pos2, "HOSTSHARE QSETUP ST ");
+    AppendHex(line2, sizeof(line2), pos2, statusReadback);
+    PushLog(line2);
+}
+
+static void RunHostShareQueueKick(const char *args) {
+    static constexpr uint8_t PciOffsetBar0 = 0x10u;
+    static constexpr uint8_t VirtioIoOffsetQueueNotify = 0x10u;
+    static constexpr uint8_t VirtioIoOffsetDeviceStatus = 0x12u;
+
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE QKICK UNSCANNED");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    if (!ResolveHostShareHitIndex(args, requestedIndex)) {
+        PushLog("HOSTSHARE QKICK USAGE HOSTSHARE QKICK [INDEX]");
+        return;
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE QKICK INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacyQueueProgrammed || !hit.LegacyQueueBuffer.Valid || hit.LegacyQueueEntries < 2u) {
+        PushLog("HOSTSHARE QKICK REQUIRES QSETUP");
+        return;
+    }
+
+    const FHostShareLegacyVirtqLayout layout = BuildHostShareLegacyVirtqLayout(hit.LegacyQueueEntries);
+    volatile uint8_t *queueBase = reinterpret_cast<volatile uint8_t *>(hit.LegacyQueueBuffer.VirtualAddress);
+    auto *desc = reinterpret_cast<volatile FHostShareLegacyVirtqDescriptor *>(queueBase + layout.DescOffset);
+    volatile uint8_t *avail = queueBase + layout.AvailOffset;
+    volatile uint8_t *used = queueBase + layout.UsedOffset;
+
+    const uint16_t usedIndexBefore = ReadLe16(used + 2u);
+    if (hit.LegacyQueueRequestOutstanding && usedIndexBefore == hit.LegacyQueueLastUsedIndex) {
+        PushLog("HOSTSHARE QKICK BUSY (POLL)");
+        return;
+    }
+
+    const uint32_t requestOffset = hit.LegacyQueueScratchOffset;
+    const uint32_t responseOffset = requestOffset + 256u;
+    if (responseOffset + 512u > hit.LegacyQueueBytes) {
+        PushLog("HOSTSHARE QKICK SCRATCH RANGE");
+        return;
+    }
+
+    volatile uint8_t *request = queueBase + requestOffset;
+    volatile uint8_t *response = queueBase + responseOffset;
+    for (uint32_t i = 0u; i < 512u; i++) {
+        response[i] = 0u;
+    }
+
+    const uint16_t tag = static_cast<uint16_t>(hit.LegacyQueueLastTag + 1u);
+    static constexpr uint32_t requestBytes = 21u;
+    WriteLe32(request + 0u, requestBytes);
+    request[4] = 100u; // Tversion
+    WriteLe16(request + 5u, tag);
+    WriteLe32(request + 7u, 65536u); // msize
+    WriteLe16(request + 11u, 8u);
+    request[13] = '9';
+    request[14] = 'P';
+    request[15] = '2';
+    request[16] = '0';
+    request[17] = '0';
+    request[18] = '0';
+    request[19] = '.';
+    request[20] = 'L';
+
+    const uint64_t requestPhys = hit.LegacyQueueBuffer.PhysicalAddress + requestOffset;
+    const uint64_t responsePhys = hit.LegacyQueueBuffer.PhysicalAddress + responseOffset;
+
+    desc[0].Address = requestPhys;
+    desc[0].Length = requestBytes;
+    desc[0].Flags = 0x0001u; // NEXT
+    desc[0].Next = 1u;
+
+    desc[1].Address = responsePhys;
+    desc[1].Length = 512u;
+    desc[1].Flags = 0x0002u; // WRITE
+    desc[1].Next = 0u;
+
+    const uint16_t availIndex = ReadLe16(avail + 2u);
+    const uint32_t ringEntryOffset = 4u +
+                                     (2u * (static_cast<uint32_t>(availIndex) %
+                                             static_cast<uint32_t>(hit.LegacyQueueEntries)));
+    WriteLe16(avail + ringEntryOffset, 0u);
+    WriteLe16(avail + 2u, static_cast<uint16_t>(availIndex + 1u));
+
+    const uint8_t bus = static_cast<uint8_t>(hit.Bus);
+    const uint8_t device = hit.Device;
+    const uint8_t function = hit.Function;
+    const uint32_t bar0 = FPciConfigX86::Read32(bus, device, function, PciOffsetBar0);
+    if ((bar0 & 0x1u) == 0u) {
+        PushLog("HOSTSHARE QKICK BAR0 NOT_IO");
+        return;
+    }
+
+    const uint16_t ioBase = static_cast<uint16_t>(bar0 & 0xFFFCu);
+    const uint16_t queueNotifyPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetQueueNotify);
+    const uint16_t statusPort = static_cast<uint16_t>(ioBase + VirtioIoOffsetDeviceStatus);
+
+    IoOut8(statusPort, 0x07u); // ACK|DRIVER|DRIVER_OK
+    __asm__ volatile("" ::: "memory");
+    IoOut16(queueNotifyPort, 0u);
+
+    hit.LegacyQueueAvailIndex = static_cast<uint16_t>(availIndex + 1u);
+    hit.LegacyQueueLastUsedIndex = usedIndexBefore;
+    hit.LegacyQueueLastTag = tag;
+    hit.LegacyQueueLastRequestBytes = requestBytes;
+    hit.LegacyQueueLastResponseBytes = 512u;
+    hit.LegacyQueueRequestOutstanding = true;
+
+    char line[160] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "HOSTSHARE QKICK ");
+    AppendUInt(line, sizeof(line), pos, requestedIndex);
+    AppendString(line, sizeof(line), pos, " TAG ");
+    AppendUInt(line, sizeof(line), pos, tag);
+    AppendString(line, sizeof(line), pos, " AV ");
+    AppendUInt(line, sizeof(line), pos, hit.LegacyQueueAvailIndex);
+    AppendString(line, sizeof(line), pos, " USED ");
+    AppendUInt(line, sizeof(line), pos, usedIndexBefore);
+    PushLog(line);
+}
+
+static void RunHostShareQueueRoundTrip(const char *args) {
+    uint64_t requestedIndex = 0u;
+    if (!ResolveHostShareHitIndex(args, requestedIndex)) {
+        PushLog("HOSTSHARE QROUNDTRIP USAGE HOSTSHARE QROUNDTRIP [INDEX]");
+        return;
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE QROUNDTRIP INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacyQueueProgrammed || !hit.LegacyQueueBuffer.Valid) {
+        RunHostShareQueueSetup(args);
+    }
+
+    RunHostShareQueueKick(args);
+
+    // Poll locally to reduce manual command churn during bring-up.
+    static constexpr uint64_t maxPolls = 200000ull;
+    uint16_t usedIndex = 0u;
+    uint32_t usedId = 0u;
+    uint32_t usedLength = 0u;
+    volatile uint8_t *response = nullptr;
+
+    bool completed = false;
+    for (uint64_t i = 0u; i < maxPolls; i++) {
+        if (TryReadHostShareQueueCompletion(hit, usedIndex, usedId, usedLength, response)) {
+            completed = true;
+            break;
+        }
+        YieldLongOperationPoll(i + 1u);
+    }
+
+    if (!completed) {
+        PushLog("HOSTSHARE QROUNDTRIP TIMEOUT");
+        RunHostShareQueuePoll(args);
+        return;
+    }
+
+    RunHostShareQueuePoll(args);
+}
+
+static void RunHostShareAttach(const char *args) {
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE ATTACH UNSCANNED");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    const char *anameToken = "";
+    if (args != nullptr && args[0] != '\0') {
+        const char *cursor = args;
+        char tokenA[96] = {};
+        if (!ReadToken(cursor, tokenA, sizeof(tokenA))) {
+            PushLog("HOSTSHARE ATTACH USAGE HOSTSHARE ATTACH [INDEX] [ANAME]");
+            return;
+        }
+
+        uint64_t parsedIndex = 0u;
+        if (ParseUInt(tokenA, parsedIndex)) {
+            requestedIndex = parsedIndex;
+            char tokenB[96] = {};
+            if (ReadToken(cursor, tokenB, sizeof(tokenB))) {
+                anameToken = tokenB;
+                char extraToken[8] = {};
+                if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                    PushLog("HOSTSHARE ATTACH TOO MANY ARGS");
+                    return;
+                }
+            }
+        } else {
+            anameToken = tokenA;
+            char extraToken[8] = {};
+            if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                PushLog("HOSTSHARE ATTACH TOO MANY ARGS");
+                return;
+            }
+        }
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE ATTACH INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacyQueueProgrammed || !hit.LegacyQueueBuffer.Valid) {
+        PushLog("HOSTSHARE ATTACH REQUIRES QSETUP");
+        return;
+    }
+
+    bool versionTimedOut = false;
+    if (!TryHostShareNegotiateVersion(hit, requestedIndex, true, versionTimedOut)) {
+        PushLog(versionTimedOut ? "HOSTSHARE VERSION TIMEOUT" : "HOSTSHARE VERSION FAIL");
+        return;
+    }
+
+    uint8_t request[192] = {};
+    const uint16_t anameLength = static_cast<uint16_t>(StringLength32(anameToken));
+    const uint32_t requestLength = static_cast<uint32_t>(4u + 1u + 2u + 4u + 4u + 2u + 0u + 2u + anameLength + 4u);
+    if (requestLength > sizeof(request)) {
+        PushLog("HOSTSHARE ATTACH ANAME TOO LONG");
+        return;
+    }
+
+    uint32_t w = 0u;
+    WriteLe32(request + w, requestLength);
+    w += 4u;
+    request[w++] = 104u; // Tattach
+    WriteLe16(request + w, 0u); // tag patched by submit helper
+    w += 2u;
+    WriteLe32(request + w, hit.LegacySessionRootFid);
+    w += 4u;
+    WriteLe32(request + w, 0xFFFFFFFFu); // afid (no auth)
+    w += 4u;
+    WriteLe16(request + w, 0u); // uname
+    w += 2u;
+    WriteLe16(request + w, anameLength);
+    w += 2u;
+    for (uint16_t i = 0u; i < anameLength; i++) {
+        request[w++] = static_cast<uint8_t>(anameToken[i]);
+    }
+    WriteLe32(request + w, 0xFFFFFFFFu); // n_uname
+
+    uint16_t usedIndex = 0u;
+    uint32_t usedId = 0u;
+    uint32_t usedLength = 0u;
+    uint32_t responseSize = 0u;
+    uint8_t responseType = 0u;
+    uint16_t responseTag = 0u;
+    volatile uint8_t *response = nullptr;
+    bool timedOut = false;
+
+    if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                               request,
+                                               requestLength,
+                                               200000ull,
+                                               usedIndex,
+                                               usedId,
+                                               usedLength,
+                                               responseSize,
+                                               responseType,
+                                               responseTag,
+                                               response,
+                                               timedOut)) {
+        PushLog("HOSTSHARE ATTACH SUBMIT FAIL");
+        return;
+    }
+    if (timedOut) {
+        PushLog("HOSTSHARE ATTACH TIMEOUT");
+        return;
+    }
+
+    if (responseType == 105u && responseSize >= 20u) {
+        const uint8_t qidType = response[7u];
+        const uint32_t qidVersion = ReadLe32(response + 8u);
+        const uint64_t qidPath = ReadLe64(response + 12u);
+        hit.LegacySessionAttached = true;
+
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE ATTACH OK IDX ");
+        AppendUInt(line, sizeof(line), pos, requestedIndex);
+        AppendString(line, sizeof(line), pos, " TAG ");
+        AppendUInt(line, sizeof(line), pos, responseTag);
+        AppendString(line, sizeof(line), pos, " QT ");
+        AppendHex(line, sizeof(line), pos, qidType);
+        AppendString(line, sizeof(line), pos, " QV ");
+        AppendHex(line, sizeof(line), pos, qidVersion);
+        AppendString(line, sizeof(line), pos, " QP ");
+        AppendHex(line, sizeof(line), pos, qidPath);
+        PushLog(line);
+        return;
+    }
+
+    if (responseType == 107u && responseSize >= 9u) {
+        char ename[96] = {};
+        (void)CopyAsciiTokenFromLeString(response + 7u,
+                                         (responseSize > 7u) ? (responseSize - 7u) : 0u,
+                                         ename,
+                                         static_cast<uint32_t>(sizeof(ename)));
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE ATTACH RERROR ");
+        AppendString(line, sizeof(line), pos, ename[0] != '\0' ? ename : "<EMPTY>");
+        PushLog(line);
+        return;
+    }
+
+    char line[160] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "HOSTSHARE ATTACH RESP TY ");
+    AppendUInt(line, sizeof(line), pos, responseType);
+    AppendString(line, sizeof(line), pos, " SZ ");
+    AppendUInt(line, sizeof(line), pos, responseSize);
+    PushLog(line);
+}
+
+static uint16_t SplitHostSharePath(const char *path,
+                                   char components[][64],
+                                   uint16_t maxComponents) {
+    if (path == nullptr || maxComponents == 0u) {
+        return 0u;
+    }
+
+    uint16_t count = 0u;
+    uint32_t i = 0u;
+    while (path[i] != '\0') {
+        while (path[i] == '/') {
+            i++;
+        }
+        if (path[i] == '\0') {
+            break;
+        }
+
+        uint32_t begin = i;
+        while (path[i] != '\0' && path[i] != '/') {
+            i++;
+        }
+
+        const uint32_t length = i - begin;
+        if (length == 0u) {
+            continue;
+        }
+
+        if (length == 1u && path[begin] == '.') {
+            continue;
+        }
+
+        if (count >= maxComponents || length >= 64u) {
+            return 0u;
+        }
+
+        for (uint32_t c = 0u; c < length; c++) {
+            components[count][c] = path[begin + c];
+        }
+        components[count][length] = '\0';
+        count++;
+    }
+
+    return count;
+}
+
+static bool SubmitHostShareWalkPath(FShareProbeHit &hit,
+                                    uint64_t requestedIndex,
+                                    const char *path,
+                                    bool emitLogs,
+                                    bool &outSuccess,
+                                    uint16_t &outNwqid,
+                                    uint8_t &outQidType,
+                                    uint32_t &outQidVersion,
+                                    uint64_t &outQidPath) {
+    outSuccess = false;
+    outNwqid = 0u;
+    outQidType = 0u;
+    outQidVersion = 0u;
+    outQidPath = 0u;
+
+    char components[8][64] = {};
+    const uint16_t componentCount = SplitHostSharePath(path, components, 8u);
+    if (path != nullptr && path[0] != '\0' && componentCount == 0u && path[0] != '.') {
+        if (emitLogs) {
+            PushLog("HOSTSHARE WALK NAME TOO LONG");
+        }
+        return false;
+    }
+
+    uint8_t request[640] = {};
+    uint32_t requestLength = static_cast<uint32_t>(4u + 1u + 2u + 4u + 4u + 2u);
+    for (uint16_t i = 0u; i < componentCount; i++) {
+        requestLength += static_cast<uint32_t>(2u + StringLength32(components[i]));
+    }
+    if (requestLength > sizeof(request)) {
+        if (emitLogs) {
+            PushLog("HOSTSHARE WALK REQ TOO LARGE");
+        }
+        return false;
+    }
+
+    uint32_t w = 0u;
+    WriteLe32(request + w, requestLength);
+    w += 4u;
+    request[w++] = 110u; // Twalk
+    WriteLe16(request + w, 0u);
+    w += 2u;
+    WriteLe32(request + w, hit.LegacySessionRootFid);
+    w += 4u;
+    WriteLe32(request + w, hit.LegacySessionWalkFid);
+    w += 4u;
+    WriteLe16(request + w, componentCount);
+    w += 2u;
+    for (uint16_t i = 0u; i < componentCount; i++) {
+        const uint16_t nameLength = static_cast<uint16_t>(StringLength32(components[i]));
+        WriteLe16(request + w, nameLength);
+        w += 2u;
+        for (uint16_t c = 0u; c < nameLength; c++) {
+            request[w++] = static_cast<uint8_t>(components[i][c]);
+        }
+    }
+
+    uint16_t usedIndex = 0u;
+    uint32_t usedId = 0u;
+    uint32_t usedLength = 0u;
+    uint32_t responseSize = 0u;
+    uint8_t responseType = 0u;
+    uint16_t responseTag = 0u;
+    volatile uint8_t *response = nullptr;
+    bool timedOut = false;
+
+    if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                               request,
+                                               requestLength,
+                                               200000ull,
+                                               usedIndex,
+                                               usedId,
+                                               usedLength,
+                                               responseSize,
+                                               responseType,
+                                               responseTag,
+                                               response,
+                                               timedOut)) {
+        if (emitLogs) {
+            PushLog("HOSTSHARE WALK SUBMIT FAIL");
+        }
+        return false;
+    }
+    if (timedOut) {
+        if (emitLogs) {
+            PushLog("HOSTSHARE WALK TIMEOUT");
+        }
+        return false;
+    }
+
+    if (responseType == 111u && responseSize >= 9u) {
+        const uint16_t nwqid = ReadLe16(response + 7u);
+        outNwqid = nwqid;
+        outSuccess = (nwqid == componentCount) || (componentCount == 0u && nwqid == 0u);
+        if (nwqid > 0u && responseSize >= 22u) {
+            outQidType = response[9u];
+            outQidVersion = ReadLe32(response + 10u);
+            outQidPath = ReadLe64(response + 14u);
+        }
+
+        if (emitLogs) {
+            char line[192] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE WALK OK IDX ");
+            AppendUInt(line, sizeof(line), pos, requestedIndex);
+            AppendString(line, sizeof(line), pos, " TAG ");
+            AppendUInt(line, sizeof(line), pos, responseTag);
+            AppendString(line, sizeof(line), pos, " NWQID ");
+            AppendUInt(line, sizeof(line), pos, nwqid);
+            PushLog(line);
+
+            if (nwqid > 0u && responseSize >= 22u) {
+                char qidLine[192] = {};
+                size_t qidPos = 0u;
+                AppendString(qidLine, sizeof(qidLine), qidPos, "HOSTSHARE WALK QID T ");
+                AppendHex(qidLine, sizeof(qidLine), qidPos, outQidType);
+                AppendString(qidLine, sizeof(qidLine), qidPos, " V ");
+                AppendHex(qidLine, sizeof(qidLine), qidPos, outQidVersion);
+                AppendString(qidLine, sizeof(qidLine), qidPos, " P ");
+                AppendHex(qidLine, sizeof(qidLine), qidPos, outQidPath);
+                PushLog(qidLine);
+            }
+        }
+        return outSuccess;
+    }
+
+    if (responseType == 107u && responseSize >= 9u) {
+        if (emitLogs) {
+            char ename[96] = {};
+            (void)CopyAsciiTokenFromLeString(response + 7u,
+                                             (responseSize > 7u) ? (responseSize - 7u) : 0u,
+                                             ename,
+                                             static_cast<uint32_t>(sizeof(ename)));
+            char line[192] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE WALK RERROR ");
+            AppendString(line, sizeof(line), pos, ename[0] != '\0' ? ename : "<EMPTY>");
+            PushLog(line);
+        }
+        return false;
+    }
+
+    if (emitLogs) {
+        char line[160] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE WALK RESP TY ");
+        AppendUInt(line, sizeof(line), pos, responseType);
+        AppendString(line, sizeof(line), pos, " SZ ");
+        AppendUInt(line, sizeof(line), pos, responseSize);
+        PushLog(line);
+    }
+    return false;
+}
+
+static void RunHostShareWalk(const char *args) {
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE WALK UNSCANNED");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    const char *pathToken = nullptr;
+    if (args != nullptr && args[0] != '\0') {
+        const char *cursor = args;
+        char tokenA[128] = {};
+        if (!ReadToken(cursor, tokenA, sizeof(tokenA))) {
+            PushLog("HOSTSHARE WALK USAGE HOSTSHARE WALK [INDEX] PATH");
+            return;
+        }
+
+        uint64_t parsedIndex = 0u;
+        if (ParseUInt(tokenA, parsedIndex)) {
+            requestedIndex = parsedIndex;
+            char tokenB[128] = {};
+            if (!ReadToken(cursor, tokenB, sizeof(tokenB))) {
+                PushLog("HOSTSHARE WALK USAGE HOSTSHARE WALK [INDEX] PATH");
+                return;
+            }
+            pathToken = tokenB;
+            char extraToken[8] = {};
+            if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                PushLog("HOSTSHARE WALK TOO MANY ARGS");
+                return;
+            }
+        } else {
+            pathToken = tokenA;
+            char extraToken[8] = {};
+            if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                PushLog("HOSTSHARE WALK TOO MANY ARGS");
+                return;
+            }
+        }
+    }
+
+    if (pathToken == nullptr || pathToken[0] == '\0') {
+        PushLog("HOSTSHARE WALK USAGE HOSTSHARE WALK [INDEX] PATH");
+        return;
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE WALK INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacySessionAttached) {
+        PushLog("HOSTSHARE WALK REQUIRES ATTACH");
+        return;
+    }
+
+    bool walkOk = false;
+    uint16_t nwqid = 0u;
+    uint8_t qidType = 0u;
+    uint32_t qidVersion = 0u;
+    uint64_t qidPath = 0u;
+    (void)SubmitHostShareWalkPath(hit,
+                                  requestedIndex,
+                                  pathToken,
+                                  true,
+                                  walkOk,
+                                  nwqid,
+                                  qidType,
+                                  qidVersion,
+                                  qidPath);
+}
+
+static void RunHostShareCat(const char *args) {
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE CAT UNSCANNED");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    const char *pathToken = nullptr;
+    if (args != nullptr && args[0] != '\0') {
+        const char *cursor = args;
+        char tokenA[128] = {};
+        if (!ReadToken(cursor, tokenA, sizeof(tokenA))) {
+            PushLog("HOSTSHARE CAT USAGE HOSTSHARE CAT [INDEX] PATH");
+            return;
+        }
+
+        uint64_t parsedIndex = 0u;
+        if (ParseUInt(tokenA, parsedIndex)) {
+            requestedIndex = parsedIndex;
+            char tokenB[128] = {};
+            if (!ReadToken(cursor, tokenB, sizeof(tokenB))) {
+                PushLog("HOSTSHARE CAT USAGE HOSTSHARE CAT [INDEX] PATH");
+                return;
+            }
+            pathToken = tokenB;
+            char extraToken[8] = {};
+            if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                PushLog("HOSTSHARE CAT TOO MANY ARGS");
+                return;
+            }
+        } else {
+            pathToken = tokenA;
+            char extraToken[8] = {};
+            if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                PushLog("HOSTSHARE CAT TOO MANY ARGS");
+                return;
+            }
+        }
+    }
+
+    if (pathToken == nullptr || pathToken[0] == '\0') {
+        PushLog("HOSTSHARE CAT USAGE HOSTSHARE CAT [INDEX] PATH");
+        return;
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE CAT INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacySessionAttached) {
+        PushLog("HOSTSHARE CAT REQUIRES ATTACH");
+        return;
+    }
+
+    if (!hit.LegacyVersionNegotiated) {
+        PushLog("HOSTSHARE CAT REQUIRES VERSION");
+        return;
+    }
+
+    const bool protocolIsDotL = StartsWith(hit.LegacyVersionName, "9P2000.L");
+    const bool protocolIsDotU = StartsWith(hit.LegacyVersionName, "9P2000.u");
+
+    bool walkOk = false;
+    uint16_t nwqid = 0u;
+    uint8_t qidType = 0u;
+    uint32_t qidVersion = 0u;
+    uint64_t qidPath = 0u;
+    if (!SubmitHostShareWalkPath(hit,
+                                 requestedIndex,
+                                 pathToken,
+                                 true,
+                                 walkOk,
+                                 nwqid,
+                                 qidType,
+                                 qidVersion,
+                                 qidPath) ||
+        !walkOk || nwqid == 0u) {
+        PushLog("HOSTSHARE CAT WALK FAIL");
+        return;
+    }
+
+    uint8_t openRequest[24] = {};
+    uint32_t openRequestSize = 0u;
+    if (protocolIsDotL) {
+        openRequestSize = 17u;
+        WriteLe32(openRequest + 0u, openRequestSize);
+        openRequest[4] = 12u; // Tlopen
+        WriteLe16(openRequest + 5u, 0u);
+        WriteLe32(openRequest + 7u, hit.LegacySessionWalkFid);
+        WriteLe32(openRequest + 11u, 0u); // O_RDONLY
+    } else if (protocolIsDotU || StartsWith(hit.LegacyVersionName, "9P2000")) {
+        openRequestSize = 12u;
+        WriteLe32(openRequest + 0u, openRequestSize);
+        openRequest[4] = 112u; // Topen
+        WriteLe16(openRequest + 5u, 0u);
+        WriteLe32(openRequest + 7u, hit.LegacySessionWalkFid);
+        openRequest[11] = 0u; // OREAD
+    } else {
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE CAT UNSUPPORTED PROTOCOL ");
+        AppendString(line,
+                     sizeof(line),
+                     pos,
+                     hit.LegacyVersionName[0] != '\0' ? hit.LegacyVersionName : "<EMPTY>");
+        PushLog(line);
+        return;
+    }
+
+    uint16_t usedIndex = 0u;
+    uint32_t usedId = 0u;
+    uint32_t usedLength = 0u;
+    uint32_t responseSize = 0u;
+    uint8_t responseType = 0u;
+    uint16_t responseTag = 0u;
+    volatile uint8_t *response = nullptr;
+    bool timedOut = false;
+
+    if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                               openRequest,
+                                               openRequestSize,
+                                               200000ull,
+                                               usedIndex,
+                                               usedId,
+                                               usedLength,
+                                               responseSize,
+                                               responseType,
+                                               responseTag,
+                                               response,
+                                               timedOut) ||
+        timedOut) {
+        PushLog(timedOut ? "HOSTSHARE CAT OPEN TIMEOUT" : "HOSTSHARE CAT OPEN FAIL");
+        return;
+    }
+
+    const uint8_t expectedOpenResponseType = protocolIsDotL ? 13u : 113u;
+    if (responseType != expectedOpenResponseType || responseSize < 24u) {
+        if (responseType == 107u && responseSize >= 9u) {
+            char ename[96] = {};
+            (void)CopyAsciiTokenFromLeString(response + 7u,
+                                             (responseSize > 7u) ? (responseSize - 7u) : 0u,
+                                             ename,
+                                             static_cast<uint32_t>(sizeof(ename)));
+            char line[192] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE CAT OPEN RERROR ");
+            AppendString(line, sizeof(line), pos, ename[0] != '\0' ? ename : "<EMPTY>");
+            PushLog(line);
+        } else if (responseType == 7u && responseSize >= 11u) {
+            const uint32_t errnoValue = ReadLe32(response + 7u);
+            char line[192] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE CAT OPEN RLERROR ERRNO ");
+            AppendUInt(line, sizeof(line), pos, errnoValue);
+            PushLog(line);
+        }
+        PushLog("HOSTSHARE CAT OPEN RESP FAIL");
+        return;
+    }
+
+    uint8_t readRequest[32] = {};
+    WriteLe32(readRequest + 0u, 23u);
+    readRequest[4] = 116u; // Tread
+    WriteLe16(readRequest + 5u, 0u);
+    WriteLe32(readRequest + 7u, hit.LegacySessionWalkFid);
+    static constexpr uint32_t readWindowBytes = 1024u;
+    static constexpr uint32_t maxReadWindows = 256u;
+    WriteLe32(readRequest + 19u, readWindowBytes);
+
+    uint64_t readOffset = 0ull;
+    uint64_t totalRead = 0ull;
+    bool sawEof = false;
+    for (uint32_t window = 0u; window < maxReadWindows; window++) {
+        for (uint32_t i = 0u; i < 8u; i++) {
+            readRequest[11u + i] = static_cast<uint8_t>((readOffset >> (8u * i)) & 0xFFull);
+        }
+
+        if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                                   readRequest,
+                                                   23u,
+                                                   300000ull,
+                                                   usedIndex,
+                                                   usedId,
+                                                   usedLength,
+                                                   responseSize,
+                                                   responseType,
+                                                   responseTag,
+                                                   response,
+                                                   timedOut) ||
+            timedOut) {
+            PushLog(timedOut ? "HOSTSHARE CAT READ TIMEOUT" : "HOSTSHARE CAT READ FAIL");
+            return;
+        }
+
+        if (responseType == 117u && responseSize >= 11u) {
+            uint32_t readCount = ReadLe32(response + 7u);
+            const uint32_t payloadBytes = (responseSize > 11u) ? (responseSize - 11u) : 0u;
+            if (readCount > payloadBytes) {
+                readCount = payloadBytes;
+            }
+
+            char head[128] = {};
+            size_t headPos = 0u;
+            AppendString(head, sizeof(head), headPos, "HOSTSHARE CAT READ ");
+            AppendUInt(head, sizeof(head), headPos, readCount);
+            PushLog(head);
+
+            if (readCount == 0u) {
+                sawEof = true;
+                break;
+            }
+
+            uint32_t cursor = 0u;
+            while (cursor < readCount) {
+                char line[96] = {};
+                size_t pos = 0u;
+                AppendString(line, sizeof(line), pos, "CAT ");
+                const uint32_t chunk = ((readCount - cursor) > 80u) ? 80u : (readCount - cursor);
+                for (uint32_t i = 0u; i < chunk; i++) {
+                    const uint8_t c = response[11u + cursor + i];
+                    AppendChar(line, sizeof(line), pos, (c >= 32u && c <= 126u) ? static_cast<char>(c) : '.');
+                }
+                PushLog(line);
+                cursor += chunk;
+            }
+
+            totalRead += static_cast<uint64_t>(readCount);
+            readOffset += static_cast<uint64_t>(readCount);
+            if (readCount < readWindowBytes) {
+                sawEof = true;
+                break;
+            }
+            continue;
+        }
+
+        if (responseType == 107u && responseSize >= 9u) {
+            char ename[96] = {};
+            (void)CopyAsciiTokenFromLeString(response + 7u,
+                                             (responseSize > 7u) ? (responseSize - 7u) : 0u,
+                                             ename,
+                                             static_cast<uint32_t>(sizeof(ename)));
+            char line[192] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE CAT RERROR ");
+            AppendString(line, sizeof(line), pos, ename[0] != '\0' ? ename : "<EMPTY>");
+            PushLog(line);
+            return;
+        }
+
+        PushLog("HOSTSHARE CAT READ RESP FAIL");
+        return;
+    }
+
+    if (sawEof) {
+        char line[128] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE CAT EOF TOTAL ");
+        AppendUInt(line, sizeof(line), pos, totalRead);
+        PushLog(line);
+    }
+
+    uint8_t clunkRequest[16] = {};
+    WriteLe32(clunkRequest + 0u, 11u);
+    clunkRequest[4] = 120u; // Tclunk
+    WriteLe16(clunkRequest + 5u, 0u);
+    WriteLe32(clunkRequest + 7u, hit.LegacySessionWalkFid);
+    (void)TrySubmitHostShareQueueRequestAndWait(hit,
+                                                clunkRequest,
+                                                11u,
+                                                200000ull,
+                                                usedIndex,
+                                                usedId,
+                                                usedLength,
+                                                responseSize,
+                                                responseType,
+                                                responseTag,
+                                                response,
+                                                timedOut);
+}
+
+static void RunHostShareList(const char *args) {
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE LS UNSCANNED");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    const char *pathToken = ".";
+    if (args != nullptr && args[0] != '\0') {
+        const char *cursor = args;
+        char tokenA[128] = {};
+        if (!ReadToken(cursor, tokenA, sizeof(tokenA))) {
+            PushLog("HOSTSHARE LS USAGE HOSTSHARE LS [INDEX] [PATH]");
+            return;
+        }
+
+        uint64_t parsedIndex = 0u;
+        if (ParseUInt(tokenA, parsedIndex)) {
+            requestedIndex = parsedIndex;
+            char tokenB[128] = {};
+            if (ReadToken(cursor, tokenB, sizeof(tokenB))) {
+                pathToken = tokenB;
+                char extraToken[8] = {};
+                if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                    PushLog("HOSTSHARE LS TOO MANY ARGS");
+                    return;
+                }
+            }
+        } else {
+            pathToken = tokenA;
+            char extraToken[8] = {};
+            if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+                PushLog("HOSTSHARE LS TOO MANY ARGS");
+                return;
+            }
+        }
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE LS INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacySessionAttached) {
+        PushLog("HOSTSHARE LS REQUIRES ATTACH");
+        return;
+    }
+
+    if (!hit.LegacyVersionNegotiated) {
+        PushLog("HOSTSHARE LS REQUIRES VERSION");
+        return;
+    }
+
+    const bool protocolIsDotL = StartsWith(hit.LegacyVersionName, "9P2000.L");
+    const bool protocolIsDotU = StartsWith(hit.LegacyVersionName, "9P2000.u");
+
+    bool walkOk = false;
+    uint16_t nwqid = 0u;
+    uint8_t qidType = 0u;
+    uint32_t qidVersion = 0u;
+    uint64_t qidPath = 0u;
+    if (!SubmitHostShareWalkPath(hit,
+                                 requestedIndex,
+                                 pathToken,
+                                 true,
+                                 walkOk,
+                                 nwqid,
+                                 qidType,
+                                 qidVersion,
+                                 qidPath) ||
+        !walkOk) {
+        PushLog("HOSTSHARE LS WALK FAIL");
+        return;
+    }
+
+    uint8_t openRequest[24] = {};
+    uint32_t openRequestSize = 0u;
+    if (protocolIsDotL) {
+        openRequestSize = 17u;
+        WriteLe32(openRequest + 0u, openRequestSize);
+        openRequest[4] = 12u; // Tlopen
+        WriteLe16(openRequest + 5u, 0u);
+        WriteLe32(openRequest + 7u, hit.LegacySessionWalkFid);
+        WriteLe32(openRequest + 11u, 0u); // O_RDONLY
+    } else {
+        openRequestSize = 12u;
+        WriteLe32(openRequest + 0u, openRequestSize);
+        openRequest[4] = 112u; // Topen
+        WriteLe16(openRequest + 5u, 0u);
+        WriteLe32(openRequest + 7u, hit.LegacySessionWalkFid);
+        openRequest[11] = 0u; // OREAD
+    }
+
+    uint16_t usedIndex = 0u;
+    uint32_t usedId = 0u;
+    uint32_t usedLength = 0u;
+    uint32_t responseSize = 0u;
+    uint8_t responseType = 0u;
+    uint16_t responseTag = 0u;
+    volatile uint8_t *response = nullptr;
+    bool timedOut = false;
+
+    if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                               openRequest,
+                                               openRequestSize,
+                                               200000ull,
+                                               usedIndex,
+                                               usedId,
+                                               usedLength,
+                                               responseSize,
+                                               responseType,
+                                               responseTag,
+                                               response,
+                                               timedOut) ||
+        timedOut) {
+        PushLog(timedOut ? "HOSTSHARE LS OPEN TIMEOUT" : "HOSTSHARE LS OPEN FAIL");
+        return;
+    }
+
+    const uint8_t expectedOpenResponseType = protocolIsDotL ? 13u : 113u;
+    if (responseType != expectedOpenResponseType || responseSize < 24u) {
+        if (responseType == 107u && responseSize >= 9u) {
+            char ename[96] = {};
+            (void)CopyAsciiTokenFromLeString(response + 7u,
+                                             (responseSize > 7u) ? (responseSize - 7u) : 0u,
+                                             ename,
+                                             static_cast<uint32_t>(sizeof(ename)));
+            char line[192] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE LS OPEN RERROR ");
+            AppendString(line, sizeof(line), pos, ename[0] != '\0' ? ename : "<EMPTY>");
+            PushLog(line);
+        } else if (responseType == 7u && responseSize >= 11u) {
+            const uint32_t errnoValue = ReadLe32(response + 7u);
+            char line[160] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE LS OPEN RLERROR ERRNO ");
+            AppendUInt(line, sizeof(line), pos, errnoValue);
+            PushLog(line);
+        }
+        PushLog("HOSTSHARE LS OPEN RESP FAIL");
+        return;
+    }
+
+    uint8_t readRequest[32] = {};
+    WriteLe32(readRequest + 0u, 23u);
+    if (protocolIsDotL) {
+        readRequest[4] = 40u; // Treaddir
+    } else if (protocolIsDotU) {
+        readRequest[4] = 116u; // Tread on directories for 9P2000.u
+    } else {
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE LS UNSUPPORTED PROTOCOL ");
+        AppendString(line,
+                     sizeof(line),
+                     pos,
+                     hit.LegacyVersionName[0] != '\0' ? hit.LegacyVersionName : "<EMPTY>");
+        PushLog(line);
+        return;
+    }
+    WriteLe16(readRequest + 5u, 0u);
+    WriteLe32(readRequest + 7u, hit.LegacySessionWalkFid);
+    for (uint32_t i = 0u; i < 8u; i++) {
+        readRequest[11u + i] = 0u;
+    }
+    WriteLe32(readRequest + 19u, 4096u);
+
+    if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                               readRequest,
+                                               23u,
+                                               300000ull,
+                                               usedIndex,
+                                               usedId,
+                                               usedLength,
+                                               responseSize,
+                                               responseType,
+                                               responseTag,
+                                               response,
+                                               timedOut) ||
+        timedOut) {
+        PushLog(timedOut ? "HOSTSHARE LS READ TIMEOUT" : "HOSTSHARE LS READ FAIL");
+        return;
+    }
+
+    if ((responseType == 41u || responseType == 117u) && responseSize >= 11u) {
+        const uint32_t readCount = ReadLe32(response + 7u);
+        char head[128] = {};
+        size_t headPos = 0u;
+        AppendString(head, sizeof(head), headPos, "HOSTSHARE LS READ ");
+        AppendUInt(head, sizeof(head), headPos, readCount);
+        PushLog(head);
+
+        uint32_t offset = 0u;
+        uint32_t entryCount = 0u;
+        while ((offset + 24u) <= readCount) {
+            const volatile uint8_t *entry = response + 11u + offset;
+            const uint8_t dtype = entry[21u];
+            const uint16_t nameLength = ReadLe16(entry + 22u);
+            const uint32_t recordBytes = 24u + static_cast<uint32_t>(nameLength);
+            if (recordBytes == 24u || (offset + recordBytes) > readCount) {
+                break;
+            }
+
+            char name[80] = {};
+            const uint32_t copyLen = (nameLength < 79u) ? nameLength : 79u;
+            for (uint32_t i = 0u; i < copyLen; i++) {
+                const uint8_t c = entry[24u + i];
+                name[i] = (c >= 32u && c <= 126u) ? static_cast<char>(c) : '.';
+            }
+            name[copyLen] = '\0';
+
+            char line[160] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "LS ");
+            AppendString(line, sizeof(line), pos, name);
+            AppendString(line, sizeof(line), pos, " DT ");
+            AppendHex(line, sizeof(line), pos, dtype);
+            PushLog(line);
+
+            entryCount++;
+            offset += recordBytes;
+        }
+
+        if (entryCount == 0u) {
+            PushLog("HOSTSHARE LS NO ENTRIES PARSED");
+        }
+    } else if (responseType == 107u && responseSize >= 9u) {
+        char ename[96] = {};
+        (void)CopyAsciiTokenFromLeString(response + 7u,
+                                         (responseSize > 7u) ? (responseSize - 7u) : 0u,
+                                         ename,
+                                         static_cast<uint32_t>(sizeof(ename)));
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE LS RERROR ");
+        AppendString(line, sizeof(line), pos, ename[0] != '\0' ? ename : "<EMPTY>");
+        PushLog(line);
+    } else if (responseType == 7u && responseSize >= 11u) {
+        const uint32_t errnoValue = ReadLe32(response + 7u);
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE LS RLERROR ERRNO ");
+        AppendUInt(line, sizeof(line), pos, errnoValue);
+        PushLog(line);
+    } else {
+        PushLog("HOSTSHARE LS READ RESP FAIL");
+    }
+
+    uint8_t clunkRequest[16] = {};
+    WriteLe32(clunkRequest + 0u, 11u);
+    clunkRequest[4] = 120u; // Tclunk
+    WriteLe16(clunkRequest + 5u, 0u);
+    WriteLe32(clunkRequest + 7u, hit.LegacySessionWalkFid);
+    (void)TrySubmitHostShareQueueRequestAndWait(hit,
+                                                clunkRequest,
+                                                11u,
+                                                200000ull,
+                                                usedIndex,
+                                                usedId,
+                                                usedLength,
+                                                responseSize,
+                                                responseType,
+                                                responseTag,
+                                                response,
+                                                timedOut);
+}
+
+static void RunHostShareAutoMap(const char *args) {
+    if (args != nullptr && args[0] != '\0') {
+        PushLog("HOSTSHARE AUTOMAP USAGE HOSTSHARE AUTOMAP");
+        return;
+    }
+
+    PushLog("HOSTSHARE AUTOMAP BEGIN");
+    PushLog("HOSTSHARE AUTOMAP PLAN ONLY (NO VFS HOSTSHARE DRIVER)");
+    RunShareProbe();
+
+    if (!GShareProbeHasScan || GShareProbeStoredHitCount == 0u) {
+        PushLog("HOSTSHARE AUTOMAP NONE");
+        return;
+    }
+
+    uint32_t readyCount = 0u;
+    for (uint32_t i = 0u; i < GShareProbeStoredHitCount; i++) {
+        if (!GShareProbeHits[i].InUse) {
+            continue;
+        }
+
+        char indexArg[24] = {};
+        size_t indexPos = 0u;
+        AppendUInt(indexArg, sizeof(indexArg), indexPos, i);
+
+        RunHostShareQueueSetup(indexArg);
+        RunHostShareAttach(indexArg);
+
+        char listArg[32] = {};
+        size_t listPos = 0u;
+        AppendUInt(listArg, sizeof(listArg), listPos, i);
+        AppendChar(listArg, sizeof(listArg), listPos, ' ');
+        AppendChar(listArg, sizeof(listArg), listPos, '.');
+        RunHostShareList(listArg);
+
+        const FShareProbeHit &hit = GShareProbeHits[i];
+        const bool ready = hit.LegacyQueueProgrammed && hit.LegacyVersionNegotiated && hit.LegacySessionAttached;
+        if (ready) {
+            readyCount++;
+        }
+
+        char line[192] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE MAP IDX ");
+        AppendUInt(line, sizeof(line), pos, i);
+        AppendString(line, sizeof(line), pos, " MOUNT /mnt/host");
+        AppendUInt(line, sizeof(line), pos, i);
+        AppendString(line, sizeof(line), pos, " TYPE ");
+        AppendString(line, sizeof(line), pos, GetVirtioDeviceKindName(hit.VirtioDeviceType));
+        AppendString(line, sizeof(line), pos, " VER ");
+        AppendString(line,
+                     sizeof(line),
+                     pos,
+                     hit.LegacyVersionName[0] != '\0' ? hit.LegacyVersionName : "<NONE>");
+        AppendString(line, sizeof(line), pos, " STATE ");
+        AppendString(line, sizeof(line), pos, ready ? "READY" : "DEGRADED");
+        PushLog(line);
+    }
+
+    char summary[128] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "HOSTSHARE AUTOMAP READY ");
+    AppendUInt(summary, sizeof(summary), summaryPos, readyCount);
+    AppendString(summary, sizeof(summary), summaryPos, " OF ");
+    AppendUInt(summary, sizeof(summary), summaryPos, GShareProbeStoredHitCount);
+    PushLog(summary);
+}
+
+static void RunHostShareQueuePoll(const char *args) {
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE QPOLL UNSCANNED");
+        return;
+    }
+
+    uint64_t requestedIndex = 0u;
+    if (!ResolveHostShareHitIndex(args, requestedIndex)) {
+        PushLog("HOSTSHARE QPOLL USAGE HOSTSHARE QPOLL [INDEX]");
+        return;
+    }
+
+    if (requestedIndex >= GShareProbeStoredHitCount || !GShareProbeHits[requestedIndex].InUse) {
+        PushLog("HOSTSHARE QPOLL INDEX OUT OF RANGE");
+        return;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[requestedIndex];
+    if (!hit.LegacyQueueProgrammed || !hit.LegacyQueueBuffer.Valid) {
+        PushLog("HOSTSHARE QPOLL REQUIRES QSETUP");
+        return;
+    }
+
+    uint16_t usedIndex = 0u;
+    uint32_t usedId = 0u;
+    uint32_t usedLen = 0u;
+    volatile uint8_t *response = nullptr;
+    if (!TryReadHostShareQueueCompletion(hit, usedIndex, usedId, usedLen, response)) {
+        char line[96] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE QPOLL ");
+        AppendUInt(line, sizeof(line), pos, requestedIndex);
+        AppendString(line, sizeof(line), pos, " PENDING USED ");
+        AppendUInt(line, sizeof(line), pos, hit.LegacyQueueLastUsedIndex);
+        PushLog(line);
+        return;
+    }
+
+    const uint32_t responseSize = ReadLe32(response + 0u);
+    const uint8_t responseType = response[4];
+    const uint16_t responseTag = ReadLe16(response + 5u);
+
+    hit.LegacyQueueLastUsedIndex = usedIndex;
+    hit.LegacyQueueRequestOutstanding = false;
+
+    char line0[192] = {};
+    size_t pos0 = 0u;
+    AppendString(line0, sizeof(line0), pos0, "HOSTSHARE QPOLL ");
+    AppendUInt(line0, sizeof(line0), pos0, requestedIndex);
+    AppendString(line0, sizeof(line0), pos0, " USED ");
+    AppendUInt(line0, sizeof(line0), pos0, usedIndex);
+    AppendString(line0, sizeof(line0), pos0, " ID ");
+    AppendUInt(line0, sizeof(line0), pos0, usedId);
+    AppendString(line0, sizeof(line0), pos0, " LEN ");
+    AppendUInt(line0, sizeof(line0), pos0, usedLen);
+    PushLog(line0);
+
+    char line1[192] = {};
+    size_t pos1 = 0u;
+    AppendString(line1, sizeof(line1), pos1, "HOSTSHARE QPOLL RESP SZ ");
+    AppendUInt(line1, sizeof(line1), pos1, responseSize);
+    AppendString(line1, sizeof(line1), pos1, " TY ");
+    AppendUInt(line1, sizeof(line1), pos1, responseType);
+    AppendString(line1, sizeof(line1), pos1, " TAG ");
+    AppendUInt(line1, sizeof(line1), pos1, responseTag);
+    AppendString(line1, sizeof(line1), pos1, " B0 ");
+    AppendHex(line1, sizeof(line1), pos1, response[0]);
+    AppendString(line1, sizeof(line1), pos1, " B1 ");
+    AppendHex(line1, sizeof(line1), pos1, response[1]);
+    PushLog(line1);
+
+    if (responseType == 101u && responseSize >= 13u) {
+        const uint32_t responseMsize = ReadLe32(response + 7u);
+        char version[48] = {};
+        (void)CopyAsciiTokenFromLeString(response + 11u,
+                                         (responseSize > 11u) ? (responseSize - 11u) : 0u,
+                                         version,
+                                         static_cast<uint32_t>(sizeof(version)));
+
+        char line2[192] = {};
+        size_t pos2 = 0u;
+        AppendString(line2, sizeof(line2), pos2, "HOSTSHARE QPOLL RVERSION MSIZE ");
+        AppendUInt(line2, sizeof(line2), pos2, responseMsize);
+        AppendString(line2, sizeof(line2), pos2, " VER ");
+        AppendString(line2, sizeof(line2), pos2, version[0] != '\0' ? version : "<EMPTY>");
+        PushLog(line2);
+    } else if (responseType == 107u && responseSize >= 9u) {
+        char ename[64] = {};
+        (void)CopyAsciiTokenFromLeString(response + 7u,
+                                         (responseSize > 7u) ? (responseSize - 7u) : 0u,
+                                         ename,
+                                         static_cast<uint32_t>(sizeof(ename)));
+
+        char line2[192] = {};
+        size_t pos2 = 0u;
+        AppendString(line2, sizeof(line2), pos2, "HOSTSHARE QPOLL RERROR ");
+        AppendString(line2, sizeof(line2), pos2, ename[0] != '\0' ? ename : "<EMPTY>");
+        PushLog(line2);
+    } else if (responseType == 7u && responseSize >= 11u) {
+        const uint32_t errnoValue = ReadLe32(response + 7u);
+        char line2[160] = {};
+        size_t pos2 = 0u;
+        AppendString(line2, sizeof(line2), pos2, "HOSTSHARE QPOLL RLERROR ERRNO ");
+        AppendUInt(line2, sizeof(line2), pos2, errnoValue);
+        PushLog(line2);
+    }
+}
+
+static void RunHostShareStatus() {
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE STATUS UNSCANNED");
+        PushLog("HOSTSHARE STATUS RUN SHAREPROBE");
+        return;
+    }
+
+    char summary[128] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "HOSTSHARE STATUS VIRTIO ");
+    AppendUInt(summary, sizeof(summary), summaryPos, GShareProbeLastVirtioCount);
+    AppendString(summary, sizeof(summary), summaryPos, " SHARECAP ");
+    AppendUInt(summary, sizeof(summary), summaryPos, GShareProbeLastShareCapableCount);
+    PushLog(summary);
+
+    if (GShareProbeStoredHitCount == 0u) {
+        PushLog("HOSTSHARE STATUS NONE");
+        return;
+    }
+
+    for (uint32_t i = 0u; i < GShareProbeStoredHitCount; i++) {
+        if (!GShareProbeHits[i].InUse) {
+            continue;
+        }
+
+        char line[160] = {};
+        size_t pos = 0u;
+        AppendString(line, sizeof(line), pos, "HOSTSHARE HIT ");
+        AppendUInt(line, sizeof(line), pos, i);
+        AppendString(line, sizeof(line), pos, " BDF ");
+        AppendUInt(line, sizeof(line), pos, GShareProbeHits[i].Bus);
+        AppendChar(line, sizeof(line), pos, ':');
+        AppendUInt(line, sizeof(line), pos, GShareProbeHits[i].Device);
+        AppendChar(line, sizeof(line), pos, '.');
+        AppendUInt(line, sizeof(line), pos, GShareProbeHits[i].Function);
+        AppendString(line, sizeof(line), pos, " DID ");
+        AppendHex(line, sizeof(line), pos, GShareProbeHits[i].DeviceId);
+        AppendString(line, sizeof(line), pos, " TYPE ");
+        AppendString(line, sizeof(line), pos, GetVirtioDeviceKindName(GShareProbeHits[i].VirtioDeviceType));
+        AppendString(line, sizeof(line), pos, " X ");
+        AppendString(line, sizeof(line), pos, GShareProbeHits[i].LegacyTransport ? "LEGACY" : "MODERN");
+        PushLog(line);
+    }
+
+    if (GShareProbeLastShareCapableCount > GShareProbeStoredHitCount) {
+        char extra[96] = {};
+        size_t extraPos = 0u;
+        AppendString(extra, sizeof(extra), extraPos, "HOSTSHARE STATUS TRUNCATED ");
+        AppendUInt(extra, sizeof(extra), extraPos, GShareProbeLastShareCapableCount - GShareProbeStoredHitCount);
+        PushLog(extra);
+    }
+}
+
+static void RunHostSharePciDump() {
+    static constexpr uint8_t PciOffsetRevision = 0x08u;
+    static constexpr uint8_t PciOffsetProgIf = 0x09u;
+    static constexpr uint8_t PciOffsetSubclass = 0x0Au;
+    static constexpr uint8_t PciOffsetClassCode = 0x0Bu;
+    static constexpr uint8_t PciOffsetBar0 = 0x10u;
+    static constexpr uint8_t PciOffsetBar1 = 0x14u;
+    static constexpr uint8_t PciOffsetInterruptLine = 0x3Cu;
+
+    if (!GShareProbeHasScan) {
+        PushLog("HOSTSHARE PCI UNSCANNED");
+        PushLog("HOSTSHARE PCI RUN SHAREPROBE");
+        return;
+    }
+
+    if (GShareProbeStoredHitCount == 0u) {
+        PushLog("HOSTSHARE PCI NONE");
+        return;
+    }
+
+    for (uint32_t i = 0u; i < GShareProbeStoredHitCount; i++) {
+        if (!GShareProbeHits[i].InUse) {
+            continue;
+        }
+
+        const uint8_t bus = static_cast<uint8_t>(GShareProbeHits[i].Bus);
+        const uint8_t device = GShareProbeHits[i].Device;
+        const uint8_t function = GShareProbeHits[i].Function;
+
+        const uint8_t revision = FPciConfigX86::Read8(bus, device, function, PciOffsetRevision);
+        const uint8_t progIf = FPciConfigX86::Read8(bus, device, function, PciOffsetProgIf);
+        const uint8_t subclass = FPciConfigX86::Read8(bus, device, function, PciOffsetSubclass);
+        const uint8_t classCode = FPciConfigX86::Read8(bus, device, function, PciOffsetClassCode);
+        const uint32_t bar0 = FPciConfigX86::Read32(bus, device, function, PciOffsetBar0);
+        const uint32_t bar1 = FPciConfigX86::Read32(bus, device, function, PciOffsetBar1);
+        const uint8_t interruptLine = FPciConfigX86::Read8(bus, device, function, PciOffsetInterruptLine);
+
+        char line0[192] = {};
+        size_t pos0 = 0u;
+        AppendString(line0, sizeof(line0), pos0, "HOSTSHARE PCI ");
+        AppendUInt(line0, sizeof(line0), pos0, i);
+        AppendString(line0, sizeof(line0), pos0, " BDF ");
+        AppendUInt(line0, sizeof(line0), pos0, bus);
+        AppendChar(line0, sizeof(line0), pos0, ':');
+        AppendUInt(line0, sizeof(line0), pos0, device);
+        AppendChar(line0, sizeof(line0), pos0, '.');
+        AppendUInt(line0, sizeof(line0), pos0, function);
+        AppendString(line0, sizeof(line0), pos0, " CLS ");
+        AppendHex(line0, sizeof(line0), pos0, classCode);
+        AppendChar(line0, sizeof(line0), pos0, ':');
+        AppendHex(line0, sizeof(line0), pos0, subclass);
+        AppendChar(line0, sizeof(line0), pos0, ':');
+        AppendHex(line0, sizeof(line0), pos0, progIf);
+        AppendString(line0, sizeof(line0), pos0, " REV ");
+        AppendHex(line0, sizeof(line0), pos0, revision);
+        PushLog(line0);
+
+        char line1[192] = {};
+        size_t pos1 = 0u;
+        AppendString(line1, sizeof(line1), pos1, "HOSTSHARE PCI ");
+        AppendUInt(line1, sizeof(line1), pos1, i);
+        AppendString(line1, sizeof(line1), pos1, " BAR0 ");
+        AppendHex(line1, sizeof(line1), pos1, bar0);
+        AppendString(line1, sizeof(line1), pos1, " BAR1 ");
+        AppendHex(line1, sizeof(line1), pos1, bar1);
+        AppendString(line1, sizeof(line1), pos1, " IRQ ");
+        AppendUInt(line1, sizeof(line1), pos1, interruptLine);
+        PushLog(line1);
+    }
+}
+
+static void RunShareProbe() {
+    static constexpr uint8_t PciOffsetVendorId = 0x00u;
+    static constexpr uint8_t PciOffsetDeviceId = 0x02u;
+    static constexpr uint8_t PciOffsetHeaderType = 0x0Eu;
+
+    uint32_t virtioDeviceCount = 0u;
+    uint32_t shareCapableCount = 0u;
+    ResetHostShareProbeState(true);
+
+    for (uint16_t bus = 0u; bus < 256u; bus++) {
+        for (uint8_t device = 0u; device < 32u; device++) {
+            const uint16_t vendor0 = FPciConfigX86::Read16(static_cast<uint8_t>(bus), device, 0u, PciOffsetVendorId);
+            if (vendor0 == 0xFFFFu) {
+                continue;
+            }
+
+            const uint8_t headerType = FPciConfigX86::Read8(static_cast<uint8_t>(bus), device, 0u, PciOffsetHeaderType);
+            const uint8_t functionCount = ((headerType & 0x80u) != 0u) ? 8u : 1u;
+
+            for (uint8_t function = 0u; function < functionCount; function++) {
+                const uint16_t vendorId =
+                    FPciConfigX86::Read16(static_cast<uint8_t>(bus), device, function, PciOffsetVendorId);
+                if (vendorId == 0xFFFFu || vendorId != 0x1AF4u) {
+                    continue;
+                }
+
+                const uint16_t deviceId =
+                    FPciConfigX86::Read16(static_cast<uint8_t>(bus), device, function, PciOffsetDeviceId);
+                const char *transport = "UNKNOWN";
+                uint16_t virtioDeviceType = 0xFFFFu;
+
+                if (deviceId >= 0x1000u && deviceId <= 0x103Fu) {
+                    virtioDeviceType = static_cast<uint16_t>(deviceId - 0x1000u);
+                    transport = "LEGACY";
+                } else if (deviceId >= 0x1040u && deviceId <= 0x107Fu) {
+                    virtioDeviceType = static_cast<uint16_t>(deviceId - 0x1040u);
+                    transport = "MODERN";
+                }
+
+                virtioDeviceCount++;
+                const bool shareCapable = (virtioDeviceType == 9u) || (virtioDeviceType == 26u);
+                if (shareCapable) {
+                    shareCapableCount++;
+                    if (GShareProbeStoredHitCount < GMaxShareProbeHits) {
+                        GShareProbeHits[GShareProbeStoredHitCount] = FShareProbeHit{
+                            .InUse = true,
+                            .Bus = bus,
+                            .Device = device,
+                            .Function = function,
+                            .DeviceId = deviceId,
+                            .VirtioDeviceType = virtioDeviceType,
+                            .LegacyTransport = (deviceId >= 0x1000u && deviceId <= 0x103Fu),
+                        };
+                        GShareProbeStoredHitCount++;
+                    }
+                }
+
+                char line[160] = {};
+                size_t pos = 0u;
+                AppendString(line, sizeof(line), pos, shareCapable ? "SHAREPROBE HIT BDF " : "SHAREPROBE VIRTIO BDF ");
+                AppendUInt(line, sizeof(line), pos, bus);
+                AppendChar(line, sizeof(line), pos, ':');
+                AppendUInt(line, sizeof(line), pos, device);
+                AppendChar(line, sizeof(line), pos, '.');
+                AppendUInt(line, sizeof(line), pos, function);
+                AppendString(line, sizeof(line), pos, " DID ");
+                AppendHex(line, sizeof(line), pos, deviceId);
+                AppendString(line, sizeof(line), pos, " TYPE ");
+                if (virtioDeviceType == 0xFFFFu) {
+                    AppendString(line, sizeof(line), pos, "NONSTD");
+                } else {
+                    AppendString(line, sizeof(line), pos, GetVirtioDeviceKindName(virtioDeviceType));
+                }
+                AppendString(line, sizeof(line), pos, " X ");
+                AppendString(line, sizeof(line), pos, transport);
+                PushLog(line);
+            }
+        }
+    }
+
+    char summary[128] = {};
+    size_t summaryPos = 0u;
+    AppendString(summary, sizeof(summary), summaryPos, "SHAREPROBE VIRTIO ");
+    AppendUInt(summary, sizeof(summary), summaryPos, virtioDeviceCount);
+    AppendString(summary, sizeof(summary), summaryPos, " SHARECAP ");
+    AppendUInt(summary, sizeof(summary), summaryPos, shareCapableCount);
+    PushLog(summary);
+
+    if (shareCapableCount == 0u) {
+        PushLog("SHAREPROBE NONE");
+    } else {
+        PushLog("SHAREPROBE DETECTED");
+    }
+
+    GShareProbeHasScan = true;
+    GShareProbeLastVirtioCount = virtioDeviceCount;
+    GShareProbeLastShareCapableCount = shareCapableCount;
+}
+
 static void SetRenderSelfTestOn() {
     GRenderSurfaceSelfTestEnabled = true;
     PushLog("RENDERTEST ON");
@@ -11625,6 +14052,80 @@ static void ProcessCommand() {
         GPendingDisplayLatencyExecuteTick = 0ull;
 #endif
         PushLog("KEYLAT OFF");
+    } else if (StrEq(GCommandBuffer, "hostshare status") || StrEq(GCommandBuffer, "sharestatus")) {
+        RunHostShareStatus();
+    } else if (StrEq(GCommandBuffer, "hostshare pci")) {
+        RunHostSharePciDump();
+    } else if (StrEq(GCommandBuffer, "hostshare init") || StartsWith(GCommandBuffer, "hostshare init ")) {
+        if (StrEq(GCommandBuffer, "hostshare init")) {
+            RunHostShareLegacyInit(nullptr);
+        } else {
+            RunHostShareLegacyInit(GCommandBuffer + 15);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare attach") || StartsWith(GCommandBuffer, "hostshare attach ")) {
+        if (StrEq(GCommandBuffer, "hostshare attach")) {
+            RunHostShareAttach(nullptr);
+        } else {
+            RunHostShareAttach(GCommandBuffer + 17);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare walk") || StartsWith(GCommandBuffer, "hostshare walk ")) {
+        if (StrEq(GCommandBuffer, "hostshare walk")) {
+            RunHostShareWalk(nullptr);
+        } else {
+            RunHostShareWalk(GCommandBuffer + 15);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare cat") || StartsWith(GCommandBuffer, "hostshare cat ")) {
+        if (StrEq(GCommandBuffer, "hostshare cat")) {
+            RunHostShareCat(nullptr);
+        } else {
+            RunHostShareCat(GCommandBuffer + 14);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare ls") || StartsWith(GCommandBuffer, "hostshare ls ")) {
+        if (StrEq(GCommandBuffer, "hostshare ls")) {
+            RunHostShareList(nullptr);
+        } else {
+            RunHostShareList(GCommandBuffer + 13);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare automap") || StartsWith(GCommandBuffer, "hostshare automap ")) {
+        if (StrEq(GCommandBuffer, "hostshare automap")) {
+            RunHostShareAutoMap(nullptr);
+        } else {
+            RunHostShareAutoMap(GCommandBuffer + 18);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare qstatus")) {
+        RunHostShareQueueStatus();
+    } else if (StrEq(GCommandBuffer, "hostshare qsetup") || StartsWith(GCommandBuffer, "hostshare qsetup ")) {
+        if (StrEq(GCommandBuffer, "hostshare qsetup")) {
+            RunHostShareQueueSetup(nullptr);
+        } else {
+            RunHostShareQueueSetup(GCommandBuffer + 17);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare qkick") || StartsWith(GCommandBuffer, "hostshare qkick ")) {
+        if (StrEq(GCommandBuffer, "hostshare qkick")) {
+            RunHostShareQueueKick(nullptr);
+        } else {
+            RunHostShareQueueKick(GCommandBuffer + 16);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare qpoll") || StartsWith(GCommandBuffer, "hostshare qpoll ")) {
+        if (StrEq(GCommandBuffer, "hostshare qpoll")) {
+            RunHostShareQueuePoll(nullptr);
+        } else {
+            RunHostShareQueuePoll(GCommandBuffer + 16);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare qroundtrip") || StartsWith(GCommandBuffer, "hostshare qroundtrip ")) {
+        if (StrEq(GCommandBuffer, "hostshare qroundtrip")) {
+            RunHostShareQueueRoundTrip(nullptr);
+        } else {
+            RunHostShareQueueRoundTrip(GCommandBuffer + 21);
+        }
+    } else if (StrEq(GCommandBuffer, "hostshare qclear") || StartsWith(GCommandBuffer, "hostshare qclear ")) {
+        if (StrEq(GCommandBuffer, "hostshare qclear")) {
+            RunHostShareQueueClear(nullptr);
+        } else {
+            RunHostShareQueueClear(GCommandBuffer + 17);
+        }
+    } else if (StrEq(GCommandBuffer, "shareprobe") || StrEq(GCommandBuffer, "virtioscan")) {
+        RunShareProbe();
 #if defined(FORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE)
     } else if (StrEq(GCommandBuffer, "kbdfont") || StrEq(GCommandBuffer, "kbdfont status")) {
         RunKeyboardFontQuery();
@@ -11882,6 +14383,7 @@ void FKernelCommandConsole::Initialize() {
     GParallelProbeAutorunCooldownTicks = GParallelProbeAutorunInitialDelayTicks;
 #endif
     GParallelProbeApDrainNoExecStreak = 0u;
+    ResetHostShareProbeState(true);
 #if defined(FORTRESS_EXPERIMENTAL_DISPLAY_LATENCY)
     PushLog("EXP DISPLAY_LATENCY ON");
 #else
@@ -11893,6 +14395,11 @@ void FKernelCommandConsole::Initialize() {
     PushLog("EXP KBD_FONT_PROFILE OFF");
 #endif
     PushLog("TYPE HELP FOR COMMANDS");
+    PushLog("HOSTSHARE: SHAREPROBE");
+}
+
+void FKernelCommandConsole::AutoMapHostSharesAtBoot() {
+    RunHostShareAutoMap(nullptr);
 }
 
 void FKernelCommandConsole::PollInput() {

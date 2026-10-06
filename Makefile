@@ -12,6 +12,7 @@ PARALLEL_PROBE_AUTORUN ?= 0
 PARALLEL_PROBE_AUTORUN_MICRO_CANARY ?= 0
 DISPLAY_LATENCY_EXPERIMENTAL ?= 0
 KEYBOARD_FONT_PROFILE_EXPERIMENTAL ?= 0
+NO_REBOOT ?= 0
 
 ifeq ($(AP_DRAIN_EXPERIMENTAL),1)
 CXXFLAGS += -DFORTRESS_EXPERIMENTAL_AP_DRAIN_ENABLE
@@ -49,6 +50,10 @@ ifeq ($(KEYBOARD_FONT_PROFILE_EXPERIMENTAL),1)
 CXXFLAGS += -DFORTRESS_EXPERIMENTAL_KEYBOARD_FONT_PROFILE
 endif
 
+ifeq ($(NO_REBOOT),1)
+CXXFLAGS += -DFORTRESS_NO_REBOOT
+endif
+
 ifeq ($(RENDERER_BACKEND),software)
 CXXFLAGS += -DFORTRESS_RENDERER_BACKEND_SOFTWARE
 else ifeq ($(RENDERER_BACKEND),null)
@@ -66,6 +71,20 @@ ISO := $(BUILD_DIR)/fortress.iso
 USB_IMAGE := $(BUILD_DIR)/fortress-usb.iso
 QEMU_LOG ?= $(BUILD_DIR)/qemu-serial.log
 QEMU_SMP ?= 4
+HOST_SYSTEM_DIR ?=
+HOST_SHARED_DIR ?=
+HOST_SYSTEM_DIR_DEFAULT := $(CURDIR)/System
+HOST_SHARED_DIR_DEFAULT := $(CURDIR)/shared
+QEMU_EXTRA_ARGS ?=
+
+ifneq ($(strip $(HOST_SYSTEM_DIR)),)
+QEMU_EXTRA_ARGS += -virtfs local,path=$(HOST_SYSTEM_DIR),mount_tag=host_system,security_model=none,readonly=on
+endif
+
+ifneq ($(strip $(HOST_SHARED_DIR)),)
+QEMU_EXTRA_ARGS += -virtfs local,path=$(HOST_SHARED_DIR),mount_tag=host_shared,security_model=none
+endif
+
 CONTRACT_SMOKE_TIMEOUT ?= 40
 PARALLEL_SMOKE_TIMEOUT ?= 40
 PARALLEL_DISPATCH_BURN_RUNS ?= 15
@@ -80,7 +99,7 @@ BACKUP_TAG_PREFIX ?= backup
 SOURCES := $(shell find src -name '*.cpp')
 OBJECTS := $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 
-.PHONY: all clean limine iso usb-image run run-dev run-probe run-log run-log-check parallel-probe-check parallel-probe-drain-check parallel-probe-smoke parallel-probe-drain-smoke parallel-probe-dispatch-containment-smoke parallel-probe-dispatch-drain-smoke parallel-probe-gate parallel-probe-dispatch-drain-burn parallel-probe-ci parallel-premerge-fast parallel-premerge-gate parallel-premerge-fast-matrix parallel-premerge-matrix parallel-hw-soak-archive dsksurf-contract-check dsksurf-contract-occlusion-check dsksurf-contract-occlusion-strict-check dsksurf-contract-fallback-strict-check dsksurf-contract-token-check dsksurf-contract-smoke backup-snapshot
+.PHONY: all clean limine iso usb-image run run-dev run-probe run-log run-log-check run-shares run-log-shares host-shares-setup parallel-probe-check parallel-probe-drain-check parallel-probe-smoke parallel-probe-drain-smoke parallel-probe-dispatch-containment-smoke parallel-probe-dispatch-drain-smoke parallel-probe-gate parallel-probe-dispatch-drain-burn parallel-probe-ci parallel-premerge-fast parallel-premerge-gate parallel-premerge-fast-matrix parallel-premerge-matrix parallel-hw-soak-archive dsksurf-contract-check dsksurf-contract-occlusion-check dsksurf-contract-occlusion-strict-check dsksurf-contract-fallback-strict-check dsksurf-contract-token-check dsksurf-contract-smoke backup-snapshot
 
 all: $(KERNEL)
 
@@ -145,7 +164,7 @@ usb-image: limine $(KERNEL)
 		$(ISO_DIR) -o $(USB_IMAGE)
 
 run: iso
-	qemu-system-x86_64 -M q35 -m 256M -smp $(QEMU_SMP) -cdrom $(ISO) -serial stdio -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0
+	qemu-system-x86_64 -M q35 -m 256M -smp $(QEMU_SMP) -cdrom $(ISO) -serial stdio -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 $(QEMU_EXTRA_ARGS)
 
 run-dev:
 	@$(MAKE) clean
@@ -164,7 +183,19 @@ run-probe:
 run-log: iso
 	@mkdir -p $(BUILD_DIR)
 	@echo "Logging serial output to $(QEMU_LOG)"
-	qemu-system-x86_64 -M q35 -m 256M -smp $(QEMU_SMP) -cdrom $(ISO) -serial stdio -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 2>&1 | tee $(QEMU_LOG)
+	qemu-system-x86_64 -M q35 -m 256M -smp $(QEMU_SMP) -cdrom $(ISO) -serial stdio -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 $(QEMU_EXTRA_ARGS) 2>&1 | tee $(QEMU_LOG)
+
+host-shares-setup:
+	@mkdir -p "$(HOST_SYSTEM_DIR_DEFAULT)" "$(HOST_SHARED_DIR_DEFAULT)"
+	@echo "Host share folders ready:"
+	@echo "  $(HOST_SYSTEM_DIR_DEFAULT)"
+	@echo "  $(HOST_SHARED_DIR_DEFAULT)"
+
+run-shares: host-shares-setup
+	@$(MAKE) run HOST_SYSTEM_DIR="$(HOST_SYSTEM_DIR_DEFAULT)" HOST_SHARED_DIR="$(HOST_SHARED_DIR_DEFAULT)"
+
+run-log-shares: host-shares-setup
+	@$(MAKE) run-log HOST_SYSTEM_DIR="$(HOST_SYSTEM_DIR_DEFAULT)" HOST_SHARED_DIR="$(HOST_SHARED_DIR_DEFAULT)"
 
 run-log-check:
 	@if [ ! -s "$(QEMU_LOG)" ]; then \

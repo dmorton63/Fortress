@@ -6,6 +6,21 @@ static bool IsModeValid(const FDisplayMode &mode) {
     return mode.Width != 0 && mode.Height != 0 && mode.StrideBytes != 0 && mode.PixelFormat != EPixelFormat::Unknown;
 }
 
+static bool BuildModeFromSurface(const FVideoSurfaceView &surface, FDisplayMode &outMode) {
+    if (!surface.IsValid() || surface.Desc.PixelFormat == EPixelFormat::Unknown) {
+        return false;
+    }
+
+    outMode = FDisplayMode{
+        .Width = surface.Desc.Width,
+        .Height = surface.Desc.Height,
+        .StrideBytes = surface.Desc.StrideBytes,
+        .PixelFormat = surface.Desc.PixelFormat,
+        .PixelMask = surface.Desc.PixelMask,
+    };
+    return IsModeValid(outMode);
+}
+
 static bool IsModeEqual(const FDisplayMode &a, const FDisplayMode &b) {
     return a.Width == b.Width &&
            a.Height == b.Height &&
@@ -30,7 +45,10 @@ bool FDisplayManager::Initialize(FDisplayDevice *inDevice) {
 
     Mode = Device->GetCurrentMode();
     if (!IsModeValid(Mode)) {
-        return false;
+        const FVideoSurfaceView backSurface = Device->GetBackSurface();
+        if (!BuildModeFromSurface(backSurface, Mode)) {
+            return false;
+        }
     }
 
     Ready = true;
@@ -52,7 +70,16 @@ bool FDisplayManager::RefreshMode() {
 
     const FDisplayMode currentMode = Device->GetCurrentMode();
     if (!IsModeValid(currentMode)) {
-        return false;
+        // Keep last valid mode if transient firmware/device mode query is invalid.
+        if (IsModeValid(Mode)) {
+            return true;
+        }
+
+        const FVideoSurfaceView backSurface = Device->GetBackSurface();
+        if (!BuildModeFromSurface(backSurface, Mode)) {
+            return false;
+        }
+        return true;
     }
 
     Mode = currentMode;

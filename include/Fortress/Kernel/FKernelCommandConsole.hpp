@@ -35,6 +35,18 @@ class FKernelCommandConsole {
 
     static void Initialize();
     static void AutoMapHostSharesAtBoot();
+    static Fortress::Core::uint32 GetHostShareDetectedCount();
+    static bool IsHostShareReady(Fortress::Core::uint32 index);
+    static bool TryReadHostShareFile(Fortress::Core::uint32 index,
+                     const char *path,
+                     void *outBuffer,
+                     Fortress::Core::uint32 outBufferBytes,
+                     Fortress::Core::uint32 &outReadBytes);
+    static bool TryWriteHostShareFile(Fortress::Core::uint32 index,
+              const char *path,
+              const void *inBuffer,
+              Fortress::Core::uint32 inBufferBytes,
+              Fortress::Core::uint32 &outWrittenBytes);
     static void PollInput();
     static void SetLongOperationYieldCallback(FLongOperationYieldCallback callback);
     static void BindVideoConsole(Fortress::Video::FVideoConsole *console);

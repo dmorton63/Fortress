@@ -101,6 +101,14 @@ static constexpr size_t GMaxBootLogLines = 128;
 
 static char GCommandBuffer[512] = {};
 static size_t GCommandLength = 0;
+enum class ECommandBlockMode : uint8_t {
+    None = 0u,
+    HostShare,
+    Vfs,
+};
+static ECommandBlockMode GCommandBlockMode = ECommandBlockMode::None;
+static uint32_t GCommandBlockHostShareIndex = 0u;
+static char GCommandBlockVfsMountPath[24] = "/mnt/host0";
 
 #if defined(FORTRESS_PARALLEL_PROBE_AUTORUN)
 static constexpr const char *GParallelProbeAutorunCommands[] = {
@@ -571,7 +579,12 @@ static void HaltCpuForever() {
 
 static void RequestPlatformShutdown() {
 #if defined(FORTRESS_NO_REBOOT)
-    FKernelCommandConsole::PushSystemLog("SHUTDOWN PORT WRITE BLOCKED (NO_REBOOT)");
+    FKernelCommandConsole::PushSystemLog("SHUTDOWN BLOCKED NO_REBOOT");
+    FKernelCommandConsole::PushSystemLog("SHUTDOWN QEMU EXIT SIGNAL");
+    // If QEMU was launched with isa-debug-exit at iobase 0xF4, this exits the VM.
+    // QEMU exit status becomes (value << 1) | 1.
+    IoOut32(0xF4u, 0x10u);
+    IoOut8(0xF4u, 0x10u);
     return;
 #else
     // QEMU/ACPI power management register.
@@ -6809,6 +6822,7 @@ static void RunVfsStat() {
     PushLog(line);
 }
 
+static bool EnsureServicePortAccess(uint16_t portId, uint32_t serviceId, const char *denyContext);
 static void RunVfsResolve(const char *args);
 static void RunLogSave(const char *args);
 
@@ -7119,6 +7133,85 @@ static void RunFsRead(const char *args) {
     AppendString(line, sizeof(line), pos, " DATA ");
 
     const uint32_t previewBytes = readBytes > 48u ? 48u : readBytes;
+    for (uint32_t i = 0u; i < previewBytes; i++) {
+        const char c = readBuffer[i];
+        AppendChar(line, sizeof(line), pos, (c >= 32 && c <= 126) ? c : '.');
+    }
+    if (readBytes > previewBytes) {
+        AppendString(line, sizeof(line), pos, "...");
+    }
+    PushLog(line);
+}
+
+static bool BuildAbsolutePathToken(const char *token, char *outPath, size_t outPathSize) {
+    if (token == nullptr || outPath == nullptr || outPathSize < 4u) {
+        return false;
+    }
+
+    if (token[0] != '/') {
+        return false;
+    }
+
+    size_t pos = 0u;
+    outPath[0] = '\0';
+    for (size_t i = 0u; token[i] != '\0'; i++) {
+        const char c = token[i];
+        if (!IsSafeFsPathChar(c)) {
+            return false;
+        }
+        if (pos + 1u >= outPathSize) {
+            return false;
+        }
+        outPath[pos++] = c;
+        outPath[pos] = '\0';
+    }
+
+    return pos > 1u && outPath[pos - 1u] != '/';
+}
+
+static void RunVfsReadAbsolute(const char *args) {
+    if (args == nullptr || args[0] == '\0') {
+        PushLog("VFS READ USAGE VFS READ /ABS/PATH");
+        return;
+    }
+
+    const char *cursor = args;
+    char pathToken[120] = {};
+    char extraToken[8] = {};
+    if (!ReadToken(cursor, pathToken, sizeof(pathToken)) || ReadToken(cursor, extraToken, sizeof(extraToken))) {
+        PushLog("VFS READ USAGE VFS READ /ABS/PATH");
+        return;
+    }
+
+    char absolutePath[128] = {};
+    if (!BuildAbsolutePathToken(pathToken, absolutePath, sizeof(absolutePath))) {
+        PushLog("VFS READ PATH INVALID");
+        return;
+    }
+
+    if (StartsWith(absolutePath, "/boot") &&
+        !EnsureServicePortAccess(FKernelRuntimeIds::PortBootVolume,
+                                 FKernelRuntimeIds::ServiceVirtualFileSystem,
+                                 "VFSREAD")) {
+        return;
+    }
+
+    char readBuffer[512] = {};
+    uint32_t readBytes = 0u;
+    if (!FVirtualFileSystem::ReadFile(absolutePath, readBuffer, sizeof(readBuffer), readBytes)) {
+        PushLog("VFS READ FAIL");
+        return;
+    }
+
+    char line[224] = {};
+    size_t pos = 0u;
+    AppendString(line, sizeof(line), pos, "VFS READ ");
+    AppendString(line, sizeof(line), pos, absolutePath);
+    AppendString(line, sizeof(line), pos, " BYTES ");
+    AppendUInt(line, sizeof(line), pos, readBytes);
+    AppendString(line, sizeof(line), pos, " DATA ");
+
+    const uint32_t previewBytes = readBytes > 96u ? 96u : readBytes;
     for (uint32_t i = 0u; i < previewBytes; i++) {
         const char c = readBuffer[i];
         AppendChar(line, sizeof(line), pos, (c >= 32 && c <= 126) ? c : '.');
@@ -10171,6 +10264,7 @@ static void RunUtilityHelp() {
 #endif
     PushLog("TEXT: TEXTSHAPER [BASIC|WRAP [PX]]");
     PushLog("VFS: VFSRESOLVE /ABS/PATH | VFSBOOT NAME | VFSBOOTBLK INDEX | VFSBOOT0");
+    PushLog("VFS: VFS READ /ABS/PATH | VFS CAT /ABS/PATH");
     PushLog("VFS: VFSMOUNTS | VFSMRESOLVE MOUNT LEAF | VFSMBLK MOUNT INDEX | VFSBLKDIGEST MOUNT INDEX");
     PushLog("VFS: VFSDIGESTRANGE MOUNT START COUNT | VFS DIGESTRANGE MOUNT START COUNT");
     PushLog("VFS: VFSDIGESTCMP MOUNT LEFT RIGHT | VFS DIGESTCMP MOUNT LEFT RIGHT");
@@ -10239,7 +10333,7 @@ static void RunUtilityHelp() {
     PushLog("OBS: AIMON THRESHOLD PROFILE [DEFAULT|LATENCY|STRICT]");
     PushLog("OBS: AIMON STATE [SHOW|EXPORT|IMPORT MODE <M> <KEY VAL...>|RESET]");
     PushLog("HUD: SHOWLOG BOOTLOG HIDELOG TERMINAL [ON|OFF|STATUS|FILTER [QUIET|NORMAL|FULL|STATUS]|WINDOW ON|OFF|TOGGLE|STATUS] LAYERS");
-    PushLog("VFS: VFSSTAT VFSMOUNTS VFSRESOLVE /ABS/PATH");
+    PushLog("VFS: VFSSTAT VFSMOUNTS VFSRESOLVE /ABS/PATH VFS READ /ABS/PATH");
     PushLog("VFS: LOGSAVE /MOUNT START_BLOCK BLOCK_COUNT (writes boot+runtime logs to /MOUNT/blk/N)");
     PushLog("FS: FS WRITE PATH TEXT | FS READ PATH | FS LS [PREFIX] | FS RM PATH (mounted on /data)");
     PushLog("LAT: KEYLAT [ON|OFF|STATUS] (keypress-to-command latency logs)");
@@ -12452,6 +12546,344 @@ static void RunHostShareWalk(const char *args) {
                                   qidPath);
 }
 
+static bool TryReadHostShareFileToBuffer(FShareProbeHit &hit,
+                                         const char *pathToken,
+                                         uint8_t *outBuffer,
+                                         uint32_t outBufferBytes,
+                                         uint32_t &outReadBytes) {
+    outReadBytes = 0u;
+    if (pathToken == nullptr || pathToken[0] == '\0' || outBuffer == nullptr || outBufferBytes == 0u) {
+        return false;
+    }
+
+    if (!hit.LegacySessionAttached || !hit.LegacyVersionNegotiated) {
+        return false;
+    }
+
+    const bool protocolIsDotL = StartsWith(hit.LegacyVersionName, "9P2000.L");
+    const bool protocolIsDotU = StartsWith(hit.LegacyVersionName, "9P2000.u");
+
+    bool walkOk = false;
+    uint16_t nwqid = 0u;
+    uint8_t qidType = 0u;
+    uint32_t qidVersion = 0u;
+    uint64_t qidPath = 0u;
+    if (!SubmitHostShareWalkPath(hit,
+                                 0u,
+                                 pathToken,
+                                 false,
+                                 walkOk,
+                                 nwqid,
+                                 qidType,
+                                 qidVersion,
+                                 qidPath) ||
+        !walkOk || nwqid == 0u) {
+        return false;
+    }
+
+    uint8_t openRequest[24] = {};
+    uint32_t openRequestSize = 0u;
+    if (protocolIsDotL) {
+        openRequestSize = 17u;
+        WriteLe32(openRequest + 0u, openRequestSize);
+        openRequest[4] = 12u; // Tlopen
+        WriteLe16(openRequest + 5u, 0u);
+        WriteLe32(openRequest + 7u, hit.LegacySessionWalkFid);
+        WriteLe32(openRequest + 11u, 0u); // O_RDONLY
+    } else if (protocolIsDotU || StartsWith(hit.LegacyVersionName, "9P2000")) {
+        openRequestSize = 12u;
+        WriteLe32(openRequest + 0u, openRequestSize);
+        openRequest[4] = 112u; // Topen
+        WriteLe16(openRequest + 5u, 0u);
+        WriteLe32(openRequest + 7u, hit.LegacySessionWalkFid);
+        openRequest[11] = 0u; // OREAD
+    } else {
+        return false;
+    }
+
+    uint16_t usedIndex = 0u;
+    uint32_t usedId = 0u;
+    uint32_t usedLength = 0u;
+    uint32_t responseSize = 0u;
+    uint8_t responseType = 0u;
+    uint16_t responseTag = 0u;
+    volatile uint8_t *response = nullptr;
+    bool timedOut = false;
+
+    if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                               openRequest,
+                                               openRequestSize,
+                                               200000ull,
+                                               usedIndex,
+                                               usedId,
+                                               usedLength,
+                                               responseSize,
+                                               responseType,
+                                               responseTag,
+                                               response,
+                                               timedOut) ||
+        timedOut) {
+        return false;
+    }
+
+    const uint8_t expectedOpenResponseType = protocolIsDotL ? 13u : 113u;
+    if (responseType != expectedOpenResponseType || responseSize < 24u) {
+        return false;
+    }
+
+    uint8_t readRequest[32] = {};
+    WriteLe32(readRequest + 0u, 23u);
+    readRequest[4] = 116u; // Tread
+    WriteLe16(readRequest + 5u, 0u);
+    WriteLe32(readRequest + 7u, hit.LegacySessionWalkFid);
+    static constexpr uint32_t readWindowBytes = 1024u;
+    static constexpr uint32_t maxReadWindows = 256u;
+    WriteLe32(readRequest + 19u, readWindowBytes);
+
+    uint64_t readOffset = 0ull;
+    uint64_t totalRead = 0ull;
+    bool success = false;
+    for (uint32_t window = 0u; window < maxReadWindows; window++) {
+        for (uint32_t i = 0u; i < 8u; i++) {
+            readRequest[11u + i] = static_cast<uint8_t>((readOffset >> (8u * i)) & 0xFFull);
+        }
+
+        if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                                   readRequest,
+                                                   23u,
+                                                   300000ull,
+                                                   usedIndex,
+                                                   usedId,
+                                                   usedLength,
+                                                   responseSize,
+                                                   responseType,
+                                                   responseTag,
+                                                   response,
+                                                   timedOut) ||
+            timedOut) {
+            success = false;
+            break;
+        }
+
+        if (responseType != 117u || responseSize < 11u) {
+            success = false;
+            break;
+        }
+
+        uint32_t readCount = ReadLe32(response + 7u);
+        const uint32_t payloadBytes = (responseSize > 11u) ? (responseSize - 11u) : 0u;
+        if (readCount > payloadBytes) {
+            readCount = payloadBytes;
+        }
+
+        if (readCount == 0u) {
+            success = true;
+            break;
+        }
+
+        if ((totalRead + static_cast<uint64_t>(readCount)) > static_cast<uint64_t>(outBufferBytes)) {
+            success = false;
+            break;
+        }
+
+        for (uint32_t i = 0u; i < readCount; i++) {
+            outBuffer[static_cast<uint32_t>(totalRead) + i] = response[11u + i];
+        }
+
+        totalRead += static_cast<uint64_t>(readCount);
+        readOffset += static_cast<uint64_t>(readCount);
+        if (readCount < readWindowBytes) {
+            success = true;
+            break;
+        }
+    }
+
+    uint8_t clunkRequest[16] = {};
+    WriteLe32(clunkRequest + 0u, 11u);
+    clunkRequest[4] = 120u; // Tclunk
+    WriteLe16(clunkRequest + 5u, 0u);
+    WriteLe32(clunkRequest + 7u, hit.LegacySessionWalkFid);
+    (void)TrySubmitHostShareQueueRequestAndWait(hit,
+                                                clunkRequest,
+                                                11u,
+                                                200000ull,
+                                                usedIndex,
+                                                usedId,
+                                                usedLength,
+                                                responseSize,
+                                                responseType,
+                                                responseTag,
+                                                response,
+                                                timedOut);
+
+    outReadBytes = static_cast<uint32_t>(totalRead);
+    return success;
+}
+
+static bool TryWriteHostShareFileFromBuffer(FShareProbeHit &hit,
+                                            const char *pathToken,
+                                            const uint8_t *inBuffer,
+                                            uint32_t inBufferBytes,
+                                            uint32_t &outWrittenBytes) {
+    outWrittenBytes = 0u;
+    if (pathToken == nullptr || pathToken[0] == '\0' || inBuffer == nullptr || inBufferBytes == 0u) {
+        return false;
+    }
+
+    if (!hit.LegacySessionAttached || !hit.LegacyVersionNegotiated) {
+        return false;
+    }
+
+    const bool protocolIsDotL = StartsWith(hit.LegacyVersionName, "9P2000.L");
+    const bool protocolIsDotU = StartsWith(hit.LegacyVersionName, "9P2000.u");
+
+    bool walkOk = false;
+    uint16_t nwqid = 0u;
+    uint8_t qidType = 0u;
+    uint32_t qidVersion = 0u;
+    uint64_t qidPath = 0u;
+    if (!SubmitHostShareWalkPath(hit,
+                                 0u,
+                                 pathToken,
+                                 false,
+                                 walkOk,
+                                 nwqid,
+                                 qidType,
+                                 qidVersion,
+                                 qidPath) ||
+        !walkOk || nwqid == 0u) {
+        return false;
+    }
+
+    uint8_t openRequest[24] = {};
+    uint32_t openRequestSize = 0u;
+    if (protocolIsDotL) {
+        openRequestSize = 17u;
+        WriteLe32(openRequest + 0u, openRequestSize);
+        openRequest[4] = 12u; // Tlopen
+        WriteLe16(openRequest + 5u, 0u);
+        WriteLe32(openRequest + 7u, hit.LegacySessionWalkFid);
+        WriteLe32(openRequest + 11u, 0x201u); // O_WRONLY | O_TRUNC
+    } else if (protocolIsDotU || StartsWith(hit.LegacyVersionName, "9P2000")) {
+        openRequestSize = 12u;
+        WriteLe32(openRequest + 0u, openRequestSize);
+        openRequest[4] = 112u; // Topen
+        WriteLe16(openRequest + 5u, 0u);
+        WriteLe32(openRequest + 7u, hit.LegacySessionWalkFid);
+        openRequest[11] = 1u; // OWRITE
+    } else {
+        return false;
+    }
+
+    uint16_t usedIndex = 0u;
+    uint32_t usedId = 0u;
+    uint32_t usedLength = 0u;
+    uint32_t responseSize = 0u;
+    uint8_t responseType = 0u;
+    uint16_t responseTag = 0u;
+    volatile uint8_t *response = nullptr;
+    bool timedOut = false;
+
+    if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                               openRequest,
+                                               openRequestSize,
+                                               200000ull,
+                                               usedIndex,
+                                               usedId,
+                                               usedLength,
+                                               responseSize,
+                                               responseType,
+                                               responseTag,
+                                               response,
+                                               timedOut) ||
+        timedOut) {
+        return false;
+    }
+
+    const uint8_t expectedOpenResponseType = protocolIsDotL ? 13u : 113u;
+    if (responseType != expectedOpenResponseType || responseSize < 24u) {
+        return false;
+    }
+
+    static constexpr uint32_t writeWindowBytes = 1024u;
+    uint8_t writeRequest[23u + writeWindowBytes] = {};
+    uint64_t writeOffset = 0ull;
+    uint64_t totalWritten = 0ull;
+    bool success = true;
+
+    while (totalWritten < inBufferBytes) {
+        uint32_t chunkBytes = static_cast<uint32_t>(inBufferBytes - static_cast<uint32_t>(totalWritten));
+        if (chunkBytes > writeWindowBytes) {
+            chunkBytes = writeWindowBytes;
+        }
+
+        const uint32_t requestSize = 23u + chunkBytes;
+        WriteLe32(writeRequest + 0u, requestSize);
+        writeRequest[4] = 118u; // Twrite
+        WriteLe16(writeRequest + 5u, 0u);
+        WriteLe32(writeRequest + 7u, hit.LegacySessionWalkFid);
+        for (uint32_t i = 0u; i < 8u; i++) {
+            writeRequest[11u + i] = static_cast<uint8_t>((writeOffset >> (8u * i)) & 0xFFull);
+        }
+        WriteLe32(writeRequest + 19u, chunkBytes);
+        for (uint32_t i = 0u; i < chunkBytes; i++) {
+            writeRequest[23u + i] = inBuffer[static_cast<uint32_t>(totalWritten) + i];
+        }
+
+        if (!TrySubmitHostShareQueueRequestAndWait(hit,
+                                                   writeRequest,
+                                                   requestSize,
+                                                   300000ull,
+                                                   usedIndex,
+                                                   usedId,
+                                                   usedLength,
+                                                   responseSize,
+                                                   responseType,
+                                                   responseTag,
+                                                   response,
+                                                   timedOut) ||
+            timedOut) {
+            success = false;
+            break;
+        }
+
+        if (responseType != 119u || responseSize < 11u) {
+            success = false;
+            break;
+        }
+
+        uint32_t wroteCount = ReadLe32(response + 7u);
+        if (wroteCount == 0u || wroteCount > chunkBytes) {
+            success = false;
+            break;
+        }
+
+        totalWritten += static_cast<uint64_t>(wroteCount);
+        writeOffset += static_cast<uint64_t>(wroteCount);
+    }
+
+    uint8_t clunkRequest[16] = {};
+    WriteLe32(clunkRequest + 0u, 11u);
+    clunkRequest[4] = 120u; // Tclunk
+    WriteLe16(clunkRequest + 5u, 0u);
+    WriteLe32(clunkRequest + 7u, hit.LegacySessionWalkFid);
+    (void)TrySubmitHostShareQueueRequestAndWait(hit,
+                                                clunkRequest,
+                                                11u,
+                                                200000ull,
+                                                usedIndex,
+                                                usedId,
+                                                usedLength,
+                                                responseSize,
+                                                responseType,
+                                                responseTag,
+                                                response,
+                                                timedOut);
+
+    outWrittenBytes = static_cast<uint32_t>(totalWritten);
+    return success && totalWritten == inBufferBytes;
+}
+
 static void RunHostShareCat(const char *args) {
     if (!GShareProbeHasScan) {
         PushLog("HOSTSHARE CAT UNSCANNED");
@@ -13010,7 +13442,7 @@ static void RunHostShareAutoMap(const char *args) {
     }
 
     PushLog("HOSTSHARE AUTOMAP BEGIN");
-    PushLog("HOSTSHARE AUTOMAP PLAN ONLY (NO VFS HOSTSHARE DRIVER)");
+    PushLog("HOSTSHARE AUTOMAP PLAN READY (BOOT MAY MOUNT)");
     RunShareProbe();
 
     if (!GShareProbeHasScan || GShareProbeStoredHitCount == 0u) {
@@ -13849,6 +14281,272 @@ static void RunParallelProbe() {
     PushLog(line);
 }
 
+static char AsciiToLower(char c) {
+    if (c >= 'A' && c <= 'Z') {
+        return static_cast<char>(c - 'A' + 'a');
+    }
+    return c;
+}
+
+static bool StrEqIgnoreCase(const char *a, const char *b) {
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+    size_t i = 0u;
+    while (a[i] != '\0' && b[i] != '\0') {
+        if (AsciiToLower(a[i]) != AsciiToLower(b[i])) {
+            return false;
+        }
+        i++;
+    }
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+static bool ParseHostMountPathIndex(const char *mountPath, uint32_t &outIndex) {
+    outIndex = 0u;
+    if (mountPath == nullptr || !StartsWith(mountPath, "/mnt/host")) {
+        return false;
+    }
+    const char *digits = mountPath + 9;
+    if (digits[0] == '\0') {
+        return false;
+    }
+    uint64_t parsed = 0u;
+    if (!ParseUInt(digits, parsed)) {
+        return false;
+    }
+    outIndex = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+static bool BuildHostShareIndexedArgs(uint32_t index,
+                                      const char *path,
+                                      char *outArgs,
+                                      size_t outArgsSize) {
+    if (outArgs == nullptr || outArgsSize < 8u) {
+        return false;
+    }
+    outArgs[0] = '\0';
+    size_t pos = 0u;
+    AppendUInt(outArgs, outArgsSize, pos, index);
+    AppendChar(outArgs, outArgsSize, pos, ' ');
+    AppendString(outArgs, outArgsSize, pos, (path != nullptr && path[0] != '\0') ? path : ".");
+    return outArgs[0] != '\0';
+}
+
+static bool BuildCatPathFromTokens(const char *pathToken,
+                                   const char *fileToken,
+                                   char *outPath,
+                                   size_t outPathSize) {
+    if (pathToken == nullptr || pathToken[0] == '\0' || outPath == nullptr || outPathSize < 4u) {
+        return false;
+    }
+    outPath[0] = '\0';
+    size_t pos = 0u;
+    if (fileToken == nullptr || fileToken[0] == '\0') {
+        AppendString(outPath, outPathSize, pos, pathToken);
+        return outPath[0] != '\0';
+    }
+    if (StrEq(pathToken, ".")) {
+        AppendString(outPath, outPathSize, pos, fileToken);
+        return outPath[0] != '\0';
+    }
+    AppendString(outPath, outPathSize, pos, pathToken);
+    if (pos > 0u && outPath[pos - 1u] != '/') {
+        AppendChar(outPath, outPathSize, pos, '/');
+    }
+    AppendString(outPath, outPathSize, pos, fileToken);
+    return outPath[0] != '\0';
+}
+
+static bool BuildVfsAbsolutePath(const char *mountPath,
+                                 const char *pathToken,
+                                 const char *fileToken,
+                                 char *outPath,
+                                 size_t outPathSize) {
+    if (mountPath == nullptr || mountPath[0] != '/' || outPath == nullptr || outPathSize < 8u) {
+        return false;
+    }
+    outPath[0] = '\0';
+    size_t pos = 0u;
+    if (pathToken == nullptr || pathToken[0] == '\0' || StrEq(pathToken, ".")) {
+        AppendString(outPath, outPathSize, pos, mountPath);
+        if (fileToken != nullptr && fileToken[0] != '\0') {
+            AppendChar(outPath, outPathSize, pos, '/');
+            AppendString(outPath, outPathSize, pos, fileToken);
+        }
+        return outPath[0] == '/';
+    }
+    if (pathToken[0] == '/') {
+        AppendString(outPath, outPathSize, pos, pathToken);
+        if (fileToken != nullptr && fileToken[0] != '\0') {
+            if (outPath[pos - 1u] != '/') {
+                AppendChar(outPath, outPathSize, pos, '/');
+            }
+            AppendString(outPath, outPathSize, pos, fileToken);
+        }
+        return outPath[0] == '/';
+    }
+    AppendString(outPath, outPathSize, pos, mountPath);
+    AppendChar(outPath, outPathSize, pos, '/');
+    AppendString(outPath, outPathSize, pos, pathToken);
+    if (fileToken != nullptr && fileToken[0] != '\0') {
+        if (outPath[pos - 1u] != '/') {
+            AppendChar(outPath, outPathSize, pos, '/');
+        }
+        AppendString(outPath, outPathSize, pos, fileToken);
+    }
+    return outPath[0] == '/';
+}
+
+static bool TryProcessCommandBlockMode() {
+    if (GCommandLength == 0u) {
+        return false;
+    }
+    const char *cursor = GCommandBuffer;
+    char cmd[32] = {};
+    if (!ReadToken(cursor, cmd, sizeof(cmd))) {
+        return false;
+    }
+    if (StrEqIgnoreCase(cmd, "begin")) {
+        char modeToken[32] = {};
+        if (!ReadToken(cursor, modeToken, sizeof(modeToken))) {
+            PushLog("BEGIN USAGE BEGIN HOSTSHARE [INDEX] | BEGIN VFS [INDEX|/MNT/HOSTN]");
+            return true;
+        }
+        if (StrEqIgnoreCase(modeToken, "hostshare")) {
+            uint32_t index = 0u;
+            char token[32] = {};
+            if (ReadToken(cursor, token, sizeof(token))) {
+                uint64_t parsed = 0u;
+                if (!ParseUInt(token, parsed)) {
+                    PushLog("BEGIN HOSTSHARE INDEX INVALID");
+                    return true;
+                }
+                index = static_cast<uint32_t>(parsed);
+            }
+            GCommandBlockMode = ECommandBlockMode::HostShare;
+            GCommandBlockHostShareIndex = index;
+            char line[96] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "BEGIN HOSTSHARE IDX ");
+            AppendUInt(line, sizeof(line), pos, index);
+            PushLog(line);
+            PushLog("BLOCK CMDS: LS [PATH] | CAT PATH [FILE] | EXIT");
+            return true;
+        }
+        if (StrEqIgnoreCase(modeToken, "vfs")) {
+            uint32_t index = GCommandBlockHostShareIndex;
+            char mountPath[24] = {};
+            size_t mountPos = 0u;
+            AppendString(mountPath, sizeof(mountPath), mountPos, "/mnt/host");
+            AppendUInt(mountPath, sizeof(mountPath), mountPos, index);
+            char token[32] = {};
+            if (ReadToken(cursor, token, sizeof(token))) {
+                uint64_t parsed = 0u;
+                if (ParseUInt(token, parsed)) {
+                    index = static_cast<uint32_t>(parsed);
+                    mountPos = 0u;
+                    mountPath[0] = '\0';
+                    AppendString(mountPath, sizeof(mountPath), mountPos, "/mnt/host");
+                    AppendUInt(mountPath, sizeof(mountPath), mountPos, index);
+                } else {
+                    uint32_t parsedMountIndex = 0u;
+                    if (!ParseHostMountPathIndex(token, parsedMountIndex)) {
+                        PushLog("BEGIN VFS ARG INVALID");
+                        return true;
+                    }
+                    index = parsedMountIndex;
+                    mountPos = 0u;
+                    mountPath[0] = '\0';
+                    AppendString(mountPath, sizeof(mountPath), mountPos, token);
+                }
+            }
+            GCommandBlockMode = ECommandBlockMode::Vfs;
+            GCommandBlockHostShareIndex = index;
+            for (size_t i = 0u; i < sizeof(GCommandBlockVfsMountPath); i++) {
+                GCommandBlockVfsMountPath[i] = mountPath[i];
+                if (mountPath[i] == '\0') {
+                    break;
+                }
+            }
+            char line[128] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "BEGIN VFS MOUNT ");
+            AppendString(line, sizeof(line), pos, GCommandBlockVfsMountPath);
+            AppendString(line, sizeof(line), pos, " IDX ");
+            AppendUInt(line, sizeof(line), pos, index);
+            PushLog(line);
+            PushLog("BLOCK CMDS: LS [PATH] | CAT PATH [FILE] | EXIT");
+            return true;
+        }
+        PushLog("BEGIN MODE INVALID");
+        return true;
+    }
+    if (GCommandBlockMode == ECommandBlockMode::None) {
+        return false;
+    }
+    if (StrEqIgnoreCase(cmd, "exit")) {
+        GCommandBlockMode = ECommandBlockMode::None;
+        PushLog("BLOCK EXIT");
+        return true;
+    }
+    if (StrEqIgnoreCase(cmd, "ls")) {
+        char pathToken[128] = {};
+        char extraToken[8] = {};
+        const bool havePath = ReadToken(cursor, pathToken, sizeof(pathToken));
+        if (ReadToken(cursor, extraToken, sizeof(extraToken))) {
+            PushLog("LS USAGE LS [PATH]");
+            return true;
+        }
+        const char *path = havePath ? pathToken : ".";
+        char args[160] = {};
+        if (!BuildHostShareIndexedArgs(GCommandBlockHostShareIndex, path, args, sizeof(args))) {
+            PushLog("LS ARG BUILD FAIL");
+            return true;
+        }
+        RunHostShareList(args);
+        return true;
+    }
+    if (StrEqIgnoreCase(cmd, "cat")) {
+        char tokenA[128] = {};
+        char tokenB[128] = {};
+        char tokenC[8] = {};
+        if (!ReadToken(cursor, tokenA, sizeof(tokenA))) {
+            PushLog("CAT USAGE CAT PATH [FILE]");
+            return true;
+        }
+        const bool haveB = ReadToken(cursor, tokenB, sizeof(tokenB));
+        if (ReadToken(cursor, tokenC, sizeof(tokenC))) {
+            PushLog("CAT TOO MANY ARGS");
+            return true;
+        }
+        char mergedPath[192] = {};
+        if (!BuildCatPathFromTokens(tokenA, haveB ? tokenB : nullptr, mergedPath, sizeof(mergedPath))) {
+            PushLog("CAT PATH INVALID");
+            return true;
+        }
+        if (GCommandBlockMode == ECommandBlockMode::HostShare) {
+            char args[224] = {};
+            if (!BuildHostShareIndexedArgs(GCommandBlockHostShareIndex, mergedPath, args, sizeof(args))) {
+                PushLog("CAT ARG BUILD FAIL");
+                return true;
+            }
+            RunHostShareCat(args);
+            return true;
+        }
+        char absolutePath[224] = {};
+        if (!BuildVfsAbsolutePath(
+                GCommandBlockVfsMountPath, tokenA, haveB ? tokenB : nullptr, absolutePath, sizeof(absolutePath))) {
+            PushLog("CAT PATH INVALID");
+            return true;
+        }
+        RunVfsReadAbsolute(absolutePath);
+        return true;
+    }
+    return false;
+}
+
 static void ResetCommandInputBuffer() {
     GCommandLength = 0;
     GCommandBuffer[0] = '\0';
@@ -13984,7 +14682,10 @@ static void ProcessCommand() {
         .RunMmioSmokeTest = RunMmioSmokeTest,
     };
 
-    if (TryProcessRuntimeControlCommand(runtimeControlContext)) {
+    if (TryProcessCommandBlockMode()) {
+    } else if (TryProcessRuntimeControlCommand(runtimeControlContext)) {
+        PushLog("BLOCK: BEGIN HOSTSHARE [INDEX] | BEGIN VFS [INDEX|/MNT/HOSTN] | EXIT");
+        PushLog("BLOCK: INSIDE -> LS [PATH] | CAT PATH [FILE]");
     } else if (TryProcessUtilityCommand()) {
     } else if (StrEq(GCommandBuffer, "rendertest") || StrEq(GCommandBuffer, "rendertest status")) {
         RunRenderSelfTestQuery();
@@ -14033,6 +14734,18 @@ static void ProcessCommand() {
             PushLog("FS READ USAGE FS READ PATH");
         } else {
             RunFsRead(GCommandBuffer + 8);
+        }
+    } else if (StrEq(GCommandBuffer, "vfs read") || StartsWith(GCommandBuffer, "vfs read ")) {
+        if (StrEq(GCommandBuffer, "vfs read")) {
+            PushLog("VFS READ USAGE VFS READ /ABS/PATH");
+        } else {
+            RunVfsReadAbsolute(GCommandBuffer + 9);
+        }
+    } else if (StrEq(GCommandBuffer, "vfs cat") || StartsWith(GCommandBuffer, "vfs cat ")) {
+        if (StrEq(GCommandBuffer, "vfs cat")) {
+            PushLog("VFS CAT USAGE VFS CAT /ABS/PATH");
+        } else {
+            RunVfsReadAbsolute(GCommandBuffer + 8);
         }
     } else if (StrEq(GCommandBuffer, "fs ls") || StartsWith(GCommandBuffer, "fs ls ")) {
         if (StrEq(GCommandBuffer, "fs ls")) {
@@ -14400,6 +15113,60 @@ void FKernelCommandConsole::Initialize() {
 
 void FKernelCommandConsole::AutoMapHostSharesAtBoot() {
     RunHostShareAutoMap(nullptr);
+}
+
+Fortress::Core::uint32 FKernelCommandConsole::GetHostShareDetectedCount() {
+    return GShareProbeHasScan ? GShareProbeStoredHitCount : 0u;
+}
+
+bool FKernelCommandConsole::IsHostShareReady(Fortress::Core::uint32 index) {
+    if (!GShareProbeHasScan || index >= GShareProbeStoredHitCount) {
+        return false;
+    }
+
+    const FShareProbeHit &hit = GShareProbeHits[index];
+    return hit.InUse && hit.LegacySessionAttached && hit.LegacyVersionNegotiated;
+}
+
+bool FKernelCommandConsole::TryReadHostShareFile(Fortress::Core::uint32 index,
+                                                 const char *path,
+                                                 void *outBuffer,
+                                                 Fortress::Core::uint32 outBufferBytes,
+                                                 Fortress::Core::uint32 &outReadBytes) {
+    outReadBytes = 0u;
+    if (!GShareProbeHasScan || path == nullptr || outBuffer == nullptr || outBufferBytes == 0u) {
+        return false;
+    }
+
+    if (index >= GShareProbeStoredHitCount || !GShareProbeHits[index].InUse) {
+        return false;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[index];
+    return TryReadHostShareFileToBuffer(
+        hit, path, static_cast<uint8_t *>(outBuffer), static_cast<uint32_t>(outBufferBytes), outReadBytes);
+}
+
+bool FKernelCommandConsole::TryWriteHostShareFile(Fortress::Core::uint32 index,
+                                                  const char *path,
+                                                  const void *inBuffer,
+                                                  Fortress::Core::uint32 inBufferBytes,
+                                                  Fortress::Core::uint32 &outWrittenBytes) {
+    outWrittenBytes = 0u;
+    if (!GShareProbeHasScan || path == nullptr || inBuffer == nullptr || inBufferBytes == 0u) {
+        return false;
+    }
+
+    if (index >= GShareProbeStoredHitCount || !GShareProbeHits[index].InUse) {
+        return false;
+    }
+
+    FShareProbeHit &hit = GShareProbeHits[index];
+    return TryWriteHostShareFileFromBuffer(hit,
+                                           path,
+                                           static_cast<const uint8_t *>(inBuffer),
+                                           static_cast<uint32_t>(inBufferBytes),
+                                           outWrittenBytes);
 }
 
 void FKernelCommandConsole::PollInput() {

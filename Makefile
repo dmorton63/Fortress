@@ -13,6 +13,8 @@ PARALLEL_PROBE_AUTORUN_MICRO_CANARY ?= 0
 DISPLAY_LATENCY_EXPERIMENTAL ?= 0
 KEYBOARD_FONT_PROFILE_EXPERIMENTAL ?= 0
 NO_REBOOT ?= 0
+QEMU_DEBUG_EXIT ?= 1
+HOSTSHARE_AUTOMAP_BOOT ?= 0
 
 ifeq ($(AP_DRAIN_EXPERIMENTAL),1)
 CXXFLAGS += -DFORTRESS_EXPERIMENTAL_AP_DRAIN_ENABLE
@@ -54,6 +56,10 @@ ifeq ($(NO_REBOOT),1)
 CXXFLAGS += -DFORTRESS_NO_REBOOT
 endif
 
+ifeq ($(HOSTSHARE_AUTOMAP_BOOT),1)
+CXXFLAGS += -DFORTRESS_HOSTSHARE_AUTOMAP_BOOT
+endif
+
 ifeq ($(RENDERER_BACKEND),software)
 CXXFLAGS += -DFORTRESS_RENDERER_BACKEND_SOFTWARE
 else ifeq ($(RENDERER_BACKEND),null)
@@ -71,11 +77,16 @@ ISO := $(BUILD_DIR)/fortress.iso
 USB_IMAGE := $(BUILD_DIR)/fortress-usb.iso
 QEMU_LOG ?= $(BUILD_DIR)/qemu-serial.log
 QEMU_SMP ?= 4
+QEMU_DEBUG_EXIT_CODE ?= 33
 HOST_SYSTEM_DIR ?=
 HOST_SHARED_DIR ?=
 HOST_SYSTEM_DIR_DEFAULT := $(CURDIR)/System
 HOST_SHARED_DIR_DEFAULT := $(CURDIR)/shared
 QEMU_EXTRA_ARGS ?=
+
+ifeq ($(QEMU_DEBUG_EXIT),1)
+QEMU_EXTRA_ARGS += -device isa-debug-exit,iobase=0xf4,iosize=0x04
+endif
 
 ifneq ($(strip $(HOST_SYSTEM_DIR)),)
 QEMU_EXTRA_ARGS += -virtfs local,path=$(HOST_SYSTEM_DIR),mount_tag=host_system,security_model=none,readonly=on
@@ -98,6 +109,7 @@ BACKUP_REMOTE ?= origin
 BACKUP_TAG_PREFIX ?= backup
 SOURCES := $(shell find src -name '*.cpp')
 OBJECTS := $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
+DEPS := $(OBJECTS:.o=.d)
 
 .PHONY: all clean limine iso usb-image run run-dev run-probe run-log run-log-check run-shares run-log-shares host-shares-setup parallel-probe-check parallel-probe-drain-check parallel-probe-smoke parallel-probe-drain-smoke parallel-probe-dispatch-containment-smoke parallel-probe-dispatch-drain-smoke parallel-probe-gate parallel-probe-dispatch-drain-burn parallel-probe-ci parallel-premerge-fast parallel-premerge-gate parallel-premerge-fast-matrix parallel-premerge-matrix parallel-hw-soak-archive dsksurf-contract-check dsksurf-contract-occlusion-check dsksurf-contract-occlusion-strict-check dsksurf-contract-fallback-strict-check dsksurf-contract-token-check dsksurf-contract-smoke backup-snapshot
 
@@ -108,7 +120,7 @@ $(BUILD_DIR):
 
 $(BUILD_DIR)/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(GENERATED_AERO_HEADER): aero.json tools/generate_aero_theme_header.py
 	@mkdir -p $(dir $@)
@@ -120,6 +132,8 @@ $(BUILD_DIR)/Cpu/%.o: CXXFLAGS += -mgeneral-regs-only
 
 $(KERNEL): $(BUILD_DIR) $(OBJECTS) linker.ld
 	$(LD) $(LDFLAGS) $(OBJECTS) -o $(KERNEL)
+
+-include $(DEPS)
 
 limine:
 	@if [ ! -f "$(LIMINE_DIR)/limine-bios.sys" ]; then \
@@ -164,7 +178,13 @@ usb-image: limine $(KERNEL)
 		$(ISO_DIR) -o $(USB_IMAGE)
 
 run: iso
-	qemu-system-x86_64 -M q35 -m 256M -smp $(QEMU_SMP) -cdrom $(ISO) -serial stdio -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 $(QEMU_EXTRA_ARGS)
+	@qemu-system-x86_64 -M q35 -m 256M -smp $(QEMU_SMP) -cdrom $(ISO) -serial stdio -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 $(QEMU_EXTRA_ARGS); \
+	rc=$$?; \
+	if [ "$(QEMU_DEBUG_EXIT)" = "1" ] && [ $$rc -eq $(QEMU_DEBUG_EXIT_CODE) ]; then \
+		echo "QEMU debug-exit status $$rc treated as success"; \
+		exit 0; \
+	fi; \
+	exit $$rc
 
 run-dev:
 	@$(MAKE) clean
@@ -183,7 +203,13 @@ run-probe:
 run-log: iso
 	@mkdir -p $(BUILD_DIR)
 	@echo "Logging serial output to $(QEMU_LOG)"
-	qemu-system-x86_64 -M q35 -m 256M -smp $(QEMU_SMP) -cdrom $(ISO) -serial stdio -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 $(QEMU_EXTRA_ARGS) 2>&1 | tee $(QEMU_LOG)
+	@bash -o pipefail -c 'qemu-system-x86_64 -M q35 -m 256M -smp $(QEMU_SMP) -cdrom $(ISO) -serial stdio -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 $(QEMU_EXTRA_ARGS) 2>&1 | tee $(QEMU_LOG)'; \
+	rc=$$?; \
+	if [ "$(QEMU_DEBUG_EXIT)" = "1" ] && [ $$rc -eq $(QEMU_DEBUG_EXIT_CODE) ]; then \
+		echo "QEMU debug-exit status $$rc treated as success"; \
+		exit 0; \
+	fi; \
+	exit $$rc
 
 host-shares-setup:
 	@mkdir -p "$(HOST_SYSTEM_DIR_DEFAULT)" "$(HOST_SHARED_DIR_DEFAULT)"

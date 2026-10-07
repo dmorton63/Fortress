@@ -31,6 +31,8 @@
 #include "Fortress/Platform/FTimerX86.hpp"
 #include "Fortress/Storage/FRamBlockDevice.hpp"
 #include "Fortress/Storage/FRawBlockFileSystemDriver.hpp"
+#include "Fortress/Storage/FHostShareBridgeBlockDevice.hpp"
+#include "Fortress/Storage/FHostShareFileSystemDriver.hpp"
 #include "Fortress/Storage/FSimpleFileSystemDriver.hpp"
 #include "Fortress/Storage/FVirtualFileSystem.hpp"
 #include "Fortress/Video/FDisplayManager.hpp"
@@ -70,6 +72,8 @@ using Fortress::Kernel::FKeyboardManager;
 using Fortress::Platform::FTimerX86;
 using Fortress::Storage::FRamBlockDevice;
 using Fortress::Storage::FRawBlockFileSystemDriver;
+using Fortress::Storage::FHostShareBridgeBlockDevice;
+using Fortress::Storage::FHostShareFileSystemDriver;
 using Fortress::Storage::FSimpleFileSystemDriver;
 using Fortress::Storage::FVirtualFileSystem;
 using Fortress::Storage::FVirtualFileSystemRoute;
@@ -95,6 +99,9 @@ static FRamBlockDevice GBootVolumeDevice;
 static FRawBlockFileSystemDriver GBootVolumeFileSystem;
 static FRamBlockDevice GDataVolumeDevice;
 static FSimpleFileSystemDriver GDataVolumeFileSystem;
+static constexpr Fortress::Core::uint32 GHostShareMountCapacity = 4u;
+static FHostShareBridgeBlockDevice GHostShareMountDevices[GHostShareMountCapacity] = {};
+static FHostShareFileSystemDriver GHostShareMountDrivers[GHostShareMountCapacity] = {};
 
 struct FBootstrapTaskContext {
     uint64_t RunCount;
@@ -365,32 +372,6 @@ static const char *GetPixelFormatName(Fortress::Video::EPixelFormat format) {
     }
 }
 
-static void BootSerialLogModeLine(const char *prefix, const Fortress::Video::FDisplayMode &mode) {
-    char line[128] = {};
-    size_t pos = 0;
-    AppendString(line, sizeof(line), pos, prefix);
-    AppendUInt(line, sizeof(line), pos, mode.Width);
-    AppendChar(line, sizeof(line), pos, 'x');
-    AppendUInt(line, sizeof(line), pos, mode.Height);
-    AppendString(line, sizeof(line), pos, " S ");
-    AppendUInt(line, sizeof(line), pos, mode.StrideBytes);
-    AppendString(line, sizeof(line), pos, " PF ");
-    AppendString(line, sizeof(line), pos, GetPixelFormatName(mode.PixelFormat));
-    BootSerialLine(line);
-}
-
-static void BootSerialCheckModeSnapshot(const char *stage, const Fortress::Video::FDisplayMode &mode) {
-    if (mode.Width == 0u || mode.Height == 0u || mode.StrideBytes == 0u ||
-        mode.PixelFormat == Fortress::Video::EPixelFormat::Unknown) {
-        char line[96] = {};
-        size_t pos = 0;
-        AppendString(line, sizeof(line), pos, "BOOTSTAGE MODE SNAPSHOT CORRUPT ");
-        AppendString(line, sizeof(line), pos, stage);
-        BootSerialLine(line);
-        BootSerialLogModeLine("BOOTSTAGE MODE SNAPSHOT NOW ", mode);
-    }
-}
-
 void FKernelBootstrap::HaltForever() {
     for (;;) {
         __asm__ volatile("hlt");
@@ -444,18 +425,6 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
         return false;
     }
 
-    char framebufferLine[128] = {};
-    size_t framebufferLinePos = 0;
-    AppendString(framebufferLine, sizeof(framebufferLine), framebufferLinePos, "BOOTSTAGE FB RAW ");
-    AppendUInt(framebufferLine, sizeof(framebufferLine), framebufferLinePos, framebuffer->width);
-    AppendChar(framebufferLine, sizeof(framebufferLine), framebufferLinePos, 'x');
-    AppendUInt(framebufferLine, sizeof(framebufferLine), framebufferLinePos, framebuffer->height);
-    AppendString(framebufferLine, sizeof(framebufferLine), framebufferLinePos, " P ");
-    AppendUInt(framebufferLine, sizeof(framebufferLine), framebufferLinePos, framebuffer->pitch);
-    AppendString(framebufferLine, sizeof(framebufferLine), framebufferLinePos, " BPP ");
-    AppendUInt(framebufferLine, sizeof(framebufferLine), framebufferLinePos, framebuffer->bpp);
-    BootSerialLine(framebufferLine);
-
     BootSerialLine("BOOTSTAGE HW RESP OK");
 
     FPanicScreen::Initialize(framebuffer);
@@ -502,26 +471,10 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
         return false;
     }
 
-    {
-        char videoDeviceLine[128] = {};
-        size_t videoDeviceLinePos = 0;
-        AppendString(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, "BOOTSTAGE VIDEODEV ");
-        AppendUInt(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, GVideoDevice.GetWidth());
-        AppendChar(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, 'x');
-        AppendUInt(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, GVideoDevice.GetHeight());
-        AppendString(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, " P ");
-        AppendUInt(videoDeviceLine, sizeof(videoDeviceLine), videoDeviceLinePos, GVideoDevice.GetPitchPixels());
-        BootSerialLine(videoDeviceLine);
-    }
-
-    BootSerialLogModeLine("BOOTSTAGE VIDEODEV MODE ", GVideoDevice.GetCurrentMode());
-
     if (!GDisplayManager.Initialize(&GVideoDevice)) {
         BootSerialLine("BOOTSTAGE FAIL DISPLAY MANAGER");
         return false;
     }
-
-    BootSerialLogModeLine("BOOTSTAGE DM MODE ", GDisplayManager.GetMode());
 
     const ERendererBackend selectedBackend = FRendererFactory::SelectDefaultBackend();
     if (!FRendererFactory::CreateAndInitializeRenderer(selectedBackend,
@@ -532,17 +485,12 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
         return false;
     }
 
-    BootSerialLogModeLine("BOOTSTAGE DM MODE POST-RENDERER ", GDisplayManager.GetMode());
-
     if (!GConsole.Initialize(&GVideoDevice, 2)) {
         BootSerialLine("BOOTSTAGE FAIL CONSOLE");
         return false;
     }
 
-    BootSerialLogModeLine("BOOTSTAGE DM MODE POST-CONSOLE ", GDisplayManager.GetMode());
-
     const Fortress::Video::FDisplayMode &displayMode = GDisplayManager.GetMode();
-    BootSerialCheckModeSnapshot("POST-SNAPSHOT", displayMode);
     if (!GCubeScene.Initialize(GRenderer3D, displayMode.Width, displayMode.Height)) {
         BootSerialLine("BOOTSTAGE WARN SCENE DEGRADED");
     }
@@ -592,7 +540,6 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     }
 
     BootSerialLine("BOOTSTAGE CPU OK");
-    BootSerialCheckModeSnapshot("POST-CPU", displayMode);
 
     if (!FMessageBus::Initialize()) {
         BootSerialLine("BOOTSTAGE FAIL BUS");
@@ -625,7 +572,6 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     }
 
     BootSerialLine("BOOTSTAGE CORE SERVICES OK");
-    BootSerialCheckModeSnapshot("POST-CORESERV", displayMode);
 
     if (!FServiceRegistry::RegisterService(FServiceRegistrationInfo{
             .ServiceId = FKernelRuntimeIds::ServiceScheduler,
@@ -699,7 +645,6 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     }
 
     BootSerialLine("BOOTSTAGE PORT OK");
-    BootSerialCheckModeSnapshot("POST-PORT", displayMode);
 
     if (!FPortManager::RegisterPort(FKernelRuntimeIds::PortDisplaySurface, "DisplaySurface")) {
         return false;
@@ -769,7 +714,6 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     }
 
     BootSerialLine("BOOTSTAGE IRQ OK");
-    BootSerialCheckModeSnapshot("POST-IRQ", displayMode);
 
     if (!GBootVolumeDevice.Initialize(FRamBlockDevice::SupportedBlockSizeBytes, 2048u, false)) {
         return false;
@@ -795,7 +739,6 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     }
 
     BootSerialLine("BOOTSTAGE VFS OK");
-    BootSerialCheckModeSnapshot("POST-VFS", displayMode);
 
     FKernelTaskHandle idleTaskHandle{};
     const FKernelTaskCreateInfo idleTask{
@@ -825,12 +768,139 @@ bool FKernelBootstrap::Initialize(const limine_framebuffer_response *framebuffer
     }
 
     BootSerialLine("BOOTSTAGE TASKS OK");
-    BootSerialCheckModeSnapshot("POST-TASKS", displayMode);
 
     FKernelCommandConsole::Initialize();
     FKernelCommandConsole::BindVideoConsole(&GConsole);
     BootSerialLine("BOOTSTAGE CONSOLE OK");
-    BootSerialCheckModeSnapshot("POST-CONSOLE", displayMode);
+
+#if defined(FORTRESS_HOSTSHARE_AUTOMAP_BOOT)
+    FKernelCommandConsole::PushSystemLog("HOSTSHARE AUTOMAP BOOT BEGIN");
+    FKernelCommandConsole::AutoMapHostSharesAtBoot();
+
+    Fortress::Core::uint32 mountedHostShares = 0u;
+    const Fortress::Core::uint32 detectedHostShares = FKernelCommandConsole::GetHostShareDetectedCount();
+    const Fortress::Core::uint32 mountSlots =
+        (detectedHostShares < GHostShareMountCapacity) ? detectedHostShares : GHostShareMountCapacity;
+    for (Fortress::Core::uint32 i = 0u; i < mountSlots; i++) {
+        if (!FKernelCommandConsole::IsHostShareReady(i)) {
+            continue;
+        }
+
+        if (!GHostShareMountDevices[i].Initialize(i)) {
+            continue;
+        }
+
+        char mountPath[24] = "/mnt/host";
+        const Fortress::Core::uint32 digit = i % 10u;
+        mountPath[9] = static_cast<char>('0' + digit);
+        mountPath[10] = '\0';
+
+        const bool mountReadOnly = (i == 0u);
+        if (FVirtualFileSystem::Mount(mountPath, &GHostShareMountDevices[i], &GHostShareMountDrivers[i], mountReadOnly)) {
+            char line[96] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE VFS MOUNT OK ");
+            AppendString(line, sizeof(line), pos, mountPath);
+            AppendString(line, sizeof(line), pos, mountReadOnly ? " RO" : " RW");
+            FKernelCommandConsole::PushSystemLog(line);
+
+            if (mountReadOnly) {
+                char smokePath[48] = {};
+                size_t smokePathPos = 0u;
+                AppendString(smokePath, sizeof(smokePath), smokePathPos, mountPath);
+                AppendString(smokePath, sizeof(smokePath), smokePathPos, "/README.md");
+                char smokeBuffer[4096] = {};
+                Fortress::Core::uint32 smokeReadBytes = 0u;
+                if (FVirtualFileSystem::ReadFile(smokePath, smokeBuffer, sizeof(smokeBuffer), smokeReadBytes)) {
+                    char smokeLine[160] = {};
+                    size_t smokeLinePos = 0u;
+                    AppendString(smokeLine, sizeof(smokeLine), smokeLinePos, "HOSTSHARE VFS SMOKE OK ");
+                    AppendString(smokeLine, sizeof(smokeLine), smokeLinePos, smokePath);
+                    AppendString(smokeLine, sizeof(smokeLine), smokeLinePos, " BYTES ");
+                    AppendUInt(smokeLine, sizeof(smokeLine), smokeLinePos, smokeReadBytes);
+                    FKernelCommandConsole::PushSystemLog(smokeLine);
+                } else {
+                    char smokeLine[160] = {};
+                    size_t smokeLinePos = 0u;
+                    AppendString(smokeLine, sizeof(smokeLine), smokeLinePos, "HOSTSHARE VFS SMOKE MISS ");
+                    AppendString(smokeLine, sizeof(smokeLine), smokeLinePos, smokePath);
+                    FKernelCommandConsole::PushSystemLog(smokeLine);
+                }
+            } else {
+                char smokePath[64] = {};
+                size_t smokePathPos = 0u;
+                AppendString(smokePath, sizeof(smokePath), smokePathPos, mountPath);
+                AppendString(smokePath, sizeof(smokePath), smokePathPos, "/README.md");
+
+                char originalData[4096] = {};
+                Fortress::Core::uint32 originalBytes = 0u;
+                const bool readOk = FVirtualFileSystem::ReadFile(smokePath, originalData, sizeof(originalData), originalBytes);
+
+                Fortress::Core::uint32 smokeWrittenBytes = 0u;
+                bool writeOk = false;
+                if (readOk && originalBytes > 0u) {
+                    writeOk = FVirtualFileSystem::WriteFile(smokePath, originalData, originalBytes, smokeWrittenBytes);
+                }
+
+                char readback[4096] = {};
+                Fortress::Core::uint32 readbackBytes = 0u;
+                const bool readbackOk =
+                    writeOk && FVirtualFileSystem::ReadFile(smokePath, readback, sizeof(readback), readbackBytes);
+
+                bool verifyOk = readOk && writeOk && smokeWrittenBytes == originalBytes;
+                bool readbackMatch = readbackOk && readbackBytes == originalBytes;
+                if (readbackMatch) {
+                    for (Fortress::Core::uint32 j = 0u; j < readbackBytes; j++) {
+                        if (readback[j] != originalData[j]) {
+                            readbackMatch = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (!readbackMatch) {
+                    char warnLine[192] = {};
+                    size_t warnPos = 0u;
+                    AppendString(warnLine, sizeof(warnLine), warnPos, "HOSTSHARE VFS WRITE VERIFY WARN ");
+                    AppendString(warnLine, sizeof(warnLine), warnPos, smokePath);
+                    FKernelCommandConsole::PushSystemLog(warnLine);
+                }
+
+                char smokeLine[192] = {};
+                size_t smokeLinePos = 0u;
+                AppendString(smokeLine,
+                             sizeof(smokeLine),
+                             smokeLinePos,
+                             verifyOk ? "HOSTSHARE VFS WRITE OK " : "HOSTSHARE VFS WRITE FAIL ");
+                AppendString(smokeLine, sizeof(smokeLine), smokeLinePos, smokePath);
+                AppendString(smokeLine, sizeof(smokeLine), smokeLinePos, " BYTES ");
+                AppendUInt(smokeLine, sizeof(smokeLine), smokeLinePos, smokeWrittenBytes);
+                FKernelCommandConsole::PushSystemLog(smokeLine);
+            }
+
+            mountedHostShares++;
+        } else {
+            char line[96] = {};
+            size_t pos = 0u;
+            AppendString(line, sizeof(line), pos, "HOSTSHARE VFS MOUNT FAIL ");
+            AppendString(line, sizeof(line), pos, mountPath);
+            FKernelCommandConsole::PushSystemLog(line);
+        }
+    }
+
+    char hostShareMountSummary[96] = {};
+    size_t hostShareMountSummaryPos = 0u;
+    AppendString(hostShareMountSummary,
+                 sizeof(hostShareMountSummary),
+                 hostShareMountSummaryPos,
+                 "HOSTSHARE VFS MOUNTED ");
+    AppendUInt(hostShareMountSummary, sizeof(hostShareMountSummary), hostShareMountSummaryPos, mountedHostShares);
+    AppendString(hostShareMountSummary, sizeof(hostShareMountSummary), hostShareMountSummaryPos, " OF ");
+    AppendUInt(hostShareMountSummary, sizeof(hostShareMountSummary), hostShareMountSummaryPos, detectedHostShares);
+    FKernelCommandConsole::PushSystemLog(hostShareMountSummary);
+
+    FKernelCommandConsole::PushSystemLog("HOSTSHARE AUTOMAP BOOT END");
+#endif
 
     char backendLine[64] = {};
     size_t backendLinePos = 0;
